@@ -138,6 +138,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "riscv",  # RISC-V optimized backend
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
@@ -1156,6 +1157,24 @@ class ServerArgs:
         logger.warning(
             f"Set NSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
         )
+
+    def _handle_hpu_backends(self):
+        if self.device == "hpu":
+            self.attention_backend = "torch_native"
+            self.sampling_backend = "pytorch"
+
+    def _handle_cpu_backends(self):
+        if self.device == "cpu":
+            if self.attention_backend is None:
+                # Auto-select backend based on architecture
+                from sglang.srt.utils.common import is_host_cpu_riscv, is_host_cpu_x86
+                if is_host_cpu_riscv():
+                    self.attention_backend = "rvv"
+                elif is_host_cpu_x86():
+                    self.attention_backend = "intel_amx"
+                else:
+                    self.attention_backend = "torch_native"
+            self.sampling_backend = "pytorch"
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
