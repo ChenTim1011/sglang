@@ -1,0 +1,10 @@
+# Core dependencies
+requests>=2.31.0
+psutil>=5.9.0
+pyyaml>=6.0
+
+# SGLang (should be installed separately)
+# sglang[all_cpu]
+
+# PyTorch (RISC-V wheel should be installed separately)
+# torch (RISC-V version)
