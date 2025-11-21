@@ -1,0 +1,39 @@
+# SGLang RISC-V Optimized Configuration
+# Optimized for Banana Pi with limited memory and CPU performance
+
+model-path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+device: cpu
+host: 127.0.0.1
+port: 30000
+
+# Tensor Parallel (single rank on Banana Pi)
+tensor-parallel-size: 1
+# CPU binding is handled via SGLANG_CPU_OMP_THREADS_BIND env (set automatically by test_tinyllama_riscv.py)
+
+# Attention Backend (RISC-V optimized with fallback to torch_native)
+# Note: On RISC-V, torch_native may be faster for prefill due to PyTorch optimizations
+attention-backend: riscv
+prefill-attention-backend: torch_native 
+decode-attention-backend: riscv
+
+# Model Implementation (Transformers)
+model-impl: transformers
+
+# KV Cache
+kv-cache-dtype: auto
+
+# Memory Management (Reduced for RISC-V)
+mem-fraction-static: 0.2          
+max-running-requests: 1
+max-prefill-tokens: 64        
+max-total-tokens: 128          
+chunked-prefill-size: 32         
+cpu-offload-gb: 1                 
+
+# Throughput (Adjusted for RISC-V performance)
+stream-interval: 2                
+num-continuous-decode-steps: 1
+
+# Performance Monitoring
+enable-metrics: true
+log-requests: true
