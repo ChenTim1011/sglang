@@ -2053,6 +2053,20 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     return major, minor
 
 
+def get_npu_compiler_config():
+    config = {
+        "frozen_parameter": True,
+        "tiling_schedule_optimize": True,
+        "topology_sorting_strategy": "StableRDFS",
+    }
+    return config
+
+
+def get_compiler_backend() -> str:
+    # Disable torch.compile on RISC-V (Inductor C++ compilation fails with -march=native)
+    if is_host_cpu_riscv():
+        return "eager"  # Use eager mode instead of compilation
+
 def get_compiler_backend(mode=None) -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
