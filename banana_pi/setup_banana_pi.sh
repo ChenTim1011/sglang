@@ -1,0 +1,1070 @@
+#!/bin/bash
+# SGLang RISC-V Setup Script for Banana Pi
+# This script helps set up SGLang on Banana Pi for running test_tinyllama_riscv.py
+# 
+# Features:
+# - Clone sglang repo (from pllab-sglang/riscv_backend branch)
+# - Install Python dependencies
+# - Install wheels (from GitHub Releases)
+# - Install libomp library (from GitHub Releases)
+# - Configure environment
+# - Run tests
+#
+# Usage: ./setup_banana_pi.sh [--user USER] [--host HOST] [--yes] [--skip-wheels] [--skip-test] [--wheels-tag TAG]
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Default configuration
+BANANA_PI_USER="${BANANA_PI_USER:-jtchen}"
+BANANA_PI_HOST="${BANANA_PI_HOST:-140.114.78.64}"
+SKIP_CONFIRM=false
+SKIP_WHEELS=false
+SKIP_TEST=true
+SGLANG_REPO="https://github.com/nthu-pllab/pllab-sglang.git"
+SGLANG_BRANCH="riscv_backend"
+WORKSPACE_DIR="$HOME/.local_riscv_env/workspace"
+PROJECT_DIR="$WORKSPACE_DIR/sglang"
+# GitHub Releases configuration for wheels
+REPO_OWNER="nthu-pllab"
+REPO_NAME="pllab-sglang"
+WHEELS_RELEASE_TAG="${WHEELS_RELEASE_TAG:-v1.0}"  # Release tag for wheels
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"  # GitHub token for private repo access
+# Use system SSH and SCP
+SSH_CMD="/usr/bin/ssh"
+SCP_CMD="/usr/bin/scp"
+
+# Force use system OpenSSL libraries to avoid conda OpenSSL version mismatch
+# Remove conda lib paths from LD_LIBRARY_PATH to prevent conda OpenSSL from being used
+if [ -n "$CONDA_PREFIX" ]; then
+    # Remove conda lib paths from LD_LIBRARY_PATH
+    if [ -n "$LD_LIBRARY_PATH" ]; then
+        export LD_LIBRARY_PATH=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v "$CONDA_PREFIX" | tr '\n' ':' | sed 's/:$//')
+    fi
+fi
+
+# Find and prioritize system OpenSSL libraries
+SYSTEM_SSL_LIB=""
+for lib_path in /usr/lib/x86_64-linux-gnu /usr/lib64 /lib/x86_64-linux-gnu /lib64; do
+    if [ -f "$lib_path/libssl.so.3" ] || [ -f "$lib_path/libssl.so.1.1" ]; then
+        SYSTEM_SSL_LIB="$lib_path"
+        break
+    fi
+done
+
+# Prepend system SSL library to LD_LIBRARY_PATH to ensure system OpenSSL is used
+if [ -n "$SYSTEM_SSL_LIB" ]; then
+    export LD_LIBRARY_PATH="$SYSTEM_SSL_LIB:${LD_LIBRARY_PATH}"
+fi
+
+# Unset conda's OpenSSL-related environment variables if they exist
+unset OPENSSL_CONF 2>/dev/null || true
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --user)
+            BANANA_PI_USER="$2"
+            shift 2
+            ;;
+        --host)
+            BANANA_PI_HOST="$2"
+            shift 2
+            ;;
+        --yes|-y)
+            SKIP_CONFIRM=true
+            shift
+            ;;
+        --skip-wheels)
+            SKIP_WHEELS=true
+            shift
+            ;;
+        --skip-test)
+            SKIP_TEST=true
+            shift
+            ;;
+        --wheels-tag)
+            WHEELS_RELEASE_TAG="$2"
+            shift 2
+            ;;
+        --github-token)
+            GITHUB_TOKEN="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --user USER      Banana Pi username (default: jtchen)"
+            echo "  --host HOST      Banana Pi host/IP (default: 140.114.78.64)"
+            echo "  --yes, -y        Skip confirmation prompts"
+            echo "  --skip-wheels    Skip wheel installation"
+            echo "  --skip-test      Skip running test after setup"
+            echo "  --wheels-tag TAG  Release tag for wheels (default: v1.0)"
+            echo "  --github-token TOKEN  GitHub token for private repo access (or set GITHUB_TOKEN env var, or will be prompted)"
+            echo "  --help, -h        Show this help message"
+            echo ""
+            echo "Environment variables:"
+            echo "  BANANA_PI_USER   Banana Pi username"
+            echo "  BANANA_PI_HOST   Banana Pi host/IP"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# Logging functions
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+log_step() {
+    echo -e "${BLUE}[STEP]${NC} $1"
+}
+
+# Display usage information (always show)
+echo ""
+echo "============================================================"
+echo "  SGLang RISC-V Setup for Banana Pi"
+echo "============================================================"
+echo ""
+echo "This script will:"
+echo "  1. Clone/update sglang repository (pllab-sglang/riscv_backend)"
+echo "  2. Download wheels and libomp from GitHub Releases"
+echo "  3. Install Python dependencies"
+echo "  4. Configure environment"
+echo ""
+echo "Options:"
+echo "  --user USER         Banana Pi username (default: $BANANA_PI_USER)"
+echo "  --host HOST         Banana Pi host/IP (default: $BANANA_PI_HOST)"
+echo "  --yes, -y           Skip confirmation prompts"
+echo "  --skip-wheels       Skip wheel installation"
+echo "  --skip-test         Skip running test after setup"
+echo "  --wheels-tag TAG    Release tag for wheels (default: v1.0)"
+echo "  --github-token TOKEN  GitHub token for private repo (or will be prompted)"
+echo "  --help, -h          Show detailed help"
+echo ""
+
+# Interactive configuration
+if [ "$SKIP_CONFIRM" = false ]; then
+    read -p "Banana Pi Username [$BANANA_PI_USER]: " input_user
+    BANANA_PI_USER="${input_user:-$BANANA_PI_USER}"
+    
+    read -p "Banana Pi Host/IP [$BANANA_PI_HOST]: " input_host
+    BANANA_PI_HOST="${input_host:-$BANANA_PI_HOST}"
+    
+    # Ask for GitHub token if not already set
+    if [ -z "$GITHUB_TOKEN" ]; then
+        echo ""
+        log_info "The repository is private and requires authentication."
+        log_info "GitHub token will be used for:"
+        log_info "  1. Downloading Release files"
+        log_info "  2. Git operations (clone/fetch/pull) if needed"
+        echo ""
+        read -s -p "GitHub Personal Access Token (PAT): " input_token
+        echo ""
+        GITHUB_TOKEN="${input_token}"
+        if [ -n "$GITHUB_TOKEN" ]; then
+            log_info "✓ GitHub token will be used for authentication"
+        else
+            log_warn "No GitHub token provided."
+            log_warn "  - Release downloads may fail"
+            log_warn "  - Git operations will prompt for username/password"
+            log_warn "  - Password prompt: Use your GitHub PAT as the password"
+        fi
+    else
+        log_info "✓ GitHub token already provided (will be used for Git operations and Release downloads)"
+    fi
+    echo ""
+fi
+
+log_info "Target: $BANANA_PI_USER@$BANANA_PI_HOST"
+log_info "Workspace: $WORKSPACE_DIR"
+log_info "Project: $PROJECT_DIR"
+echo ""
+
+# Verify SSH command exists
+if [ ! -x "$SSH_CMD" ]; then
+    log_error "System SSH not found: $SSH_CMD"
+    log_info "Please install OpenSSH: sudo apt-get install openssh-client"
+    exit 1
+fi
+
+log_info "Using SSH: $SSH_CMD"
+log_info "Using SCP: $SCP_CMD"
+
+# Check SSH connection (with proper OpenSSL environment)
+log_step "Checking SSH connection..."
+set +e
+SSH_CONNECTION_TEST=$(timeout 10 "$SSH_CMD" -o ConnectTimeout=5 -o BatchMode=yes "$BANANA_PI_USER@$BANANA_PI_HOST" exit 2>&1)
+SSH_CONNECTION_EXIT=$?
+set -e
+
+if [ $SSH_CONNECTION_EXIT -eq 0 ]; then
+    log_info "✓ SSH connection OK"
+elif [ $SSH_CONNECTION_EXIT -eq 124 ]; then
+    log_error "SSH connection timeout (10 seconds)"
+    log_info "Please check:"
+    log_info "  1. Host/IP is correct: $BANANA_PI_HOST"
+    log_info "  2. SSH service is running on Banana Pi"
+    log_info "  3. Network connectivity"
+    exit 1
+elif [ $SSH_CONNECTION_EXIT -eq 255 ]; then
+    log_warn "Cannot connect via SSH without password"
+    log_info "You may be asked for password during setup"
+else
+    log_warn "SSH connection failed (exit code: $SSH_CONNECTION_EXIT)"
+    if [ -n "$SSH_CONNECTION_TEST" ]; then
+        # Filter out OpenSSL warnings but show other errors
+        FILTERED_TEST=$(echo "$SSH_CONNECTION_TEST" | grep -v "OpenSSL version mismatch" || true)
+        if [ -n "$FILTERED_TEST" ]; then
+            log_info "Error details:"
+            echo "$FILTERED_TEST" | while IFS= read -r line; do
+                echo "  $line"
+            done
+        fi
+    fi
+    log_info "You may be asked for password during setup"
+fi
+echo ""
+
+# Remote setup script
+REMOTE_SETUP_SCRIPT=$(cat << 'REMOTE_SCRIPT_EOF'
+#!/bin/bash
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
+
+WORKSPACE_DIR="$HOME/.local_riscv_env/workspace"
+PROJECT_DIR="$WORKSPACE_DIR/sglang"
+SGLANG_REPO="https://github.com/nthu-pllab/pllab-sglang.git"
+SGLANG_BRANCH="riscv_backend"
+WHEEL_BUILDER_URL="https://gitlab.com/api/v4/projects/riseproject%2Fpython%2Fwheel_builder/packages/pypi/simple"
+
+# Step 1: Create workspace directory
+log_step "Creating workspace directory..."
+mkdir -p "$WORKSPACE_DIR"
+cd "$WORKSPACE_DIR"
+log_info "✓ Workspace directory created"
+
+# Step 2: Clone or update sglang repo
+log_step "Setting up sglang repository..."
+
+if [ -d "$PROJECT_DIR/.git" ]; then
+    # Repository exists - ask user what to do
+    log_info "Repository already exists at: $PROJECT_DIR"
+    echo ""
+    echo "What would you like to do?"
+    echo "  1) Update existing repository (git pull)"
+    echo "  2) Remove and re-clone (fresh start)"
+    echo "  3) Skip repository setup (use existing)"
+    echo ""
+    
+    if [ "$SKIP_CONFIRM" = "true" ]; then
+        # Non-interactive mode: default to update
+        REPO_ACTION="1"
+        log_info "Non-interactive mode: updating existing repository"
+    else
+        read -p "Enter choice [1-3] (default: 1): " REPO_ACTION
+        REPO_ACTION="${REPO_ACTION:-1}"
+    fi
+    
+    case "$REPO_ACTION" in
+        1)
+            log_info "Updating existing repository..."
+            cd "$PROJECT_DIR"
+            # Check and update remote URL if needed
+            CURRENT_REMOTE=$(git remote get-url origin 2>/dev/null || echo "")
+            if [ "$CURRENT_REMOTE" != "$SGLANG_REPO" ]; then
+                log_info "Updating remote URL to: $SGLANG_REPO"
+                git remote set-url origin "$SGLANG_REPO" 2>/dev/null || git remote add origin "$SGLANG_REPO"
+            fi
+            
+            # Configure Git to use token if available (for private repos)
+            if [ -n "$GITHUB_TOKEN" ]; then
+                # Use token in URL for authentication (only for this session)
+                GIT_CREDENTIAL_URL=$(echo "$SGLANG_REPO" | sed "s|https://|https://${GITHUB_TOKEN}@|")
+                git remote set-url origin "$GIT_CREDENTIAL_URL" 2>/dev/null
+            fi
+            
+            # Stash local changes before switching branches
+            if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+                log_info "Stashing local changes before updating..."
+                git stash push -m "Auto-stash before branch switch $(date +%Y%m%d_%H%M%S)" 2>/dev/null || log_warn "Could not stash changes"
+            fi
+            
+            git fetch origin
+            CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [ "$CURRENT_BRANCH" != "$SGLANG_BRANCH" ]; then
+                log_info "Switching to branch: $SGLANG_BRANCH"
+                git checkout "$SGLANG_BRANCH" 2>/dev/null || git checkout -b "$SGLANG_BRANCH" origin/"$SGLANG_BRANCH" 2>/dev/null || {
+                    log_warn "Could not switch to branch, trying to reset..."
+                    git reset --hard origin/"$SGLANG_BRANCH" 2>/dev/null || log_warn "Could not reset branch"
+                }
+            fi
+            git pull origin "$SGLANG_BRANCH" || log_warn "Could not pull, continuing..."
+            
+            # Restore remote URL without token (for security)
+            if [ -n "$GITHUB_TOKEN" ]; then
+                git remote set-url origin "$SGLANG_REPO" 2>/dev/null
+            fi
+            
+            log_info "✓ Repository updated"
+            ;;
+        2)
+        log_info "Removing existing repository and cloning fresh copy..."
+        rm -rf "$PROJECT_DIR"
+        # Use token in URL for authentication if available (for private repos)
+        CLONE_URL="$SGLANG_REPO"
+        if [ -n "$GITHUB_TOKEN" ]; then
+            CLONE_URL=$(echo "$SGLANG_REPO" | sed "s|https://|https://${GITHUB_TOKEN}@|")
+        fi
+        git clone -b "$SGLANG_BRANCH" "$CLONE_URL" "$PROJECT_DIR" || {
+            log_error "Failed to clone repository"
+            if [ -z "$GITHUB_TOKEN" ]; then
+                log_info "💡 Tip: For private repositories, you may need to provide a GitHub token."
+                log_info "   Password prompt: Use your GitHub Personal Access Token (PAT) as the password."
+            fi
+            exit 1
+        }
+        # Restore remote URL without token (for security)
+        if [ -n "$GITHUB_TOKEN" ]; then
+            cd "$PROJECT_DIR"
+            git remote set-url origin "$SGLANG_REPO" 2>/dev/null
+        fi
+        log_info "✓ Repository cloned"
+            ;;
+        3)
+            log_info "Skipping repository setup, using existing repository"
+            ;;
+        *)
+            log_warn "Invalid choice, defaulting to update"
+            cd "$PROJECT_DIR"
+            # Check and update remote URL if needed
+            CURRENT_REMOTE=$(git remote get-url origin 2>/dev/null || echo "")
+            if [ "$CURRENT_REMOTE" != "$SGLANG_REPO" ]; then
+                log_info "Updating remote URL to: $SGLANG_REPO"
+                git remote set-url origin "$SGLANG_REPO" 2>/dev/null || git remote add origin "$SGLANG_REPO"
+            fi
+            
+            # Configure Git to use token if available (for private repos)
+            if [ -n "$GITHUB_TOKEN" ]; then
+                GIT_CREDENTIAL_URL=$(echo "$SGLANG_REPO" | sed "s|https://|https://${GITHUB_TOKEN}@|")
+                git remote set-url origin "$GIT_CREDENTIAL_URL" 2>/dev/null
+            fi
+            
+            # Stash local changes before switching branches
+            if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+                log_info "Stashing local changes before updating..."
+                git stash push -m "Auto-stash before branch switch $(date +%Y%m%d_%H%M%S)" 2>/dev/null || log_warn "Could not stash changes"
+            fi
+            
+            git fetch origin
+            git checkout "$SGLANG_BRANCH" 2>/dev/null || git checkout -b "$SGLANG_BRANCH" origin/"$SGLANG_BRANCH" 2>/dev/null || {
+                log_warn "Could not switch to branch, trying to reset..."
+                git reset --hard origin/"$SGLANG_BRANCH" 2>/dev/null || log_warn "Could not reset branch"
+            }
+            git pull origin "$SGLANG_BRANCH" || log_warn "Could not pull, continuing..."
+            
+            # Restore remote URL without token (for security)
+            if [ -n "$GITHUB_TOKEN" ]; then
+                git remote set-url origin "$SGLANG_REPO" 2>/dev/null
+            fi
+            
+            log_info "✓ Repository updated"
+            ;;
+    esac
+else
+    # Repository doesn't exist - ask user if they want to clone
+    log_info "Repository does not exist at: $PROJECT_DIR"
+    echo ""
+    
+    if [ "$SKIP_CONFIRM" = "true" ]; then
+        # Non-interactive mode: default to clone
+        CLONE_REPO="y"
+        log_info "Non-interactive mode: cloning repository"
+    else
+        read -p "Do you want to clone the repository? [Y/n]: " CLONE_REPO
+        CLONE_REPO="${CLONE_REPO:-y}"
+    fi
+    
+    if [[ "$CLONE_REPO" =~ ^[Yy] ]]; then
+        log_info "Cloning repository..."
+        # Use token in URL for authentication if available (for private repos)
+        CLONE_URL="$SGLANG_REPO"
+        if [ -n "$GITHUB_TOKEN" ]; then
+            CLONE_URL=$(echo "$SGLANG_REPO" | sed "s|https://|https://${GITHUB_TOKEN}@|")
+        fi
+        git clone -b "$SGLANG_BRANCH" "$CLONE_URL" "$PROJECT_DIR" || {
+            log_error "Failed to clone repository"
+            if [ -z "$GITHUB_TOKEN" ]; then
+                log_info "💡 Tip: For private repositories, you may need to provide a GitHub token."
+                log_info "   Password prompt: Use your GitHub Personal Access Token (PAT) as the password."
+            fi
+            exit 1
+        }
+        # Restore remote URL without token (for security)
+        if [ -n "$GITHUB_TOKEN" ]; then
+            cd "$PROJECT_DIR"
+            git remote set-url origin "$SGLANG_REPO" 2>/dev/null
+        fi
+        log_info "✓ Repository cloned"
+    else
+        log_warn "Skipping repository clone"
+        log_info "You will need to set up the repository manually"
+        log_info "Expected location: $PROJECT_DIR"
+    fi
+fi
+
+# Verify repository exists
+if [ ! -d "$PROJECT_DIR/.git" ]; then
+    log_error "Repository not found at $PROJECT_DIR"
+    log_info "Please clone the repository manually or run this script again"
+    exit 1
+fi
+
+log_info "✓ Repository ready"
+
+# Step 3: Create virtual environment
+log_step "Setting up Python virtual environment..."
+VENV_DIR="$WORKSPACE_DIR/venv_sglang"
+if [ ! -d "$VENV_DIR" ]; then
+    log_info "Creating virtual environment..."
+    python3 -m venv "$VENV_DIR" || {
+        log_error "Failed to create virtual environment"
+        exit 1
+    }
+fi
+
+# Activate virtual environment
+source "$VENV_DIR/bin/activate"
+log_info "✓ Virtual environment ready"
+
+# Upgrade pip
+log_info "Upgrading pip..."
+python -m pip install --upgrade pip --quiet
+
+# Step 4: Install wheels (if not skipped)
+INSTALLED_WHEELS=()
+FAILED_WHEELS=()
+LIBOMP_INSTALLED=false
+
+if [ "$SKIP_WHEELS" != "true" ]; then
+    log_step "Installing wheels from GitHub Releases..."
+    cd "$PROJECT_DIR"
+    
+    # GitHub Releases configuration
+    REPO_OWNER="nthu-pllab"
+    REPO_NAME="pllab-sglang"
+    RELEASE_TAG="${WHEELS_RELEASE_TAG:-v1.0}"
+    # Trim whitespace from token if provided
+    GITHUB_TOKEN=$(echo "${GITHUB_TOKEN:-}" | tr -d '\n\r' | xargs)
+    WHEELS_DIR="$WORKSPACE_DIR/wheels"
+    
+    # Debug: Verify token is set (without showing actual token)
+    if [ -n "$GITHUB_TOKEN" ]; then
+        TOKEN_LEN=${#GITHUB_TOKEN}
+        log_info "GITHUB_TOKEN is set (length: $TOKEN_LEN chars)"
+        if [ $TOKEN_LEN -lt 20 ]; then
+            log_warn "Warning: Token seems too short. Please verify it's correct."
+        fi
+    else
+        log_warn "GITHUB_TOKEN is not set!"
+    fi
+    
+    # Create temporary directory for wheels
+    mkdir -p "$WHEELS_DIR"
+    cd "$WHEELS_DIR"
+    
+    log_info "Downloading riscv_wheels_and_libomp.tar.gz from GitHub Releases (tag: $RELEASE_TAG)..."
+    
+    # Download the combined archive
+    ARCHIVE_FILE="riscv_wheels_and_libomp.tar.gz"
+    DOWNLOAD_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${RELEASE_TAG}/${ARCHIVE_FILE}"
+    
+    # Log the download URL for debugging
+    log_info "Download URL: $DOWNLOAD_URL"
+    
+    # Try to download with better error reporting
+    # For private repos, use GitHub token if available
+    DOWNLOAD_SUCCESS=false
+    if [ -n "$GITHUB_TOKEN" ]; then
+        log_info "Using GitHub token for authentication..."
+    fi
+    
+    if command -v curl >/dev/null 2>&1; then
+        log_info "Using curl to download..."
+        # Use -f to fail on HTTP errors, but capture stderr for error messages
+        # Use -w to capture HTTP status code
+        if [ -n "$GITHUB_TOKEN" ]; then
+            # Trim token to remove any whitespace and newlines
+            GITHUB_TOKEN=$(echo "$GITHUB_TOKEN" | tr -d '\n\r' | xargs)
+            # Query release API to get asset ID (required for private repositories)
+            API_TEST=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${RELEASE_TAG}" 2>&1)
+            
+            if echo "$API_TEST" | grep -q '"tag_name"'; then
+                # Get asset ID from API response
+                if command -v python3 >/dev/null 2>&1; then
+                    ASSET_ID=$(echo "$API_TEST" | python3 -c "import sys, json; data=json.load(sys.stdin); assets=data.get('assets', []); target_asset=[a for a in assets if a['name'] == '$ARCHIVE_FILE']; print(target_asset[0]['id'] if target_asset else '')" 2>/dev/null || echo "")
+                    
+                    if [ -n "$ASSET_ID" ]; then
+                        # Use API endpoint for private repository assets
+                        DOWNLOAD_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/assets/${ASSET_ID}"
+                        CURL_OUTPUT=$(curl -L -w "\nHTTP_STATUS:%{http_code}" -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/octet-stream" -o "$ARCHIVE_FILE" "$DOWNLOAD_URL" 2>&1)
+                    else
+                        log_warn "Asset ID not found, using browser_download_url"
+                        CURL_OUTPUT=$(curl -L -w "\nHTTP_STATUS:%{http_code}" -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/octet-stream" -o "$ARCHIVE_FILE" "$DOWNLOAD_URL" 2>&1)
+                    fi
+                else
+                    log_warn "python3 not found, using browser_download_url"
+                    CURL_OUTPUT=$(curl -L -w "\nHTTP_STATUS:%{http_code}" -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/octet-stream" -o "$ARCHIVE_FILE" "$DOWNLOAD_URL" 2>&1)
+                fi
+            else
+                log_warn "⚠ Token may not have access to release API, trying browser_download_url"
+                CURL_OUTPUT=$(curl -L -w "\nHTTP_STATUS:%{http_code}" -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/octet-stream" -o "$ARCHIVE_FILE" "$DOWNLOAD_URL" 2>&1)
+            fi
+            CURL_EXIT=$?
+        else
+            log_warn "GITHUB_TOKEN is empty! Attempting download without authentication..."
+            CURL_OUTPUT=$(curl -L -w "\nHTTP_STATUS:%{http_code}" -o "$ARCHIVE_FILE" "$DOWNLOAD_URL" 2>&1)
+            CURL_EXIT=$?
+        fi
+        
+        HTTP_STATUS=$(echo "$CURL_OUTPUT" | grep "HTTP_STATUS:" | cut -d: -f2 | tr -d ' ' || echo "")
+        CURL_ERROR=$(echo "$CURL_OUTPUT" | grep -v "HTTP_STATUS:" || echo "$CURL_OUTPUT")
+        
+        # Check if download was successful based on HTTP status and file existence
+        if [ "$HTTP_STATUS" = "200" ] && [ -f "$ARCHIVE_FILE" ] && [ -s "$ARCHIVE_FILE" ]; then
+            DOWNLOAD_SUCCESS=true
+        else
+            log_error "Download failed (HTTP $HTTP_STATUS)"
+            if [ "$HTTP_STATUS" = "404" ]; then
+                log_error "File not found. Please verify release '$RELEASE_TAG' exists and contains '$ARCHIVE_FILE'"
+            elif [ "$HTTP_STATUS" = "401" ] || [ "$HTTP_STATUS" = "403" ]; then
+                log_error "Authentication failed. Please check your GitHub token"
+            fi
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        log_info "Using wget to download..."
+        if [ -n "$GITHUB_TOKEN" ]; then
+            WGET_OUTPUT=$(wget --header="Authorization: token $GITHUB_TOKEN" -O "$ARCHIVE_FILE" "$DOWNLOAD_URL" 2>&1)
+        else
+            WGET_OUTPUT=$(wget -O "$ARCHIVE_FILE" "$DOWNLOAD_URL" 2>&1)
+        fi
+        WGET_EXIT=$?
+        if [ $WGET_EXIT -eq 0 ] && [ -f "$ARCHIVE_FILE" ] && [ -s "$ARCHIVE_FILE" ]; then
+            DOWNLOAD_SUCCESS=true
+        else
+            log_error "wget download failed (exit code: $WGET_EXIT)"
+            if echo "$WGET_OUTPUT" | grep -q "404"; then
+                log_error "File not found (404). Possible reasons:"
+                log_info "  1. Release '$RELEASE_TAG' does not exist"
+                log_info "  2. File '$ARCHIVE_FILE' not found in the release"
+                log_info "  3. Repository is private and token may not have access"
+            elif echo "$WGET_OUTPUT" | grep -q "401\|403"; then
+                log_error "Authentication failed (401/403). Possible reasons:"
+                log_info "  1. GitHub token is invalid or expired"
+                log_info "  2. Token does not have 'repo' scope for private repository"
+                log_info "  3. Token does not have access to this repository"
+                log_info ""
+                log_info "Please check your token at: https://github.com/settings/tokens"
+            elif echo "$WGET_OUTPUT" | grep -q "422"; then
+                log_error "Unprocessable Entity (422). Release may not exist or file name is incorrect."
+            else
+                log_warn "Error details:"
+                echo "$WGET_OUTPUT" | head -10
+            fi
+        fi
+    else
+        log_error "Neither curl nor wget found. Please install one of them."
+        exit 1
+    fi
+    
+    if [ "$DOWNLOAD_SUCCESS" = true ] && [ -f "$ARCHIVE_FILE" ]; then
+        log_info "  ✓ Downloaded $ARCHIVE_FILE"
+        
+        # Extract archive
+        log_info "Extracting archive..."
+        tar -xzf "$ARCHIVE_FILE" -C "$WHEELS_DIR" 2>/dev/null || {
+            log_error "Failed to extract $ARCHIVE_FILE"
+            exit 1
+        }
+        log_info "  ✓ Extracted archive"
+        
+        # Install all wheels (check if already installed first)
+        log_info "Installing Python wheels..."
+        for wheel_file in "$WHEELS_DIR"/*.whl; do
+            if [ -f "$wheel_file" ]; then
+                wheel_name=$(basename "$wheel_file")
+                # Extract package name from wheel filename (e.g., torch-2.8.0... -> torch)
+                package_name=$(echo "$wheel_name" | sed -E 's/-[0-9].*//' | sed 's/_/-/g')
+                
+                # Check if package is already installed
+                if python -c "import ${package_name//-/_}" 2>/dev/null || \
+                   pip show "$package_name" >/dev/null 2>&1; then
+                    log_info "  ⊙ $wheel_name already installed, skipping"
+                    INSTALLED_WHEELS+=("$wheel_name (already installed)")
+                else
+                    log_info "  Installing $wheel_name..."
+                    if pip install "$wheel_file" --quiet 2>&1; then
+                        log_info "  ✓ Installed $wheel_name"
+                        INSTALLED_WHEELS+=("$wheel_name")
+                    else
+                        log_warn "  ✗ Failed to install $wheel_name"
+                        FAILED_WHEELS+=("$wheel_name")
+                    fi
+                fi
+            fi
+        done
+        
+        # Setup libomp (check if already installed)
+        LIBOMP_FILE="$WHEELS_DIR/libomp_riscv.tar.gz"
+        LIBOMP_DIR="$HOME/.local/lib"
+        if [ -f "$LIBOMP_FILE" ]; then
+            if [ -f "$LIBOMP_DIR/libomp.so" ]; then
+                log_info "libomp already installed at $LIBOMP_DIR/libomp.so, skipping"
+                LIBOMP_INSTALLED=true
+            else
+                log_info "Setting up OpenMP library..."
+                mkdir -p "$LIBOMP_DIR"
+                if tar -xzf "$LIBOMP_FILE" -C "$LIBOMP_DIR" 2>/dev/null; then
+                    if [ -f "$LIBOMP_DIR/libomp.so" ]; then
+                        if ! grep -q "LD_PRELOAD.*libomp.so" ~/.bashrc 2>/dev/null; then
+                            echo "" >> ~/.bashrc
+                            echo "# OpenMP library configuration (for sgl-kernel)" >> ~/.bashrc
+                            echo "export LD_PRELOAD=\"$LIBOMP_DIR/libomp.so\${LD_PRELOAD:+:\$LD_PRELOAD}\"" >> ~/.bashrc
+                            echo "export LD_LIBRARY_PATH=\"$LIBOMP_DIR:\${LD_LIBRARY_PATH}\"" >> ~/.bashrc
+                        fi
+                        log_info "  ✓ libomp configured"
+                        LIBOMP_INSTALLED=true
+                    else
+                        log_warn "  ✗ libomp.so not found after extraction"
+                    fi
+                else
+                    log_warn "  ✗ Failed to extract libomp_riscv.tar.gz"
+                fi
+            fi
+        else
+            log_warn "libomp_riscv.tar.gz not found in archive"
+        fi
+    else
+        log_error "Failed to download $ARCHIVE_FILE from GitHub Releases"
+        log_info "URL: $DOWNLOAD_URL"
+        log_info ""
+        log_info "Possible reasons:"
+        log_info "  1. Release tag '$RELEASE_TAG' does not exist"
+        log_info "  2. File '$ARCHIVE_FILE' not found in the release"
+        log_info "  3. Network connectivity issues"
+        log_info ""
+        log_info "Please check:"
+        log_info "  https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/tag/${RELEASE_TAG}"
+        log_info ""
+        log_info "You can manually download the file and place it at: $WHEELS_DIR/$ARCHIVE_FILE"
+        exit 1
+    fi
+    
+    # Clean up
+    cd "$PROJECT_DIR"
+    rm -rf "$WHEELS_DIR"
+else
+    log_info "Skipping wheel installation"
+fi
+
+# Step 5: Install Python dependencies
+log_step "Installing Python dependencies..."
+cd "$PROJECT_DIR"
+
+# Install from requirements.txt if exists
+if [ -f "banana_pi/test_tinyllama_riscv/requirements.txt" ]; then
+    log_info "Installing from requirements.txt..."
+    pip install -r "banana_pi/test_tinyllama_riscv/requirements.txt" --quiet || log_warn "Some packages failed to install"
+fi
+
+# Install common packages that might be missing
+log_info "Installing common packages..."
+
+# Packages available in wheel_builder (install from wheel_builder first for faster installation)
+WHEEL_BUILDER_PACKAGES=(
+    "numpy"
+    "scipy"
+    "pandas"
+    "pillow"
+    "matplotlib"
+    "tokenizers"
+    "tiktoken"
+    "psutil"
+    "uvloop"
+    "pyyaml"  
+    "aiohttp"
+    "orjson"
+    "msgspec"
+    "sentencepiece"
+    "setproctitle"
+    "xxhash"
+    "openai-harmony"  
+    "pydantic-core"  
+)
+
+# Other core dependencies (install from PyPI)
+OTHER_CORE_DEPS=(
+    "tqdm"
+    "packaging"
+    "pybase64"
+    "fastapi"
+    "uvicorn"
+    "python-multipart"
+    "pydantic>=2.0"
+    "compressed-tensors"
+    "gguf"
+    "huggingface_hub"
+    "einops"
+    "prometheus-client>=0.20.0"
+    "requests"
+    "interegular"
+    "jsonschema"
+    "partial_json_parser"
+    "openai"
+    "dill"
+    "multiprocess"
+    "torchao"
+    "xgrammar"
+    "pytest"
+)
+
+# Track installation results
+INSTALLED_PACKAGES=()
+FAILED_PACKAGES=()
+SKIPPED_PACKAGES=()
+
+# Install packages from wheel_builder first (faster, pre-compiled)
+log_info "Installing packages from wheel_builder (pre-compiled wheels)..."
+for package in "${WHEEL_BUILDER_PACKAGES[@]}"; do
+    # Extract base package name (remove version constraints)
+    base_package="${package%%[>=<]*}"
+    # Handle special cases
+    if [ "$package" = "pyyaml" ]; then
+        import_name="yaml"
+    elif [ "$package" = "openai-harmony" ]; then
+        import_name="openai_harmony"
+    elif [ "$package" = "pydantic-core" ]; then
+        import_name="pydantic_core"
+    else
+        import_name="$base_package"
+    fi
+    
+    # Check if already installed
+    if python -c "import $import_name" 2>/dev/null; then
+        log_info "  ⊙ $package already installed, skipping"
+        SKIPPED_PACKAGES+=("$package")
+    else
+        log_info "Installing $package from wheel_builder..."
+        set +e
+        pip install "$package" --index-url "$WHEEL_BUILDER_URL" --quiet 2>/dev/null
+        INSTALL_EXIT=$?
+        set -e
+        
+        if [ $INSTALL_EXIT -eq 0 ] || python -c "import $import_name" 2>/dev/null; then
+            log_info "  ✓ Installed $package"
+            INSTALLED_PACKAGES+=("$package")
+        else
+            log_warn "  ✗ Failed from wheel_builder, trying PyPI..."
+            set +e
+            pip install "$package" --quiet 2>/dev/null
+            INSTALL_EXIT=$?
+            set -e
+            
+            if [ $INSTALL_EXIT -eq 0 ] || python -c "import $import_name" 2>/dev/null; then
+                log_info "  ✓ Installed $package from PyPI"
+                INSTALLED_PACKAGES+=("$package")
+            else
+                log_warn "  ✗ Failed to install $package"
+                FAILED_PACKAGES+=("$package")
+            fi
+        fi
+    fi
+done
+
+# Install other core dependencies from PyPI
+log_info "Installing other core dependencies from PyPI..."
+for package in "${OTHER_CORE_DEPS[@]}"; do
+    # Extract base package name for import check
+    base_package="${package%%[>=<]*}"
+    # Handle special cases for import names
+    case "$base_package" in
+        "prometheus-client")
+            import_name="prometheus_client"
+            ;;
+        "python-multipart")
+            import_name="multipart"
+            ;;
+        "huggingface_hub")
+            import_name="huggingface_hub"
+            ;;
+        "partial_json_parser")
+            import_name="partial_json"
+            ;;
+        "pybase64")
+            import_name="pybase64"
+            ;;
+        *)
+            import_name="$base_package"
+            ;;
+    esac
+    
+    # Check if already installed
+    if python -c "import $import_name" 2>/dev/null; then
+        log_info "  ⊙ $package already installed, skipping"
+        SKIPPED_PACKAGES+=("$package")
+    else
+        log_info "Installing $package..."
+        set +e
+        pip install "$package" --quiet 2>/dev/null
+        INSTALL_EXIT=$?
+        set -e
+        
+        if [ $INSTALL_EXIT -eq 0 ] || python -c "import $import_name" 2>/dev/null; then
+            log_info "  ✓ Installed $package"
+            INSTALLED_PACKAGES+=("$package")
+        else
+            log_warn "  ✗ Failed to install $package"
+            FAILED_PACKAGES+=("$package")
+        fi
+    fi
+done
+
+# Install sglang in development mode using --no-deps (to skip GPU-specific packages)
+SGLANG_INSTALL_LOG="$WORKSPACE_DIR/sglang_install.log"
+log_info "Installing sglang (logs: $SGLANG_INSTALL_LOG)..."
+log_info "  Using --no-deps to skip GPU-specific packages (decord2, cuda-python, etc.)"
+set +e
+# SGLang's pyproject.toml is in the python/ directory
+if [ -f "$PROJECT_DIR/python/pyproject.toml" ]; then
+    pip install --no-deps -e "$PROJECT_DIR/python" 2>&1 | tee "$SGLANG_INSTALL_LOG"
+    SGLANG_INSTALL_EXIT=${PIPESTATUS[0]}
+else
+    # Fallback: try root directory
+    pip install --no-deps -e "$PROJECT_DIR" 2>&1 | tee "$SGLANG_INSTALL_LOG"
+    SGLANG_INSTALL_EXIT=${PIPESTATUS[0]}
+fi
+set -e
+
+if [ $SGLANG_INSTALL_EXIT -eq 0 ]; then
+    log_info "  ✓ Installed sglang (without dependencies)"
+    log_info "  Note: Dependencies should be installed in previous steps or can be installed manually as needed"
+    INSTALLED_PACKAGES+=("sglang")
+else
+    log_warn "  ✗ Failed to install sglang in development mode"
+    if [ -f "$SGLANG_INSTALL_LOG" ]; then
+        log_warn "  └─ See last 40 log lines for details:"
+        tail -n 40 "$SGLANG_INSTALL_LOG"
+    fi
+    FAILED_PACKAGES+=("sglang")
+fi
+
+# Display installation summary
+echo ""
+log_step "Installation Summary"
+echo "============================================================"
+if [ ${#INSTALLED_WHEELS[@]} -gt 0 ]; then
+    log_info "Successfully installed/verified wheels (${#INSTALLED_WHEELS[@]}):"
+    for wheel in "${INSTALLED_WHEELS[@]}"; do
+        echo "  ✓ $wheel"
+    done
+fi
+
+if [ "$LIBOMP_INSTALLED" = true ]; then
+    log_info "OpenMP library: ✓ Installed/configured"
+else
+    log_warn "OpenMP library: ✗ Not installed"
+fi
+
+if [ ${#INSTALLED_PACKAGES[@]} -gt 0 ]; then
+    log_info "Successfully installed packages (${#INSTALLED_PACKAGES[@]}):"
+    for pkg in "${INSTALLED_PACKAGES[@]}"; do
+        echo "  ✓ $pkg"
+    done
+fi
+
+if [ ${#SKIPPED_PACKAGES[@]} -gt 0 ]; then
+    log_info "Skipped (already installed) (${#SKIPPED_PACKAGES[@]}):"
+    for pkg in "${SKIPPED_PACKAGES[@]}"; do
+        echo "  ⊙ $pkg"
+    done
+fi
+
+if [ ${#FAILED_WHEELS[@]} -gt 0 ] || [ ${#FAILED_PACKAGES[@]} -gt 0 ]; then
+    log_warn "Failed installations:"
+    for wheel in "${FAILED_WHEELS[@]}"; do
+        echo "  ✗ $wheel"
+    done
+    for pkg in "${FAILED_PACKAGES[@]}"; do
+        echo "  ✗ $pkg"
+    done
+    echo ""
+    log_info "You may need to install these manually or check for compatibility issues"
+fi
+echo "============================================================"
+echo ""
+
+# Step 6: Configure OpenMP library
+log_step "Configuring OpenMP library..."
+LIBOMP_DIR="$HOME/.local/lib"
+LIBOMP_SO="$LIBOMP_DIR/libomp.so"
+
+if [ -f "$LIBOMP_SO" ]; then
+    # Add to .bashrc if not already there
+    if ! grep -q "LD_PRELOAD.*libomp.so" ~/.bashrc 2>/dev/null; then
+        echo "" >> ~/.bashrc
+        echo "# OpenMP library configuration (for sgl-kernel)" >> ~/.bashrc
+        echo "export LD_PRELOAD=\"$LIBOMP_SO\${LD_PRELOAD:+:\$LD_PRELOAD}\"" >> ~/.bashrc
+        echo "export LD_LIBRARY_PATH=\"$LIBOMP_DIR:\${LD_LIBRARY_PATH}\"" >> ~/.bashrc
+    fi
+    log_info "✓ OpenMP library configured"
+else
+    log_warn "libomp.so not found at $LIBOMP_SO"
+    log_info "You may need to install OpenMP library manually"
+fi
+
+# Step 7: Verify setup
+log_step "Verifying setup..."
+cd "$PROJECT_DIR"
+
+VERIFY_ERRORS=0
+
+# Check if test file exists
+TEST_FILE="banana_pi/test_tinyllama_riscv/test_tinyllama_riscv.py"
+if [ -f "$TEST_FILE" ]; then
+    log_info "✓ Test file found: $TEST_FILE"
+else
+    log_warn "Test file not found: $TEST_FILE"
+    log_warn "  └─ Pull latest changes or re-run this script with option 1 'update' or 2 're-clone'"
+    VERIFY_ERRORS=1
+fi
+
+# Check if config file exists
+CONFIG_FILE="banana_pi/test_tinyllama_riscv/config_riscv.yaml"
+if [ -f "$CONFIG_FILE" ]; then
+    log_info "✓ Config file found: $CONFIG_FILE"
+else
+    log_warn "Config file not found: $CONFIG_FILE"
+    log_warn "  └─ Ensure repository includes banana_pi/test_tinyllama_riscv assets"
+    VERIFY_ERRORS=1
+fi
+
+if [ $VERIFY_ERRORS -eq 0 ]; then
+    log_info "✓ Setup verification passed"
+else
+    log_warn "Setup verification completed with warnings. Please address the missing files above."
+fi
+
+echo ""
+log_info "Setup completed successfully!"
+echo ""
+log_info "Next steps:"
+echo "  1. Activate virtual environment:"
+echo "     source $VENV_DIR/bin/activate"
+echo ""
+echo "  2. Run the test:"
+echo "     cd $PROJECT_DIR"
+echo "     python $TEST_FILE"
+echo ""
+REMOTE_SCRIPT_EOF
+)
+
+# Transfer and execute setup script
+log_step "Transferring setup script to Banana Pi..."
+log_info "You may be prompted for SSH password..."
+
+# Write script to temporary file
+TEMP_SCRIPT=$(mktemp)
+echo "$REMOTE_SETUP_SCRIPT" > "$TEMP_SCRIPT"
+trap "rm -f '$TEMP_SCRIPT'" EXIT
+
+# Use scp to transfer script (allows password input)
+# Don't use timeout or output redirection here to allow interactive password input
+set +e
+log_info "Transferring script file..."
+echo ""  # Add blank line before password prompt
+"$SCP_CMD" "$TEMP_SCRIPT" "$BANANA_PI_USER@$BANANA_PI_HOST:/tmp/setup_sglang.sh"
+SCP_EXIT_CODE=$?
+set -e
+
+if [ $SCP_EXIT_CODE -ne 0 ]; then
+    log_error "Failed to transfer setup script (exit code: $SCP_EXIT_CODE)"
+    log_info "Please check:"
+    log_info "  1. SSH password is correct"
+    log_info "  2. Network connectivity"
+    log_info "  3. SSH service is running on Banana Pi"
+    exit 1
+fi
+
+log_info "✓ Script transferred successfully"
+
+# Make script executable
+set +e
+log_info "Making script executable..."
+"$SSH_CMD" -t "$BANANA_PI_USER@$BANANA_PI_HOST" "chmod +x /tmp/setup_sglang.sh"
+SSH_EXIT_CODE=$?
+set -e
+
+if [ $SSH_EXIT_CODE -ne 0 ]; then
+    log_warn "Failed to make script executable (exit code: $SSH_EXIT_CODE)"
+    log_info "Continuing anyway..."
+fi
+
+log_step "Running setup on Banana Pi..."
+log_info "This may take several minutes..."
+log_info "You may be prompted for SSH password if not using key-based authentication..."
+# Use -t to force pseudo-terminal allocation for password input and interactive prompts
+# Don't capture output in variable to allow real-time display and password input
+set +e
+# Ensure stderr is also displayed by redirecting it to stdout
+"$SSH_CMD" -t "$BANANA_PI_USER@$BANANA_PI_HOST" "export SKIP_WHEELS='$SKIP_WHEELS' && export SKIP_CONFIRM='$SKIP_CONFIRM' && export WHEELS_RELEASE_TAG='$WHEELS_RELEASE_TAG' && export GITHUB_TOKEN='$GITHUB_TOKEN' && bash /tmp/setup_sglang.sh 2>&1"
+SSH_EXIT_CODE=$?
+set -e
+
+if [ $SSH_EXIT_CODE -ne 0 ]; then
+    log_error "Failed to run setup script on Banana Pi (exit code: $SSH_EXIT_CODE)"
+    log_info "Please check the output above for error details"
+    exit 1
+fi
+
+# Test execution is disabled by default
+# Users can run the test manually after setup completes
+
+echo ""
+log_info "Setup completed!"
+log_info "To run tests manually, SSH to Banana Pi and run:"
+echo "  cd ~/.local_riscv_env/workspace/sglang"
+echo "  source ~/.local_riscv_env/workspace/venv_sglang/bin/activate"
+echo "  python banana_pi/test_tinyllama_riscv/test_tinyllama_riscv.py"
+echo ""
+
