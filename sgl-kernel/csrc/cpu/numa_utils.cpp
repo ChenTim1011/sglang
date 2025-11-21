@@ -1,15 +1,65 @@
+// NUMA support is optional for RISC-V cross-compilation
+// If numa.h is not available, we provide stub implementations
+#if defined(__riscv) || defined(__riscv__) || !__has_include(<numa.h>)
+  // Stub implementation for RISC-V or when NUMA is not available
+  #include <cstddef>
+  #include <cstdlib>
+  #include <sched.h>
+  #include <sys/syscall.h>
+  #include <sys/types.h>
+  #include <unistd.h>
+  #include <string>
+  #include <vector>
+  #include <algorithm>
+  #include <sstream>
+  
+  #include "common.h"
+  
+  // Stub NUMA types and functions
+  typedef struct {
+    unsigned long* maskp;
+    size_t size;
+  } bitmask;
+  
+  inline int numa_available() { return -1; }  // NUMA not available
+  inline bitmask* numa_parse_cpustring(const char* s) {
+    // Return a minimal stub
+    static bitmask stub_mask = {nullptr, 0};
+    return &stub_mask;
+  }
+  inline int numa_node_of_cpu(int cpu) { return 0; }
+  inline bitmask* numa_parse_nodestring(const char* s) {
+    static bitmask stub_mask = {nullptr, 0};
+    return &stub_mask;
+  }
+  inline bitmask* numa_get_membind() {
+    static bitmask stub_mask = {nullptr, 0};
+    return &stub_mask;
+  }
+  inline int numa_migrate_pages(int pid, bitmask* from, bitmask* to) { return 0; }
+  inline void numa_set_membind(bitmask* mask) {}
+  inline void numa_set_strict(int strict) {}
+  inline void numa_free_nodemask(bitmask* mask) {}
+#else
 #include <numa.h>
 #include <sched.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
-
 #include <string>
 
 #include "common.h"
+#endif
 
 std::string init_cpu_threads_env(const std::string& cpu_ids) {
   bitmask* omp_cpu_mask = numa_parse_cpustring(cpu_ids.c_str());
+  // For RISC-V stub, skip NUMA checks
+  #if defined(__riscv) || defined(__riscv__) || !__has_include(<numa.h>)
+    // Stub implementation: just return a simple message
+    std::stringstream ss;
+    ss << "OMP threads binding (NUMA not available on RISC-V): Process " << getpid() << "\n";
+    return ss.str();
+  #else
   TORCH_CHECK(omp_cpu_mask->size > 0);
   std::vector<int> omp_cpu_ids;
   omp_cpu_ids.reserve(omp_cpu_mask->size);
@@ -88,4 +138,5 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
   }
 
   return ss.str();
+  #endif  // !__riscv && __has_include(<numa.h>)
 }
