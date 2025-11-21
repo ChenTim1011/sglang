@@ -220,6 +220,41 @@ def device_context(device: torch.device):
             raise ValueError(f"Unknown device module: {device}")
 
 
+is_ampere_with_cuda_12_3 = lambda: _check(8)
+is_hopper_with_cuda_12_3 = lambda: _check(9)
+
+
+def is_host_cpu_riscv() -> bool:
+    """Check if the host CPU is RISC-V architecture with Vector Extension support."""
+    machine = platform.machine().lower()
+    is_riscv = machine in ("riscv64", "riscv32")
+
+    if not is_riscv:
+        return False
+
+    # Check if PyTorch CPU is available
+    if not (hasattr(torch, "cpu") and torch.cpu.is_available()):
+        return False
+
+    # Additional check: try to detect RISC-V Vector Extension support
+    # This can be done by checking if we can compile with RVV intrinsics
+    # For now, we assume that if we're on RISC-V, we have basic support
+    # The actual RVV capability will be checked at compile time via CPU_CAPABILITY_RVV macro
+
+    return True
+
+
+def is_cpu_only_runtime() -> bool:
+    """Return True when we explicitly run in CPU-only mode."""
+    if os.getenv("SGLANG_CPU_ONLY", "0") == "1":
+        return True
+    if os.getenv("SGLANG_DISABLE_GPU_MODULES", "0") == "1":
+        return True
+    return is_host_cpu_riscv()
+
+
+@lru_cache(maxsize=1)
+def is_blackwell():
 def _check_cuda_device_version(
     device_capability_majors: List[int], cuda_version: Tuple[int, int]
 ):
