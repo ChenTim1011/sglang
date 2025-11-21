@@ -10,7 +10,14 @@ from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
 import numpy
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.utils import is_cpu_only_runtime
+
+if not is_cpu_only_runtime():
+    from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+else:
+
+    def scaled_fp8_quant(*args, **kwargs):
+        raise RuntimeError("FP8 quantization is disabled in CPU-only runtime")
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig

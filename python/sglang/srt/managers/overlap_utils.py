@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, is_host_cpu_riscv
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -15,7 +16,9 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+# Disable torch.compile on RISC-V (Inductor C++ compilation fails with -march=native)
+# get_compiler_backend() already returns "eager" on RISC-V, but explicitly disable for safety
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=is_host_cpu_riscv())
 def _resolve_future_token_ids(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,

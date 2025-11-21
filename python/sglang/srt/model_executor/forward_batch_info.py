@@ -55,7 +55,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton
+from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton, is_host_cpu_riscv
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+_is_riscv = is_host_cpu_riscv()
 
 
 class ForwardMode(IntEnum):
@@ -1082,6 +1083,6 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=(_is_npu or _is_riscv))
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
