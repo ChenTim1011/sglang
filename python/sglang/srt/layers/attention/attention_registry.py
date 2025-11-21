@@ -230,3 +230,10 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("riscv")
+def create_riscv_backend(runner):
+    from sglang.srt.layers.attention.riscv_backend import RISCVAttnBackend
+
+    return RISCVAttnBackend(runner)
