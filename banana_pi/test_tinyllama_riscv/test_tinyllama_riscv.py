@@ -276,8 +276,9 @@ def check_libomp():
     except OSError as e:
         issues.append(f"libomp cannot be loaded: {e}")
         print(f"  ⚠ libomp cannot be loaded: {e}")
-    except:
-        pass
+    except Exception as e:
+        issues.append(f"Unexpected error when loading libomp: {e}")
+        print(f"  ⚠ Unexpected error when loading libomp: {e}")
 
     # Print warnings and issues
     if warnings:
@@ -433,7 +434,8 @@ def launch_server():
                 f.write('import sys\n')
                 f.write('import os\n')
                 f.write('import importlib\n')
-                f.write(f'sys.path.insert(0, r"{script_dir}")\n')
+                script_dir_real = os.path.realpath(script_dir)
+                f.write(f'sys.path.insert(0, r"{script_dir_real}")\n')
                 f.write('\n')
                 f.write(
                     '# Step 1: Load triton_stub FIRST, before any other imports\n')
@@ -495,7 +497,8 @@ def launch_server():
                 f.write('import sys\n')
                 f.write('import os\n')
                 f.write('import importlib\n')
-                f.write(f'sys.path.insert(0, r"{script_dir}")\n')
+                script_dir_real = os.path.realpath(script_dir)
+                f.write(f'sys.path.insert(0, r"{script_dir_real}")\n')
                 f.write('\n')
                 f.write('# Force import and registration of riscv backend\n')
                 f.write('try:\n')
@@ -527,13 +530,17 @@ def launch_server():
             print("  ✓ Created wrapper script to ensure riscv backend registration")
 
         # Start process with output redirected to log file
-        process = subprocess.Popen(
-            server_cmd,
-            stdout=open(log_file, 'a'),
-            stderr=subprocess.STDOUT,
-            cwd=script_dir,
-            env=env
-        )
+        log_f = open(log_file, 'a')
+        try:
+            process = subprocess.Popen(
+                server_cmd,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                cwd=script_dir,
+                env=env
+            )
+        finally:
+            log_f.close()
 
         print(f"📡 Server process started with PID: {process.pid}")
         print(f"💡 Monitor progress: tail -f {log_file}")
@@ -550,7 +557,7 @@ def launch_server():
                     lines = f.readlines()
                     for line in lines[-20:]:
                         print(f"   {line.rstrip()}")
-            except:
+            except (OSError, IOError):
                 pass
             return False
 
@@ -573,7 +580,7 @@ def launch_server():
                         lines = f.readlines()
                         for line in lines[-30:]:
                             print(f"   {line.rstrip()}")
-                except:
+                except Exception:
                     pass
                 return False
 
@@ -645,7 +652,7 @@ def launch_server():
                                 print(f"   📝 Latest log entries:")
                                 for line in last_lines:
                                     print(f"      {line[:100]}")
-                except:
+                except (FileNotFoundError, IOError):
                     pass
                 last_check = time.time()
 
