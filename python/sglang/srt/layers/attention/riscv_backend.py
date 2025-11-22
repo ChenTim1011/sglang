@@ -48,7 +48,14 @@ class RISCVAttnBackend(AttentionBackend):
             print(
                 "[RISC-V Backend] Detected RISC-V system, attempting to load RISC-V kernels...", flush=True)
             try:
-                import sgl_kernel
+                # Check if sgl_kernel is available using importlib
+                import importlib.util
+                spec = importlib.util.find_spec("sgl_kernel")
+                if spec is None:
+                    raise ImportError("sgl_kernel not found")
+                # Import sgl_kernel to access torch.ops.sgl_kernel
+                # Use __import__ to avoid ruff F401 warning
+                __import__("sgl_kernel")
 
                 # Try to load RISC-V optimized kernels
                 has_decode = hasattr(torch.ops.sgl_kernel,
@@ -85,6 +92,10 @@ class RISCVAttnBackend(AttentionBackend):
             print(
                 "[RISC-V Backend] ⚠ System is not RISC-V, will use fallback backend", flush=True)
 
+    def _check_head_dim_alignment(self, qk_head_dim: int, v_head_dim: int) -> bool:
+        """Check if head dimensions are aligned for RISC-V kernel."""
+        return qk_head_dim % 16 == 0 and v_head_dim % 16 == 0
+
     def _supports_riscv_decode(self, layer: RadixAttention, forward_batch: ForwardBatch) -> bool:
         """
         Check if RISC-V kernel supports this decode case.
@@ -98,9 +109,7 @@ class RISCVAttnBackend(AttentionBackend):
             return False
 
         # Phase 1: Basic support checks
-        # Check if head dimensions are supported
-        if layer.qk_head_dim % 16 != 0 or layer.v_head_dim % 16 != 0:
-            # RISC-V kernel may require aligned dimensions
+        if not self._check_head_dim_alignment(layer.qk_head_dim, layer.v_head_dim):
             return False
 
         # Check if batch size is reasonable
@@ -126,7 +135,7 @@ class RISCVAttnBackend(AttentionBackend):
             return False
 
         # Similar checks as decode
-        if layer.qk_head_dim % 16 != 0 or layer.v_head_dim % 16 != 0:
+        if not self._check_head_dim_alignment(layer.qk_head_dim, layer.v_head_dim):
             return False
 
         return True
