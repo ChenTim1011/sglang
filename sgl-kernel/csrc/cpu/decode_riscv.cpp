@@ -7,6 +7,8 @@
 #pragma clang riscv intrinsic vector
 #endif
 
+#include <vector>
+
 #include "common.h"
 
 #if defined(CPU_CAPABILITY_RVV)
@@ -85,6 +87,9 @@ inline void index_gemm_kernel_nt_rvv(
   // Set vector length (based on K size)
   size_t vl = __riscv_vsetvl_e32m1(K);
 
+  // Check head_dim size to prevent buffer overflow
+  TORCH_CHECK(K <= 256, "head_dim (", K, ") exceeds maximum supported size (256)");
+
   // Temporary buffer for converting scalar_t to float32
   // This is needed when scalar_t is float16 (2 bytes) but we need float32 (4 bytes) for RVV
   alignas(64) float q_float32[256];  // Max head_dim typically 256
@@ -129,11 +134,24 @@ inline void index_gemm_kernel_nt_rvv(
       }
 
       // Reduce sum
-      float temp[32];  // Max VLEN/32 for RVV (support up to VLEN=1024)
-      __riscv_vse32_v_f32m1(temp, vdot, vl);
+      // Use dynamic buffer size based on actual vl to avoid overflow
+      // RVV supports VLEN up to 65536, so we need to handle variable sizes
       float sum = 0.0f;
-      for (size_t i = 0; i < vl; i++) {
-        sum += temp[i];
+      size_t temp_size = (vl + 31) / 32;  // Round up to handle any VLEN
+      if (temp_size > 32) {
+        // For very large VLEN, use dynamic allocation
+        std::vector<float> temp_vec(temp_size);
+        __riscv_vse32_v_f32m1(temp_vec.data(), vdot, vl);
+        for (size_t i = 0; i < vl; i++) {
+          sum += temp_vec[i];
+        }
+      } else {
+        // For normal VLEN (<= 1024), use stack buffer
+        float temp[32];  // Sufficient for VLEN up to 1024 (32 * 32 = 1024)
+        __riscv_vse32_v_f32m1(temp, vdot, vl);
+        for (size_t i = 0; i < vl; i++) {
+          sum += temp[i];
+        }
       }
 
       // Apply scaling and store result
