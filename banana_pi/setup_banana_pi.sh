@@ -1,7 +1,7 @@
 #!/bin/bash
 # SGLang RISC-V Setup Script for Banana Pi
 # This script helps set up SGLang on Banana Pi for running test_tinyllama_riscv.py
-# 
+#
 # Features:
 # - Clone sglang repo (from pllab-sglang/riscv_backend branch)
 # - Install Python dependencies
@@ -167,10 +167,10 @@ echo ""
 if [ "$SKIP_CONFIRM" = false ]; then
     read -p "Banana Pi Username [$BANANA_PI_USER]: " input_user
     BANANA_PI_USER="${input_user:-$BANANA_PI_USER}"
-    
+
     read -p "Banana Pi Host/IP [$BANANA_PI_HOST]: " input_host
     BANANA_PI_HOST="${input_host:-$BANANA_PI_HOST}"
-    
+
     # Ask for GitHub token if not already set
     if [ -z "$GITHUB_TOKEN" ]; then
         echo ""
@@ -287,7 +287,7 @@ if [ -d "$PROJECT_DIR/.git" ]; then
     echo "  2) Remove and re-clone (fresh start)"
     echo "  3) Skip repository setup (use existing)"
     echo ""
-    
+
     if [ "$SKIP_CONFIRM" = "true" ]; then
         # Non-interactive mode: default to update
         REPO_ACTION="1"
@@ -296,7 +296,7 @@ if [ -d "$PROJECT_DIR/.git" ]; then
         read -p "Enter choice [1-3] (default: 1): " REPO_ACTION
         REPO_ACTION="${REPO_ACTION:-1}"
     fi
-    
+
     case "$REPO_ACTION" in
         1)
             log_info "Updating existing repository..."
@@ -307,20 +307,20 @@ if [ -d "$PROJECT_DIR/.git" ]; then
                 log_info "Updating remote URL to: $SGLANG_REPO"
                 git remote set-url origin "$SGLANG_REPO" 2>/dev/null || git remote add origin "$SGLANG_REPO"
             fi
-            
+
             # Configure Git to use token if available (for private repos)
             if [ -n "$GITHUB_TOKEN" ]; then
                 # Use token in URL for authentication (only for this session)
                 GIT_CREDENTIAL_URL=$(echo "$SGLANG_REPO" | sed "s|https://|https://${GITHUB_TOKEN}@|")
                 git remote set-url origin "$GIT_CREDENTIAL_URL" 2>/dev/null
             fi
-            
+
             # Stash local changes before switching branches
             if ! git diff-index --quiet HEAD -- 2>/dev/null; then
                 log_info "Stashing local changes before updating..."
                 git stash push -m "Auto-stash before branch switch $(date +%Y%m%d_%H%M%S)" 2>/dev/null || log_warn "Could not stash changes"
             fi
-            
+
             git fetch origin
             CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
             if [ "$CURRENT_BRANCH" != "$SGLANG_BRANCH" ]; then
@@ -331,12 +331,12 @@ if [ -d "$PROJECT_DIR/.git" ]; then
                 }
             fi
             git pull origin "$SGLANG_BRANCH" || log_warn "Could not pull, continuing..."
-            
+
             # Restore remote URL without token (for security)
             if [ -n "$GITHUB_TOKEN" ]; then
                 git remote set-url origin "$SGLANG_REPO" 2>/dev/null
             fi
-            
+
             log_info "✓ Repository updated"
             ;;
         2)
@@ -374,31 +374,31 @@ if [ -d "$PROJECT_DIR/.git" ]; then
                 log_info "Updating remote URL to: $SGLANG_REPO"
                 git remote set-url origin "$SGLANG_REPO" 2>/dev/null || git remote add origin "$SGLANG_REPO"
             fi
-            
+
             # Configure Git to use token if available (for private repos)
             if [ -n "$GITHUB_TOKEN" ]; then
                 GIT_CREDENTIAL_URL=$(echo "$SGLANG_REPO" | sed "s|https://|https://${GITHUB_TOKEN}@|")
                 git remote set-url origin "$GIT_CREDENTIAL_URL" 2>/dev/null
             fi
-            
+
             # Stash local changes before switching branches
             if ! git diff-index --quiet HEAD -- 2>/dev/null; then
                 log_info "Stashing local changes before updating..."
                 git stash push -m "Auto-stash before branch switch $(date +%Y%m%d_%H%M%S)" 2>/dev/null || log_warn "Could not stash changes"
             fi
-            
+
             git fetch origin
             git checkout "$SGLANG_BRANCH" 2>/dev/null || git checkout -b "$SGLANG_BRANCH" origin/"$SGLANG_BRANCH" 2>/dev/null || {
                 log_warn "Could not switch to branch, trying to reset..."
                 git reset --hard origin/"$SGLANG_BRANCH" 2>/dev/null || log_warn "Could not reset branch"
             }
             git pull origin "$SGLANG_BRANCH" || log_warn "Could not pull, continuing..."
-            
+
             # Restore remote URL without token (for security)
             if [ -n "$GITHUB_TOKEN" ]; then
                 git remote set-url origin "$SGLANG_REPO" 2>/dev/null
             fi
-            
+
             log_info "✓ Repository updated"
             ;;
     esac
@@ -406,7 +406,7 @@ else
     # Repository doesn't exist - ask user if they want to clone
     log_info "Repository does not exist at: $PROJECT_DIR"
     echo ""
-    
+
     if [ "$SKIP_CONFIRM" = "true" ]; then
         # Non-interactive mode: default to clone
         CLONE_REPO="y"
@@ -415,7 +415,7 @@ else
         read -p "Do you want to clone the repository? [Y/n]: " CLONE_REPO
         CLONE_REPO="${CLONE_REPO:-y}"
     fi
-    
+
     if [[ "$CLONE_REPO" =~ ^[Yy] ]]; then
         log_info "Cloning repository..."
         # Use token in URL for authentication if available (for private repos)
@@ -480,7 +480,7 @@ LIBOMP_INSTALLED=false
 if [ "$SKIP_WHEELS" != "true" ]; then
     log_step "Installing wheels from GitHub Releases..."
     cd "$PROJECT_DIR"
-    
+
     # GitHub Releases configuration
     REPO_OWNER="nthu-pllab"
     REPO_NAME="pllab-sglang"
@@ -488,7 +488,7 @@ if [ "$SKIP_WHEELS" != "true" ]; then
     # Trim whitespace from token if provided
     GITHUB_TOKEN=$(echo "${GITHUB_TOKEN:-}" | tr -d '\n\r' | xargs)
     WHEELS_DIR="$WORKSPACE_DIR/wheels"
-    
+
     # Debug: Verify token is set (without showing actual token)
     if [ -n "$GITHUB_TOKEN" ]; then
         TOKEN_LEN=${#GITHUB_TOKEN}
@@ -499,27 +499,27 @@ if [ "$SKIP_WHEELS" != "true" ]; then
     else
         log_warn "GITHUB_TOKEN is not set!"
     fi
-    
+
     # Create temporary directory for wheels
     mkdir -p "$WHEELS_DIR"
     cd "$WHEELS_DIR"
-    
+
     log_info "Downloading riscv_wheels_and_libomp.tar.gz from GitHub Releases (tag: $RELEASE_TAG)..."
-    
+
     # Download the combined archive
     ARCHIVE_FILE="riscv_wheels_and_libomp.tar.gz"
     DOWNLOAD_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${RELEASE_TAG}/${ARCHIVE_FILE}"
-    
+
     # Log the download URL for debugging
     log_info "Download URL: $DOWNLOAD_URL"
-    
+
     # Try to download with better error reporting
     # For private repos, use GitHub token if available
     DOWNLOAD_SUCCESS=false
     if [ -n "$GITHUB_TOKEN" ]; then
         log_info "Using GitHub token for authentication..."
     fi
-    
+
     if command -v curl >/dev/null 2>&1; then
         log_info "Using curl to download..."
         # Use -f to fail on HTTP errors, but capture stderr for error messages
@@ -529,12 +529,12 @@ if [ "$SKIP_WHEELS" != "true" ]; then
             GITHUB_TOKEN=$(echo "$GITHUB_TOKEN" | tr -d '\n\r' | xargs)
             # Query release API to get asset ID (required for private repositories)
             API_TEST=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${RELEASE_TAG}" 2>&1)
-            
+
             if echo "$API_TEST" | grep -q '"tag_name"'; then
                 # Get asset ID from API response
                 if command -v python3 >/dev/null 2>&1; then
                     ASSET_ID=$(echo "$API_TEST" | python3 -c "import sys, json; data=json.load(sys.stdin); assets=data.get('assets', []); target_asset=[a for a in assets if a['name'] == '$ARCHIVE_FILE']; print(target_asset[0]['id'] if target_asset else '')" 2>/dev/null || echo "")
-                    
+
                     if [ -n "$ASSET_ID" ]; then
                         # Use API endpoint for private repository assets
                         DOWNLOAD_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/assets/${ASSET_ID}"
@@ -557,10 +557,10 @@ if [ "$SKIP_WHEELS" != "true" ]; then
             CURL_OUTPUT=$(curl -L -w "\nHTTP_STATUS:%{http_code}" -o "$ARCHIVE_FILE" "$DOWNLOAD_URL" 2>&1)
             CURL_EXIT=$?
         fi
-        
+
         HTTP_STATUS=$(echo "$CURL_OUTPUT" | grep "HTTP_STATUS:" | cut -d: -f2 | tr -d ' ' || echo "")
         CURL_ERROR=$(echo "$CURL_OUTPUT" | grep -v "HTTP_STATUS:" || echo "$CURL_OUTPUT")
-        
+
         # Check if download was successful based on HTTP status and file existence
         if [ "$HTTP_STATUS" = "200" ] && [ -f "$ARCHIVE_FILE" ] && [ -s "$ARCHIVE_FILE" ]; then
             DOWNLOAD_SUCCESS=true
@@ -607,10 +607,10 @@ if [ "$SKIP_WHEELS" != "true" ]; then
         log_error "Neither curl nor wget found. Please install one of them."
         exit 1
     fi
-    
+
     if [ "$DOWNLOAD_SUCCESS" = true ] && [ -f "$ARCHIVE_FILE" ]; then
         log_info "  ✓ Downloaded $ARCHIVE_FILE"
-        
+
         # Extract archive
         log_info "Extracting archive..."
         tar -xzf "$ARCHIVE_FILE" -C "$WHEELS_DIR" 2>/dev/null || {
@@ -618,7 +618,7 @@ if [ "$SKIP_WHEELS" != "true" ]; then
             exit 1
         }
         log_info "  ✓ Extracted archive"
-        
+
         # Install all wheels (check if already installed first)
         log_info "Installing Python wheels..."
         for wheel_file in "$WHEELS_DIR"/*.whl; do
@@ -626,7 +626,7 @@ if [ "$SKIP_WHEELS" != "true" ]; then
                 wheel_name=$(basename "$wheel_file")
                 # Extract package name from wheel filename (e.g., torch-2.8.0... -> torch)
                 package_name=$(echo "$wheel_name" | sed -E 's/-[0-9].*//' | sed 's/_/-/g')
-                
+
                 # Check if package is already installed
                 if python -c "import ${package_name//-/_}" 2>/dev/null || \
                    pip show "$package_name" >/dev/null 2>&1; then
@@ -644,7 +644,7 @@ if [ "$SKIP_WHEELS" != "true" ]; then
                 fi
             fi
         done
-        
+
         # Setup libomp (check if already installed)
         LIBOMP_FILE="$WHEELS_DIR/libomp_riscv.tar.gz"
         LIBOMP_DIR="$HOME/.local/lib"
@@ -690,7 +690,7 @@ if [ "$SKIP_WHEELS" != "true" ]; then
         log_info "You can manually download the file and place it at: $WHEELS_DIR/$ARCHIVE_FILE"
         exit 1
     fi
-    
+
     # Clean up
     cd "$PROJECT_DIR"
     rm -rf "$WHEELS_DIR"
@@ -722,15 +722,15 @@ WHEEL_BUILDER_PACKAGES=(
     "tiktoken"
     "psutil"
     "uvloop"
-    "pyyaml"  
+    "pyyaml"
     "aiohttp"
     "orjson"
     "msgspec"
     "sentencepiece"
     "setproctitle"
     "xxhash"
-    "openai-harmony"  
-    "pydantic-core"  
+    "openai-harmony"
+    "pydantic-core"
 )
 
 # Other core dependencies (install from PyPI)
@@ -779,7 +779,7 @@ for package in "${WHEEL_BUILDER_PACKAGES[@]}"; do
     else
         import_name="$base_package"
     fi
-    
+
     # Check if already installed
     if python -c "import $import_name" 2>/dev/null; then
         log_info "  ⊙ $package already installed, skipping"
@@ -790,7 +790,7 @@ for package in "${WHEEL_BUILDER_PACKAGES[@]}"; do
         pip install "$package" --index-url "$WHEEL_BUILDER_URL" --quiet 2>/dev/null
         INSTALL_EXIT=$?
         set -e
-        
+
         if [ $INSTALL_EXIT -eq 0 ] || python -c "import $import_name" 2>/dev/null; then
             log_info "  ✓ Installed $package"
             INSTALLED_PACKAGES+=("$package")
@@ -800,7 +800,7 @@ for package in "${WHEEL_BUILDER_PACKAGES[@]}"; do
             pip install "$package" --quiet 2>/dev/null
             INSTALL_EXIT=$?
             set -e
-            
+
             if [ $INSTALL_EXIT -eq 0 ] || python -c "import $import_name" 2>/dev/null; then
                 log_info "  ✓ Installed $package from PyPI"
                 INSTALLED_PACKAGES+=("$package")
@@ -838,7 +838,7 @@ for package in "${OTHER_CORE_DEPS[@]}"; do
             import_name="$base_package"
             ;;
     esac
-    
+
     # Check if already installed
     if python -c "import $import_name" 2>/dev/null; then
         log_info "  ⊙ $package already installed, skipping"
@@ -849,7 +849,7 @@ for package in "${OTHER_CORE_DEPS[@]}"; do
         pip install "$package" --quiet 2>/dev/null
         INSTALL_EXIT=$?
         set -e
-        
+
         if [ $INSTALL_EXIT -eq 0 ] || python -c "import $import_name" 2>/dev/null; then
             log_info "  ✓ Installed $package"
             INSTALLED_PACKAGES+=("$package")
@@ -1008,12 +1008,23 @@ TEMP_SCRIPT=$(mktemp)
 echo "$REMOTE_SETUP_SCRIPT" > "$TEMP_SCRIPT"
 trap "rm -f '$TEMP_SCRIPT'" EXIT
 
+# Generate unique remote script filename to avoid permission conflicts
+# Use PID and timestamp to ensure uniqueness
+REMOTE_SCRIPT_NAME="setup_sglang_$$_$(date +%s).sh"
+REMOTE_SCRIPT_PATH="/tmp/$REMOTE_SCRIPT_NAME"
+
+# Try to clean up old script files (if they exist and we have permission)
+log_info "Cleaning up old setup scripts (if any)..."
+set +e
+"$SSH_CMD" -t "$BANANA_PI_USER@$BANANA_PI_HOST" "rm -f /tmp/setup_sglang*.sh 2>/dev/null || true"
+set -e
+
 # Use scp to transfer script (allows password input)
 # Don't use timeout or output redirection here to allow interactive password input
 set +e
 log_info "Transferring script file..."
 echo ""  # Add blank line before password prompt
-"$SCP_CMD" "$TEMP_SCRIPT" "$BANANA_PI_USER@$BANANA_PI_HOST:/tmp/setup_sglang.sh"
+"$SCP_CMD" "$TEMP_SCRIPT" "$BANANA_PI_USER@$BANANA_PI_HOST:$REMOTE_SCRIPT_PATH"
 SCP_EXIT_CODE=$?
 set -e
 
@@ -1023,15 +1034,16 @@ if [ $SCP_EXIT_CODE -ne 0 ]; then
     log_info "  1. SSH password is correct"
     log_info "  2. Network connectivity"
     log_info "  3. SSH service is running on Banana Pi"
+    log_info "  4. /tmp directory is writable"
     exit 1
 fi
 
-log_info "✓ Script transferred successfully"
+log_info "✓ Script transferred successfully to $REMOTE_SCRIPT_PATH"
 
 # Make script executable
 set +e
 log_info "Making script executable..."
-"$SSH_CMD" -t "$BANANA_PI_USER@$BANANA_PI_HOST" "chmod +x /tmp/setup_sglang.sh"
+"$SSH_CMD" -t "$BANANA_PI_USER@$BANANA_PI_HOST" "chmod +x $REMOTE_SCRIPT_PATH"
 SSH_EXIT_CODE=$?
 set -e
 
@@ -1047,8 +1059,15 @@ log_info "You may be prompted for SSH password if not using key-based authentica
 # Don't capture output in variable to allow real-time display and password input
 set +e
 # Ensure stderr is also displayed by redirecting it to stdout
-"$SSH_CMD" -t "$BANANA_PI_USER@$BANANA_PI_HOST" "export SKIP_WHEELS='$SKIP_WHEELS' && export SKIP_CONFIRM='$SKIP_CONFIRM' && export WHEELS_RELEASE_TAG='$WHEELS_RELEASE_TAG' && export GITHUB_TOKEN='$GITHUB_TOKEN' && bash /tmp/setup_sglang.sh 2>&1"
+# Also ensure cleanup happens even if script fails
+"$SSH_CMD" -t "$BANANA_PI_USER@$BANANA_PI_HOST" "export SKIP_WHEELS='$SKIP_WHEELS' && export SKIP_CONFIRM='$SKIP_CONFIRM' && export WHEELS_RELEASE_TAG='$WHEELS_RELEASE_TAG' && export GITHUB_TOKEN='$GITHUB_TOKEN' && bash $REMOTE_SCRIPT_PATH 2>&1; EXIT_CODE=\$?; rm -f $REMOTE_SCRIPT_PATH 2>/dev/null || true; exit \$EXIT_CODE"
 SSH_EXIT_CODE=$?
+set -e
+
+# Cleanup remote script (in case the above cleanup didn't work)
+log_info "Cleaning up remote script..."
+set +e
+"$SSH_CMD" -t "$BANANA_PI_USER@$BANANA_PI_HOST" "rm -f $REMOTE_SCRIPT_PATH 2>/dev/null || true"
 set -e
 
 if [ $SSH_EXIT_CODE -ne 0 ]; then
@@ -1067,4 +1086,3 @@ echo "  cd ~/.local_riscv_env/workspace/sglang"
 echo "  source ~/.local_riscv_env/workspace/venv_sglang/bin/activate"
 echo "  python banana_pi/test_tinyllama_riscv/test_tinyllama_riscv.py"
 echo ""
-
