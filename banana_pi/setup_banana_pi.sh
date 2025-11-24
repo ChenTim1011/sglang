@@ -655,21 +655,56 @@ if [ "$SKIP_WHEELS" != "true" ]; then
             else
                 log_info "Setting up OpenMP library..."
                 mkdir -p "$LIBOMP_DIR"
-                if tar -xzf "$LIBOMP_FILE" -C "$LIBOMP_DIR" 2>/dev/null; then
-                    if [ -f "$LIBOMP_DIR/libomp.so" ]; then
-                        if ! grep -q "LD_PRELOAD.*libomp.so" ~/.bashrc 2>/dev/null; then
-                            echo "" >> ~/.bashrc
-                            echo "# OpenMP library configuration (for sgl-kernel)" >> ~/.bashrc
-                            echo "export LD_PRELOAD=\"$LIBOMP_DIR/libomp.so\${LD_PRELOAD:+:\$LD_PRELOAD}\"" >> ~/.bashrc
-                            echo "export LD_LIBRARY_PATH=\"$LIBOMP_DIR:\${LD_LIBRARY_PATH}\"" >> ~/.bashrc
+                # Extract to temporary directory first to handle archive structure
+                # Archive structure may be: libomp_riscv/lib/libomp.so or lib/libomp.so
+                # We need: $LIBOMP_DIR/libomp.so
+                TEMP_EXTRACT_DIR=$(mktemp -d)
+                if tar -xzf "$LIBOMP_FILE" -C "$TEMP_EXTRACT_DIR" 2>/dev/null; then
+                    # Look for libomp.so in the extracted structure
+                    # Try common paths: libomp_riscv/lib/libomp.so or lib/libomp.so
+                    FOUND_LIBOMP=""
+                    for possible_path in "$TEMP_EXTRACT_DIR"/*/lib/libomp.so "$TEMP_EXTRACT_DIR"/lib/libomp.so "$TEMP_EXTRACT_DIR"/*/libomp.so "$TEMP_EXTRACT_DIR"/libomp.so; do
+                        if [ -f "$possible_path" ]; then
+                            FOUND_LIBOMP="$possible_path"
+                            break
                         fi
-                        log_info "  ✓ libomp configured"
-                        LIBOMP_INSTALLED=true
+                    done
+
+                    if [ -n "$FOUND_LIBOMP" ]; then
+                        # Copy libomp.so to the target directory
+                        if cp "$FOUND_LIBOMP" "$LIBOMP_DIR/libomp.so" 2>/dev/null; then
+                            rm -rf "$TEMP_EXTRACT_DIR"
+
+                            if [ -f "$LIBOMP_DIR/libomp.so" ]; then
+                                if ! grep -q "LD_PRELOAD.*libomp.so" ~/.bashrc 2>/dev/null; then
+                                    echo "" >> ~/.bashrc
+                                    echo "# OpenMP library configuration (for sgl-kernel)" >> ~/.bashrc
+                                    echo "export LD_PRELOAD=\"$LIBOMP_DIR/libomp.so\${LD_PRELOAD:+:\$LD_PRELOAD}\"" >> ~/.bashrc
+                                    echo "export LD_LIBRARY_PATH=\"$LIBOMP_DIR:\${LD_LIBRARY_PATH}\"" >> ~/.bashrc
+                                fi
+                                log_info "  ✓ libomp configured at $LIBOMP_DIR/libomp.so"
+                                LIBOMP_INSTALLED=true
+                            else
+                                log_warn "  ✗ libomp.so not found at expected location after copy"
+                                LIBOMP_INSTALLED=false
+                            fi
+                        else
+                            log_warn "  ✗ Failed to copy libomp.so to $LIBOMP_DIR"
+                            rm -rf "$TEMP_EXTRACT_DIR"
+                            LIBOMP_INSTALLED=false
+                        fi
                     else
-                        log_warn "  ✗ libomp.so not found after extraction"
+                        log_warn "  ✗ libomp.so not found in archive structure"
+                        log_info "    Archive contents:"
+                        find "$TEMP_EXTRACT_DIR" -type f -name "*.so" 2>/dev/null | head -5 | while read -r file; do
+                            log_info "      $file"
+                        done
+                        rm -rf "$TEMP_EXTRACT_DIR"
+                        LIBOMP_INSTALLED=false
                     fi
                 else
                     log_warn "  ✗ Failed to extract libomp_riscv.tar.gz"
+                    LIBOMP_INSTALLED=false
                 fi
             fi
         else
