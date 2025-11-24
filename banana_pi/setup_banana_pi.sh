@@ -570,6 +570,26 @@ if [ "$SKIP_WHEELS" != "true" ]; then
                 log_error "File not found. Please verify release '$RELEASE_TAG' exists and contains '$ARCHIVE_FILE'"
             elif [ "$HTTP_STATUS" = "401" ] || [ "$HTTP_STATUS" = "403" ]; then
                 log_error "Authentication failed. Please check your GitHub token"
+                if [ -f "$ARCHIVE_FILE" ]; then
+                    log_info "Downloaded file content (first 200 chars):"
+                    head -c 200 "$ARCHIVE_FILE" | cat -A
+                    echo ""
+                fi
+            elif [ "$HTTP_STATUS" = "302" ] || [ "$HTTP_STATUS" = "301" ]; then
+                log_warn "Redirect detected (HTTP $HTTP_STATUS). This may indicate authentication issues."
+            elif [ -z "$HTTP_STATUS" ]; then
+                log_error "No HTTP status code received. Check network connectivity."
+                if [ -f "$ARCHIVE_FILE" ]; then
+                    log_info "Downloaded file content (first 200 chars):"
+                    head -c 200 "$ARCHIVE_FILE" | cat -A
+                    echo ""
+                fi
+            fi
+            if [ "$CURL_EXIT" -ne 0 ]; then
+                log_error "curl exit code: $CURL_EXIT"
+                if [ -n "$CURL_ERROR" ]; then
+                    log_info "curl error: $CURL_ERROR"
+                fi
             fi
         fi
     elif command -v wget >/dev/null 2>&1; then
@@ -611,12 +631,54 @@ if [ "$SKIP_WHEELS" != "true" ]; then
     if [ "$DOWNLOAD_SUCCESS" = true ] && [ -f "$ARCHIVE_FILE" ]; then
         log_info "  ✓ Downloaded $ARCHIVE_FILE"
 
-        # Extract archive
-        log_info "Extracting archive..."
-        tar -xzf "$ARCHIVE_FILE" -C "$WHEELS_DIR" 2>/dev/null || {
-            log_error "Failed to extract $ARCHIVE_FILE"
+        # Verify downloaded file is actually a tar archive (gzip or uncompressed)
+        log_info "Verifying archive format..."
+        FILE_TYPE=$(file "$ARCHIVE_FILE" | cut -d: -f2-)
+        if echo "$FILE_TYPE" | grep -qE "(gzip|tar|compressed|POSIX tar)"; then
+            log_info "  ✓ Archive format verified: $FILE_TYPE"
+        else
+            log_error "Downloaded file is not a valid archive!"
+            log_info "File type: $FILE_TYPE"
+            log_info "First 200 characters of downloaded file:"
+            head -c 200 "$ARCHIVE_FILE" | cat -A
+            echo ""
+            log_info "This usually means:"
+            log_info "  1. Download returned an HTML error page instead of the archive"
+            log_info "  2. GitHub token may not have access to the release"
+            log_info "  3. Release or file may not exist"
+            if [ -n "$HTTP_STATUS" ] && [ "$HTTP_STATUS" != "200" ]; then
+                log_error "HTTP Status: $HTTP_STATUS"
+            fi
+            rm -f "$ARCHIVE_FILE"
             exit 1
-        }
+        fi
+
+        # Extract archive - support both .tar and .tar.gz formats
+        log_info "Extracting archive..."
+        # Check if file is gzip compressed or uncompressed tar
+        if echo "$FILE_TYPE" | grep -qE "gzip|compressed"; then
+            # File is gzip compressed, use -z flag
+            log_info "  Detected gzip-compressed tar archive"
+            if ! tar -xzf "$ARCHIVE_FILE" -C "$WHEELS_DIR" 2>&1; then
+                log_error "Failed to extract gzip-compressed archive"
+                log_info "Please check:"
+                log_info "  1. Archive file exists and is readable"
+                log_info "  2. Destination directory is writable: $WHEELS_DIR"
+                log_info "  3. Archive file is not corrupted"
+                exit 1
+            fi
+        else
+            # File is uncompressed tar, use -xf (no -z flag)
+            log_info "  Detected uncompressed tar archive"
+            if ! tar -xf "$ARCHIVE_FILE" -C "$WHEELS_DIR" 2>&1; then
+                log_error "Failed to extract tar archive"
+                log_info "Please check:"
+                log_info "  1. Archive file exists and is readable"
+                log_info "  2. Destination directory is writable: $WHEELS_DIR"
+                log_info "  3. Archive file is not corrupted"
+                exit 1
+            fi
+        fi
         log_info "  ✓ Extracted archive"
 
         # Install all wheels (check if already installed first)
@@ -646,20 +708,42 @@ if [ "$SKIP_WHEELS" != "true" ]; then
         done
 
         # Setup libomp (check if already installed)
-        LIBOMP_FILE="$WHEELS_DIR/libomp_riscv.tar.gz"
+        # Search for libomp_riscv.tar.gz in WHEELS_DIR and subdirectories
+        LIBOMP_FILE=""
         LIBOMP_DIR="$HOME/.local/lib"
-        if [ -f "$LIBOMP_FILE" ]; then
+
+        # Try direct path first
+        if [ -f "$WHEELS_DIR/libomp_riscv.tar.gz" ]; then
+            LIBOMP_FILE="$WHEELS_DIR/libomp_riscv.tar.gz"
+        else
+            # Search in subdirectories
+            LIBOMP_FILE=$(find "$WHEELS_DIR" -name "libomp_riscv.tar.gz" -type f 2>/dev/null | head -1)
+        fi
+
+        if [ -n "$LIBOMP_FILE" ] && [ -f "$LIBOMP_FILE" ]; then
             if [ -f "$LIBOMP_DIR/libomp.so" ]; then
                 log_info "libomp already installed at $LIBOMP_DIR/libomp.so, skipping"
                 LIBOMP_INSTALLED=true
             else
                 log_info "Setting up OpenMP library..."
+                log_info "  Found libomp archive at: $LIBOMP_FILE"
                 mkdir -p "$LIBOMP_DIR"
                 # Extract to temporary directory first to handle archive structure
                 # Archive structure may be: libomp_riscv/lib/libomp.so or lib/libomp.so
                 # We need: $LIBOMP_DIR/libomp.so
                 TEMP_EXTRACT_DIR=$(mktemp -d)
-                if tar -xzf "$LIBOMP_FILE" -C "$TEMP_EXTRACT_DIR" 2>/dev/null; then
+
+                # Check file type to determine extraction method
+                LIBOMP_FILE_TYPE=$(file "$LIBOMP_FILE" | cut -d: -f2-)
+                if echo "$LIBOMP_FILE_TYPE" | grep -qE "gzip|compressed"; then
+                    log_info "  Extracting gzip-compressed libomp archive..."
+                    EXTRACT_CMD="tar -xzf"
+                else
+                    log_info "  Extracting uncompressed libomp archive..."
+                    EXTRACT_CMD="tar -xf"
+                fi
+
+                if $EXTRACT_CMD "$LIBOMP_FILE" -C "$TEMP_EXTRACT_DIR" 2>&1; then
                     # Look for libomp.so in the extracted structure
                     # Try common paths: libomp_riscv/lib/libomp.so or lib/libomp.so
                     FOUND_LIBOMP=""
@@ -703,12 +787,19 @@ if [ "$SKIP_WHEELS" != "true" ]; then
                         LIBOMP_INSTALLED=false
                     fi
                 else
-                    log_warn "  ✗ Failed to extract libomp_riscv.tar.gz"
+                    log_warn "  ✗ Failed to extract libomp archive"
+                    log_info "    Extraction command: $EXTRACT_CMD"
+                    log_info "    File type: $LIBOMP_FILE_TYPE"
                     LIBOMP_INSTALLED=false
                 fi
             fi
         else
             log_warn "libomp_riscv.tar.gz not found in archive"
+            log_info "  Searched in: $WHEELS_DIR"
+            log_info "  Available files in WHEELS_DIR:"
+            find "$WHEELS_DIR" -maxdepth 2 -type f \( -name "*libomp*" -o -name "*.tar*" \) 2>/dev/null | head -10 | while read -r file; do
+                log_info "    $file"
+            done || log_info "    (none found)"
         fi
     else
         log_error "Failed to download $ARCHIVE_FILE from GitHub Releases"
@@ -864,10 +955,19 @@ for package in "${OTHER_CORE_DEPS[@]}"; do
             import_name="huggingface_hub"
             ;;
         "partial_json_parser")
-            import_name="partial_json"
+            import_name="partial_json_parser"
+            ;;
+        "torchao")
+            import_name="torchao"
             ;;
         "pybase64")
             import_name="pybase64"
+            ;;
+        "compressed-tensors")
+            import_name="compressed_tensors"
+            ;;
+        "xgrammar")
+            import_name="xgrammar"
             ;;
         *)
             import_name="$base_package"
@@ -881,15 +981,65 @@ for package in "${OTHER_CORE_DEPS[@]}"; do
     else
         log_info "Installing $package..."
         set +e
-        pip install "$package" --quiet 2>/dev/null
+        # Capture error output for debugging
+        INSTALL_ERROR=$(pip install "$package" 2>&1)
         INSTALL_EXIT=$?
         set -e
 
-        if [ $INSTALL_EXIT -eq 0 ] || python -c "import $import_name" 2>/dev/null; then
-            log_info "  ✓ Installed $package"
-            INSTALLED_PACKAGES+=("$package")
+        # Check if package is already satisfied (pip may return non-zero but package is installed)
+        # Match pattern: "Requirement already satisfied" followed by package name (with or without version)
+        # Also check if package can be imported (more reliable check)
+        if echo "$INSTALL_ERROR" | grep -qiE "Requirement already satisfied.*$base_package" || \
+           python -c "import $import_name" 2>/dev/null; then
+            # Double-check by trying to import
+            if python -c "import $import_name" 2>/dev/null; then
+                log_info "  ⊙ $package already installed, skipping"
+                SKIPPED_PACKAGES+=("$package")
+            else
+                # pip says it's installed but import fails
+                # This is OK - some packages don't need to be imported or have different import names
+                # Just check if pip shows it's installed
+                if echo "$INSTALL_ERROR" | grep -qiE "Requirement already satisfied.*$base_package"; then
+                    log_info "  ⊙ $package already installed, skipping"
+                    SKIPPED_PACKAGES+=("$package")
+                else
+                    # Can't import and pip doesn't say it's installed - might be an issue
+                    log_warn "  ⚠ $package installed but cannot be imported"
+                    FAILED_PACKAGES+=("$package")
+                fi
+            fi
+        elif [ $INSTALL_EXIT -eq 0 ]; then
+            # Installation succeeded
+            if python -c "import $import_name" 2>/dev/null; then
+                log_info "  ✓ Installed $package"
+                INSTALLED_PACKAGES+=("$package")
+            else
+                # Installation succeeded but can't import - this is OK for some packages
+                # Check if pip actually installed it successfully
+                if pip show "$base_package" >/dev/null 2>&1; then
+                    log_info "  ✓ Installed $package (import check skipped)"
+                    INSTALLED_PACKAGES+=("$package")
+                else
+                    log_warn "  ⚠ $package installation may have failed"
+                    FAILED_PACKAGES+=("$package")
+                fi
+            fi
+        elif python -c "import $import_name" 2>/dev/null; then
+            # Installation failed but package can be imported (might be installed from elsewhere)
+            log_info "  ⊙ $package is available (import check passed)"
+            SKIPPED_PACKAGES+=("$package")
         else
             log_warn "  ✗ Failed to install $package"
+            # Show error details for debugging (especially for RISC-V platform)
+            if echo "$INSTALL_ERROR" | grep -qE "(No matching distribution|Could not find|not available)"; then
+                log_info "    Reason: Package may not have wheels for RISC-V architecture"
+                log_info "    This is expected for some packages on RISC-V platform"
+            elif echo "$INSTALL_ERROR" | grep -qE "(error|Error|ERROR)"; then
+                log_info "    Error details (first 5 lines):"
+                echo "$INSTALL_ERROR" | head -5 | while read -r line; do
+                    log_info "      $line"
+                done
+            fi
             FAILED_PACKAGES+=("$package")
         fi
     fi
@@ -1095,7 +1245,16 @@ log_info "You may be prompted for SSH password if not using key-based authentica
 set +e
 # Ensure stderr is also displayed by redirecting it to stdout
 # Also ensure cleanup happens even if script fails
-"$SSH_CMD" -t "$BANANA_PI_USER@$BANANA_PI_HOST" "export SKIP_WHEELS='$SKIP_WHEELS' && export SKIP_CONFIRM='$SKIP_CONFIRM' && export WHEELS_RELEASE_TAG='$WHEELS_RELEASE_TAG' && export GITHUB_TOKEN='$GITHUB_TOKEN' && bash $REMOTE_SCRIPT_PATH 2>&1; EXIT_CODE=\$?; rm -f $REMOTE_SCRIPT_PATH 2>/dev/null || true; exit \$EXIT_CODE"
+# Use a more robust approach to avoid quote issues
+"$SSH_CMD" -t "$BANANA_PI_USER@$BANANA_PI_HOST" \
+    "export SKIP_WHEELS='$SKIP_WHEELS' && \
+     export SKIP_CONFIRM='$SKIP_CONFIRM' && \
+     export WHEELS_RELEASE_TAG='$WHEELS_RELEASE_TAG' && \
+     export GITHUB_TOKEN='$GITHUB_TOKEN' && \
+     bash $REMOTE_SCRIPT_PATH 2>&1; \
+     EXIT_CODE=\$?; \
+     rm -f $REMOTE_SCRIPT_PATH 2>/dev/null || true; \
+     exit \$EXIT_CODE"
 SSH_EXIT_CODE=$?
 set -e
 
