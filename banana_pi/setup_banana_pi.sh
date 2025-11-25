@@ -321,6 +321,8 @@ if [ -d "$PROJECT_DIR/.git" ]; then
                 git stash push -m "Auto-stash before branch switch $(date +%Y%m%d_%H%M%S)" 2>/dev/null || log_warn "Could not stash changes"
             fi
 
+            # Handle untracked files that might conflict with incoming changes
+            # Check if there are untracked files that would be overwritten
             git fetch origin
             CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
             if [ "$CURRENT_BRANCH" != "$SGLANG_BRANCH" ]; then
@@ -330,7 +332,201 @@ if [ -d "$PROJECT_DIR/.git" ]; then
                     git reset --hard origin/"$SGLANG_BRANCH" 2>/dev/null || log_warn "Could not reset branch"
                 }
             fi
-            git pull origin "$SGLANG_BRANCH" || log_warn "Could not pull, continuing..."
+
+            # Try to pull and handle conflicts
+            set +e
+            PULL_OUTPUT=$(git pull origin "$SGLANG_BRANCH" 2>&1)
+            PULL_EXIT=$?
+            set -e
+
+            # Check for different types of conflicts
+            if echo "$PULL_OUTPUT" | grep -q "untracked working tree files would be overwritten"; then
+                # Untracked files conflict - stop and ask user
+                log_error "Untracked files detected that would be overwritten by merge!"
+                echo ""
+                echo "The following untracked files would be overwritten:"
+                CONFLICTING_FILES=$(echo "$PULL_OUTPUT" | grep "would be overwritten by merge" | sed 's/.*: *//' | sort -u)
+                echo "$CONFLICTING_FILES" | while read -r file; do
+                    if [ -n "$file" ]; then
+                        echo "  - $file"
+                    fi
+                done
+                echo ""
+                echo "How would you like to resolve this?"
+                echo "  1) Remove conflicting untracked files and pull (use remote version)"
+                echo "  2) Keep local files and skip update"
+                echo "  3) Manually handle files (script will exit, you handle manually)"
+                echo "  4) Continue anyway (may cause errors)"
+                echo ""
+
+                if [ "$SKIP_CONFIRM" = "true" ]; then
+                    # Non-interactive mode: default to remove conflicting files
+                    UNTRACKED_CHOICE="1"
+                    log_info "Non-interactive mode: removing conflicting untracked files"
+                else
+                    read -p "Enter choice [1-4] (default: 1): " UNTRACKED_CHOICE
+                    UNTRACKED_CHOICE="${UNTRACKED_CHOICE:-1}"
+                fi
+
+                case "$UNTRACKED_CHOICE" in
+                    1)
+                        log_info "Removing conflicting untracked files..."
+                        echo "$CONFLICTING_FILES" | while read -r file; do
+                            if [ -n "$file" ] && ([ -f "$file" ] || [ -d "$file" ]); then
+                                log_info "  Removing: $file"
+                                rm -rf "$file" 2>/dev/null || log_warn "    Could not remove: $file"
+                            fi
+                        done
+                        # Retry pull after removing conflicting files
+                        git pull origin "$SGLANG_BRANCH" || log_warn "Could not pull after cleanup, continuing..."
+                        ;;
+                    2)
+                        log_info "Keeping local files and skipping update..."
+                        log_warn "Using existing local version (not updated)"
+                        ;;
+                    3)
+                        log_info "Exiting script for manual file handling"
+                        echo ""
+                        log_info "To handle conflicting untracked files and push to remote, follow these steps:"
+                        echo ""
+                        log_info "1. Navigate to the project directory:"
+                        echo "   cd $PROJECT_DIR"
+                        echo ""
+                        log_info "2. Handle the conflicting files (choose one):"
+                        echo "   Option A - Remove conflicting files:"
+                        echo "     rm <conflicting-file1> <conflicting-file2> ..."
+                        echo ""
+                        echo "   Option B - Move/rename conflicting files:"
+                        echo "     mv <conflicting-file> <new-location-or-name>"
+                        echo ""
+                        echo "   Option C - Add files to git (if you want to keep them):"
+                        echo "     git add <file1> <file2> ..."
+                        echo "     git commit -m 'Add local files'"
+                        echo ""
+                        log_info "3. After handling files, pull from remote:"
+                        echo "   git pull origin $SGLANG_BRANCH"
+                        echo ""
+                        log_info "4. If you added/modified files and want to push to remote:"
+                        echo "   git push origin $SGLANG_BRANCH"
+                        echo ""
+                        log_info "5. Re-run this setup script:"
+                        echo "   ./setup_banana_pi.sh"
+                        echo ""
+                        exit 1
+                        ;;
+                    4)
+                        log_warn "Continuing with conflicting untracked files (may cause errors)"
+                        ;;
+                    *)
+                        log_warn "Invalid choice, removing conflicting untracked files"
+                        echo "$CONFLICTING_FILES" | while read -r file; do
+                            if [ -n "$file" ] && ([ -f "$file" ] || [ -d "$file" ]); then
+                                log_info "  Removing: $file"
+                                rm -rf "$file" 2>/dev/null || log_warn "    Could not remove: $file"
+                            fi
+                        done
+                        git pull origin "$SGLANG_BRANCH" || log_warn "Could not pull after cleanup, continuing..."
+                        ;;
+                esac
+            elif echo "$PULL_OUTPUT" | grep -qE "(needs merge|unmerged files|unresolved conflict|Pulling is not possible)"; then
+                # Merge conflict detected - stop and ask user
+                log_error "Git merge conflict detected!"
+                echo ""
+                echo "The following files have merge conflicts:"
+                # Get unmerged files using multiple methods
+                UNMERGED_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null || git status --short | grep -E "^UU|^AA|^DD" | awk '{print $2}' || echo "")
+                if [ -n "$UNMERGED_FILES" ]; then
+                    echo "$UNMERGED_FILES" | while read -r file; do
+                        if [ -n "$file" ]; then
+                            echo "  - $file"
+                        fi
+                    done
+                else
+                    # Fallback: show git status
+                    git status --short | grep -E "^UU|^AA|^DD" | while read -r line; do
+                        echo "  $line"
+                    done
+                fi
+                echo ""
+                echo "How would you like to resolve this?"
+                echo "  1) Abort merge and use remote version (discard local changes)"
+                echo "  2) Abort merge and keep local version (skip update)"
+                echo "  3) Manually resolve conflicts (script will exit, you resolve manually)"
+                echo "  4) Continue anyway (may cause errors)"
+                echo ""
+
+                if [ "$SKIP_CONFIRM" = "true" ]; then
+                    # Non-interactive mode: default to abort and use remote
+                    CONFLICT_CHOICE="1"
+                    log_info "Non-interactive mode: aborting merge and using remote version"
+                else
+                    read -p "Enter choice [1-4] (default: 1): " CONFLICT_CHOICE
+                    CONFLICT_CHOICE="${CONFLICT_CHOICE:-1}"
+                fi
+
+                case "$CONFLICT_CHOICE" in
+                    1)
+                        log_info "Aborting merge and using remote version..."
+                        git merge --abort 2>/dev/null || true
+                        git reset --hard origin/"$SGLANG_BRANCH" 2>/dev/null || {
+                            log_error "Failed to reset to remote version"
+                            exit 1
+                        }
+                        log_info "✓ Repository reset to remote version"
+                        ;;
+                    2)
+                        log_info "Aborting merge and keeping local version..."
+                        git merge --abort 2>/dev/null || true
+                        log_warn "Using existing local version (not updated)"
+                        ;;
+                    3)
+                        log_info "Exiting script for manual conflict resolution"
+                        echo ""
+                        log_info "To resolve conflicts and push to remote, follow these steps:"
+                        echo ""
+                        log_info "1. Navigate to the project directory:"
+                        echo "   cd $PROJECT_DIR"
+                        echo ""
+                        log_info "2. Resolve conflicts in the files (edit files to fix conflicts):"
+                        echo "   - Edit the conflicted files and resolve merge markers"
+                        echo "   - Or use: git checkout --ours <file>  (use local version)"
+                        echo "   - Or use: git checkout --theirs <file> (use remote version)"
+                        echo ""
+                        log_info "3. Stage the resolved files:"
+                        echo "   git add <resolved-file1> <resolved-file2> ..."
+                        echo "   # Or stage all resolved files:"
+                        echo "   git add -u"
+                        echo ""
+                        log_info "4. Commit the merge:"
+                        echo "   git commit -m 'Resolve merge conflicts'"
+                        echo ""
+                        log_info "5. Push to remote (if you have push access):"
+                        echo "   git push origin $SGLANG_BRANCH"
+                        echo ""
+                        log_info "6. Re-run this setup script:"
+                        echo "   ./setup_banana_pi.sh"
+                        echo ""
+                        exit 1
+                        ;;
+                    4)
+                        log_warn "Continuing with unresolved conflicts (may cause errors)"
+                        ;;
+                    *)
+                        log_warn "Invalid choice, aborting merge and using remote version"
+                        git merge --abort 2>/dev/null || true
+                        git reset --hard origin/"$SGLANG_BRANCH" 2>/dev/null || {
+                            log_error "Failed to reset to remote version"
+                            exit 1
+                        }
+                        ;;
+                esac
+            elif [ $PULL_EXIT -ne 0 ]; then
+                # Other pull errors
+                log_warn "Could not pull (exit code: $PULL_EXIT)"
+                log_info "Pull output:"
+                echo "$PULL_OUTPUT" | head -10
+                log_warn "Continuing with existing repository state..."
+            fi
 
             # Restore remote URL without token (for security)
             if [ -n "$GITHUB_TOKEN" ]; then
@@ -388,11 +584,39 @@ if [ -d "$PROJECT_DIR/.git" ]; then
             fi
 
             git fetch origin
-            git checkout "$SGLANG_BRANCH" 2>/dev/null || git checkout -b "$SGLANG_BRANCH" origin/"$SGLANG_BRANCH" 2>/dev/null || {
-                log_warn "Could not switch to branch, trying to reset..."
-                git reset --hard origin/"$SGLANG_BRANCH" 2>/dev/null || log_warn "Could not reset branch"
-            }
-            git pull origin "$SGLANG_BRANCH" || log_warn "Could not pull, continuing..."
+            CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [ "$CURRENT_BRANCH" != "$SGLANG_BRANCH" ]; then
+                log_info "Switching to branch: $SGLANG_BRANCH"
+                git checkout "$SGLANG_BRANCH" 2>/dev/null || git checkout -b "$SGLANG_BRANCH" origin/"$SGLANG_BRANCH" 2>/dev/null || {
+                    log_warn "Could not switch to branch, trying to reset..."
+                    git reset --hard origin/"$SGLANG_BRANCH" 2>/dev/null || log_warn "Could not reset branch"
+                }
+            fi
+
+            # Check for untracked files that would conflict with pull
+            set +e
+            PULL_OUTPUT=$(git pull origin "$SGLANG_BRANCH" 2>&1)
+            PULL_EXIT=$?
+            echo "$PULL_OUTPUT" | grep -q "untracked working tree files would be overwritten"
+            UNTRACKED_CONFLICT=$?
+            set -e
+
+            if [ $UNTRACKED_CONFLICT -eq 0 ]; then
+                log_warn "Untracked files detected that would be overwritten by merge"
+                log_info "Removing conflicting untracked files..."
+                # Extract conflicting file paths from git pull output
+                CONFLICTING_FILES=$(echo "$PULL_OUTPUT" | grep "would be overwritten by merge" | sed 's/.*: *//' | sort -u)
+                for file in $CONFLICTING_FILES; do
+                    if [ -n "$file" ] && ([ -f "$file" ] || [ -d "$file" ]); then
+                        log_info "  Removing: $file"
+                        rm -rf "$file" 2>/dev/null || log_warn "    Could not remove: $file"
+                    fi
+                done
+                # Retry pull after removing conflicting files
+                git pull origin "$SGLANG_BRANCH" || log_warn "Could not pull after cleanup, continuing..."
+            elif [ $PULL_EXIT -ne 0 ]; then
+                log_warn "Could not pull (exit code: $PULL_EXIT), continuing..."
+            fi
 
             # Restore remote URL without token (for security)
             if [ -n "$GITHUB_TOKEN" ]; then
@@ -683,7 +907,7 @@ if [ "$SKIP_WHEELS" != "true" ]; then
 
         # Install all wheels (check if already installed first)
         log_info "Installing Python wheels..."
-        for wheel_file in "$WHEELS_DIR"/*.whl; do
+        for wheel_file in "$WHEELS_DIR"/riscv_wheels_and_libomp/*.whl; do
             if [ -f "$wheel_file" ]; then
                 wheel_name=$(basename "$wheel_file")
                 # Extract package name from wheel filename (e.g., torch-2.8.0... -> torch)
@@ -708,16 +932,16 @@ if [ "$SKIP_WHEELS" != "true" ]; then
         done
 
         # Setup libomp (check if already installed)
-        # Search for libomp_riscv.tar.gz in WHEELS_DIR and subdirectories
+        # Search for libomp_riscv.tar.gz in riscv_wheels_and_libomp subdirectory
         LIBOMP_FILE=""
         LIBOMP_DIR="$HOME/.local/lib"
 
         # Try direct path first
-        if [ -f "$WHEELS_DIR/libomp_riscv.tar.gz" ]; then
-            LIBOMP_FILE="$WHEELS_DIR/libomp_riscv.tar.gz"
+        if [ -f "$WHEELS_DIR/riscv_wheels_and_libomp/libomp_riscv.tar.gz" ]; then
+            LIBOMP_FILE="$WHEELS_DIR/riscv_wheels_and_libomp/libomp_riscv.tar.gz"
         else
             # Search in subdirectories
-            LIBOMP_FILE=$(find "$WHEELS_DIR" -name "libomp_riscv.tar.gz" -type f 2>/dev/null | head -1)
+            LIBOMP_FILE=$(find "$WHEELS_DIR/riscv_wheels_and_libomp" -name "libomp_riscv.tar.gz" -type f 2>/dev/null | head -1)
         fi
 
         if [ -n "$LIBOMP_FILE" ] && [ -f "$LIBOMP_FILE" ]; then
@@ -795,9 +1019,9 @@ if [ "$SKIP_WHEELS" != "true" ]; then
             fi
         else
             log_warn "libomp_riscv.tar.gz not found in archive"
-            log_info "  Searched in: $WHEELS_DIR"
-            log_info "  Available files in WHEELS_DIR:"
-            find "$WHEELS_DIR" -maxdepth 2 -type f \( -name "*libomp*" -o -name "*.tar*" \) 2>/dev/null | head -10 | while read -r file; do
+            log_info "  Searched in: $WHEELS_DIR/riscv_wheels_and_libomp"
+            log_info "  Available files in riscv_wheels_and_libomp:"
+            find "$WHEELS_DIR/riscv_wheels_and_libomp" -maxdepth 2 -type f \( -name "*libomp*" -o -name "*.tar*" \) 2>/dev/null | head -10 | while read -r file; do
                 log_info "    $file"
             done || log_info "    (none found)"
         fi
@@ -883,6 +1107,8 @@ OTHER_CORE_DEPS=(
     "torchao"
     "xgrammar"
     "pytest"
+    "pyzmq"
+    "ipython"
 )
 
 # Track installation results
@@ -968,6 +1194,12 @@ for package in "${OTHER_CORE_DEPS[@]}"; do
             ;;
         "xgrammar")
             import_name="xgrammar"
+            ;;
+        "pyzmq")
+            import_name="zmq"
+            ;;
+        "ipython")
+            import_name="IPython"
             ;;
         *)
             import_name="$base_package"
@@ -1072,6 +1304,40 @@ else
         tail -n 40 "$SGLANG_INSTALL_LOG"
     fi
     FAILED_PACKAGES+=("sglang")
+fi
+
+# Install triton stub as a proper package so subprocess can import it
+# This creates a real 'triton' package in site-packages that can be imported directly
+log_info "Setting up triton stub package for subprocess import..."
+TRITON_STUB_SOURCE="$PROJECT_DIR/banana_pi/test_tinyllama_riscv/triton_stub.py"
+if [ -f "$TRITON_STUB_SOURCE" ]; then
+    # Get site-packages directory
+    SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || python -c "import site; print(site.USER_SITE)" 2>/dev/null || echo "")
+    if [ -n "$SITE_PACKAGES" ] && [ -d "$SITE_PACKAGES" ]; then
+        # Create triton package directory
+        TRITON_PKG_DIR="$SITE_PACKAGES/triton"
+        mkdir -p "$TRITON_PKG_DIR"
+
+        # Copy triton_stub.py content directly to triton/__init__.py
+        # This ensures that 'import triton' works directly in subprocess
+        TRITON_INIT="$TRITON_PKG_DIR/__init__.py"
+        if cp "$TRITON_STUB_SOURCE" "$TRITON_INIT" 2>/dev/null; then
+            log_info "  ✓ Installed triton stub package to $TRITON_PKG_DIR"
+            log_info "  Note: 'import triton' will now work in subprocess (e.g., sglang.launch_server)"
+
+            # Also copy triton_stub.py to site-packages for backward compatibility
+            TRITON_STUB_TARGET="$SITE_PACKAGES/triton_stub.py"
+            if cp "$TRITON_STUB_SOURCE" "$TRITON_STUB_TARGET" 2>/dev/null; then
+                log_info "  ✓ Also installed triton_stub.py to $TRITON_STUB_TARGET (for backward compatibility)"
+            fi
+        else
+            log_warn "  ✗ Failed to copy triton_stub to triton package directory"
+        fi
+    else
+        log_warn "  ⚠ Could not find site-packages directory"
+    fi
+else
+    log_warn "  ⚠ triton_stub.py not found at $TRITON_STUB_SOURCE"
 fi
 
 # Display installation summary

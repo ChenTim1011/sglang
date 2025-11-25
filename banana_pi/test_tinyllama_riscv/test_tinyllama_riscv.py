@@ -3,29 +3,31 @@
 TinyLlama Interactive Chat Script with Server Management
 """
 
-import importlib.util
 import ctypes
-import psutil
+import importlib.util
+import json
+import os
 import signal
 import subprocess
-import time
-import json
-import requests
 import sys
-import os
+import time
+
+import psutil
+import requests
 
 # Import stubs FIRST, before any other imports that might try to import these modules
 # This ensures triton and PIL are available in sys.modules before SGLang tries to import them
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Load triton_stub
-_triton_stub_path = os.path.join(_script_dir, 'triton_stub.py')
+_triton_stub_path = os.path.join(_script_dir, "triton_stub.py")
 if os.path.exists(_triton_stub_path):
     # Add script directory to path
     if _script_dir not in sys.path:
         sys.path.insert(0, _script_dir)
     try:
         import triton_stub  # This will register triton in sys.modules
+
         # Silent import - we'll check later if needed
     except ImportError:
         pass  # Will handle later if triton is actually needed
@@ -75,9 +77,7 @@ def get_cpu_threads_bind_from_config(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         if isinstance(data, dict):
-            value = data.get("cpu-omp-threads-bind") or data.get(
-                "cpu_omp_threads_bind"
-            )
+            value = data.get("cpu-omp-threads-bind") or data.get("cpu_omp_threads_bind")
             if isinstance(value, (int, float)):
                 value = str(value)
     except ModuleNotFoundError:
@@ -110,12 +110,11 @@ def get_cpu_threads_bind_from_config(config_path):
 def find_sglang_processes():
     """Find running SGLang processes"""
     processes = []
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
-            if proc.info['name'] and 'python' in proc.info['name'].lower():
-                cmdline = ' '.join(
-                    proc.info['cmdline']) if proc.info['cmdline'] else ''
-                if 'sglang' in cmdline and 'launch_server' in cmdline:
+            if proc.info["name"] and "python" in proc.info["name"].lower():
+                cmdline = " ".join(proc.info["cmdline"]) if proc.info["cmdline"] else ""
+                if "sglang" in cmdline and "launch_server" in cmdline:
                     processes.append(proc)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -126,14 +125,13 @@ def check_disk_space():
     """Check available disk space"""
     try:
         result = subprocess.run(
-            ['df', '-h', os.path.expanduser('~')],
+            ["df", "-h", os.path.expanduser("~")],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=5
+            timeout=5,
         )
         if result.returncode == 0:
-            lines = result.stdout.decode(
-                'utf-8', errors='ignore').strip().split('\n')
+            lines = result.stdout.decode("utf-8", errors="ignore").strip().split("\n")
             if len(lines) >= 2:
                 # Parse df output
                 parts = lines[1].split()
@@ -142,24 +140,23 @@ def check_disk_space():
                     total = parts[1]
                     used = parts[2]
                     available = parts[3]
-                    use_percent = parts[4] if len(parts) >= 5 else 'N/A'
-                    mount_point = parts[5] if len(parts) >= 6 else 'N/A'
+                    use_percent = parts[4] if len(parts) >= 5 else "N/A"
+                    mount_point = parts[5] if len(parts) >= 6 else "N/A"
 
-                    print(
-                        f"  📦 Disk space: {available} available / {total} total")
+                    print(f"  📦 Disk space: {available} available / {total} total")
                     print(f"     Used: {used} ({use_percent})")
 
                     # Check if disk space is low (< 1GB)
                     try:
                         # Parse available space (e.g., "5.2G" -> 5.2)
-                        avail_str = available.upper().replace('G', '').replace('M', '')
+                        avail_str = available.upper().replace("G", "").replace("M", "")
                         avail_value = float(avail_str)
-                        if 'M' in available.upper():
+                        if "M" in available.upper():
                             # Less than 1GB if in MB
                             if avail_value < 1024:
                                 print("  ⚠ Warning: Low disk space (< 1GB)")
                                 return False
-                        elif 'G' in available.upper():
+                        elif "G" in available.upper():
                             if avail_value < 1.0:
                                 print("  ⚠ Warning: Low disk space (< 1GB)")
                                 return False
@@ -182,9 +179,9 @@ def check_libomp():
     warnings = []
 
     # Check LD_PRELOAD
-    ld_preload = os.environ.get('LD_PRELOAD', '')
+    ld_preload = os.environ.get("LD_PRELOAD", "")
     if ld_preload:
-        libomp_in_preload = 'libomp.so' in ld_preload
+        libomp_in_preload = "libomp.so" in ld_preload
         if libomp_in_preload:
             print(f"  ✓ LD_PRELOAD is set: {ld_preload}")
         else:
@@ -193,11 +190,11 @@ def check_libomp():
         warnings.append("LD_PRELOAD is not set (libomp may not be loaded)")
 
     # Check LD_LIBRARY_PATH
-    ld_library_path = os.environ.get('LD_LIBRARY_PATH', '')
+    ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
     libomp_paths = [
-        os.path.expanduser('~/.local/lib'),
-        '/usr/local/lib',
-        '/usr/lib/riscv64-linux-gnu',
+        os.path.expanduser("~/.local/lib"),
+        "/usr/local/lib",
+        "/usr/lib/riscv64-linux-gnu",
     ]
 
     found_libomp = False
@@ -205,7 +202,7 @@ def check_libomp():
 
     # Check common locations
     for path in libomp_paths:
-        libomp_so = os.path.join(path, 'libomp.so')
+        libomp_so = os.path.join(path, "libomp.so")
         if os.path.exists(libomp_so):
             found_libomp = True
             libomp_location = libomp_so
@@ -214,24 +211,23 @@ def check_libomp():
 
     # Also check LD_LIBRARY_PATH
     if ld_library_path:
-        for path in ld_library_path.split(':'):
+        for path in ld_library_path.split(":"):
             if path:
-                libomp_so = os.path.join(path, 'libomp.so')
+                libomp_so = os.path.join(path, "libomp.so")
                 if os.path.exists(libomp_so):
                     found_libomp = True
                     libomp_location = libomp_so
-                    print(
-                        f"  ✓ Found libomp.so in LD_LIBRARY_PATH: {libomp_location}")
+                    print(f"  ✓ Found libomp.so in LD_LIBRARY_PATH: {libomp_location}")
                     break
 
     if not found_libomp:
         # Try to find using find command (if available)
         try:
             result = subprocess.run(
-                ['find', os.path.expanduser('~'), '/usr/local', '/usr/lib'],
+                ["find", os.path.expanduser("~"), "/usr/local", "/usr/lib"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=5
+                timeout=5,
             )
             # This is too broad, let's use a more targeted approach
         except:
@@ -243,20 +239,19 @@ def check_libomp():
         # Try to verify libomp has required symbols
         try:
             result = subprocess.run(
-                ['nm', '-D', libomp_location],
+                ["nm", "-D", libomp_location],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=5
+                timeout=5,
             )
             if result.returncode == 0:
-                output = result.stdout.decode('utf-8', errors='ignore')
-                if '__kmpc_for_static_init_8' in output:
+                output = result.stdout.decode("utf-8", errors="ignore")
+                if "__kmpc_for_static_init_8" in output:
                     print("  ✓ libomp contains required symbols for sgl-kernel")
                 else:
                     warnings.append("libomp may not contain required symbols")
         except FileNotFoundError:
-            warnings.append(
-                "'nm' command not found, cannot verify libomp symbols")
+            warnings.append("'nm' command not found, cannot verify libomp symbols")
         except:
             warnings.append("Could not verify libomp symbols")
 
@@ -268,7 +263,7 @@ def check_libomp():
         elif found_libomp:
             # Try loading from LD_LIBRARY_PATH
             try:
-                lib = ctypes.CDLL('libomp.so')
+                lib = ctypes.CDLL("libomp.so")
                 print("  ✓ libomp can be loaded from system paths")
             except OSError:
                 issues.append("libomp found but cannot be loaded")
@@ -300,9 +295,12 @@ def check_libomp():
         print("        export LD_PRELOAD=~/.local/lib/libomp.so")
         print("        export LD_LIBRARY_PATH=~/.local/lib:$LD_LIBRARY_PATH")
         print(
-            "     5. Add to ~/.bashrc for permanent setting (done by setup_banana_pi.sh):")
+            "     5. Add to ~/.bashrc for permanent setting (done by setup_banana_pi.sh):"
+        )
         print("        echo 'export LD_PRELOAD=~/.local/lib/libomp.so' >> ~/.bashrc")
-        print("        echo 'export LD_LIBRARY_PATH=~/.local/lib:\\$LD_LIBRARY_PATH' >> ~/.bashrc")
+        print(
+            "        echo 'export LD_LIBRARY_PATH=~/.local/lib:\\$LD_LIBRARY_PATH' >> ~/.bashrc"
+        )
         print("        source ~/.bashrc")
         return False
 
@@ -330,9 +328,9 @@ def launch_server():
     print(f"📁 Working directory: {script_dir}")
 
     # Try config_riscv.yaml first, fallback to config.yaml
-    config_file = 'config_riscv.yaml'
+    config_file = "config_riscv.yaml"
     if not os.path.exists(config_file):
-        config_file = 'config.yaml'
+        config_file = "config.yaml"
         if not os.path.exists(config_file):
             print(f"❌ Configuration file not found: {config_file}")
             print(f"   Expected in: {script_dir}")
@@ -341,14 +339,15 @@ def launch_server():
     print(f"📄 Using config file: {config_file}")
 
     # Create log file for server output
-    log_file = os.path.join(script_dir, 'sglang_server.log')
+    log_file = os.path.join(script_dir, "sglang_server.log")
     print(f"📝 Server logs will be written to: {log_file}")
 
     try:
         # Start server in background with logging
-        with open(log_file, 'w') as log:
+        with open(log_file, "w") as log:
             log.write(
-                f"SGLang Server Log - Started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f"SGLang Server Log - Started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
             log.write(f"Working directory: {script_dir}\n")
             log.write(f"Config file: {config_file}\n")
             log.write("=" * 60 + "\n\n")
@@ -356,31 +355,31 @@ def launch_server():
 
         # Try to use triton stub if available (for RISC-V compatibility)
         env = os.environ.copy()
-        pythonpath = env.get('PYTHONPATH', '')
-        if script_dir not in pythonpath.split(':'):
-            env['PYTHONPATH'] = f"{script_dir}{':' + pythonpath if pythonpath else ''}"
+        pythonpath = env.get("PYTHONPATH", "")
+        if script_dir not in pythonpath.split(":"):
+            env["PYTHONPATH"] = f"{script_dir}{':' + pythonpath if pythonpath else ''}"
 
         # Disable torch.compile on RISC-V (Inductor C++ compilation fails with -march=native)
         # PyTorch Inductor tries to compile C++ code with -march=native, but RISC-V g++ doesn't support it
-        env['TORCH_COMPILE_DISABLE'] = '1'
-        env['TORCHDYNAMO_DISABLE'] = '1'
-        env['SGLANG_ENABLE_TORCH_COMPILE'] = '0'
+        env["TORCH_COMPILE_DISABLE"] = "1"
+        env["TORCHDYNAMO_DISABLE"] = "1"
+        env["SGLANG_ENABLE_TORCH_COMPILE"] = "0"
 
         # Ensure CPU binding is configured for TP workers
-        if not env.get('SGLANG_CPU_OMP_THREADS_BIND'):
+        if not env.get("SGLANG_CPU_OMP_THREADS_BIND"):
             config_bind = get_cpu_threads_bind_from_config(
-                os.path.join(script_dir, config_file))
+                os.path.join(script_dir, config_file)
+            )
             if config_bind:
-                env['SGLANG_CPU_OMP_THREADS_BIND'] = config_bind
-                print(
-                    f"  ✓ Applying cpu-omp-threads-bind from config: {config_bind}")
+                env["SGLANG_CPU_OMP_THREADS_BIND"] = config_bind
+                print(f"  ✓ Applying cpu-omp-threads-bind from config: {config_bind}")
             else:
                 cpu_count = os.cpu_count() or 1
                 if cpu_count <= 1:
                     default_bind = "0"
                 else:
                     default_bind = f"0-{cpu_count - 1}"
-                env['SGLANG_CPU_OMP_THREADS_BIND'] = default_bind
+                env["SGLANG_CPU_OMP_THREADS_BIND"] = default_bind
                 print(
                     "  ⚠ cpu-omp-threads-bind not found in config; "
                     f"defaulting to cores {default_bind}"
@@ -388,19 +387,22 @@ def launch_server():
         else:
             print(
                 f"  ✓ Using existing SGLANG_CPU_OMP_THREADS_BIND="
-                f"{env['SGLANG_CPU_OMP_THREADS_BIND']}")
+                f"{env['SGLANG_CPU_OMP_THREADS_BIND']}"
+            )
 
         # Check if triton is available (real or stub)
         # IMPORTANT: Even if triton is available in current process (via stub),
         # we need to ensure it's loaded in the subprocess too
-        triton_stub_path = os.path.join(script_dir, 'triton_stub.py')
+        triton_stub_path = os.path.join(script_dir, "triton_stub.py")
         use_wrapper = False
 
         try:
             import triton
-            version = getattr(triton, '__version__', 'unknown')
-            is_stub = 'stub' in str(version).lower(
-            ) or getattr(triton, '_is_stub', False)
+
+            version = getattr(triton, "__version__", "unknown")
+            is_stub = "stub" in str(version).lower() or getattr(
+                triton, "_is_stub", False
+            )
             if is_stub:
                 print("  ✓ triton stub is loaded in main process (RISC-V compatible)")
                 # Even if stub is loaded in main process, subprocess needs it too
@@ -425,119 +427,214 @@ def launch_server():
 
         # Create wrapper script if needed (for triton stub only)
         if use_wrapper:
-            wrapper_script = os.path.join(
-                script_dir, 'launch_server_wrapper.py')
-            with open(wrapper_script, 'w') as f:
-                f.write('#!/usr/bin/env python3\n')
+            wrapper_script = os.path.join(script_dir, "launch_server_wrapper.py")
+            with open(wrapper_script, "w") as f:
+                f.write("#!/usr/bin/env python3\n")
                 f.write(
-                    '# Wrapper script to load triton_stub and ensure riscv backend is registered\n')
-                f.write('import sys\n')
-                f.write('import os\n')
-                f.write('import importlib\n')
+                    "# Wrapper script to load triton_stub and ensure riscv backend is registered\n"
+                )
+                f.write("import sys\n")
+                f.write("import os\n")
+                f.write("import importlib\n")
+                f.write("import traceback\n")
                 script_dir_real = os.path.realpath(script_dir)
                 f.write(f'sys.path.insert(0, r"{script_dir_real}")\n')
-                f.write('\n')
+                f.write("\n")
+                f.write("# Step 1: Load triton_stub FIRST, before any other imports\n")
                 f.write(
-                    '# Step 1: Load triton_stub FIRST, before any other imports\n')
-                f.write('try:\n')
+                    "# Try importing from venv site-packages first, then from script directory\n"
+                )
+                f.write("triton_stub_loaded = False\n")
+                f.write("try:\n")
                 f.write(
-                    '    import triton_stub  # This will register triton in sys.modules\n')
-                f.write('    print("✓ triton_stub loaded in subprocess")\n')
-                f.write('except ImportError as e:\n')
-                f.write('    print(f"⚠ Failed to import triton_stub: {e}")\n')
-                f.write('    pass\n')
-                f.write('\n')
-                f.write('# Step 2: Force import and registration of riscv backend\n')
+                    "    # Try importing from venv (if installed via setup script)\n"
+                )
                 f.write(
-                    '# This ensures the backend is registered even if __pycache__ is stale\n')
-                f.write('try:\n')
-                f.write('    # Import riscv_backend to trigger registration\n')
+                    "    import triton_stub  # This will register triton in sys.modules\n"
+                )
+                f.write('    print("✓ triton_stub loaded from venv site-packages")\n')
+                f.write("    triton_stub_loaded = True\n")
+                f.write("except ImportError:\n")
+                f.write("    # Try importing from script directory\n")
                 f.write(
-                    '    from sglang.srt.layers.attention import riscv_backend\n')
+                    f'    triton_stub_path = os.path.join(r"{script_dir_real}", "triton_stub.py")\n'
+                )
+                f.write("    if os.path.exists(triton_stub_path):\n")
+                f.write("        try:\n")
+                f.write("            import importlib.util\n")
+                f.write(
+                    '            spec = importlib.util.spec_from_file_location("triton_stub", triton_stub_path)\n'
+                )
+                f.write(
+                    "            triton_stub = importlib.util.module_from_spec(spec)\n"
+                )
+                f.write("            spec.loader.exec_module(triton_stub)\n")
+                f.write(
+                    '            print("✓ triton_stub loaded from script directory")\n'
+                )
+                f.write("            triton_stub_loaded = True\n")
+                f.write("        except Exception as e:\n")
+                f.write(
+                    '            print(f"⚠ Failed to load triton_stub from script directory: {e}")\n'
+                )
+                f.write("            traceback.print_exc()\n")
+                f.write("    else:\n")
+                f.write(
+                    '        print("⚠ triton_stub.py not found in script directory")\n'
+                )
+                f.write('        print(f"  Expected at: {triton_stub_path}")\n')
+                f.write("\n")
+                f.write("if not triton_stub_loaded:\n")
+                f.write(
+                    '    print("⚠ Warning: triton_stub not loaded, server may fail to start")\n'
+                )
+                f.write("\n")
+                f.write("# Step 2: Force import and registration of riscv backend\n")
+                f.write(
+                    "# This ensures the backend is registered even if __pycache__ is stale\n"
+                )
+                f.write("try:\n")
+                f.write("    # Import riscv_backend to trigger registration\n")
+                f.write("    from sglang.srt.layers.attention import riscv_backend\n")
                 f.write('    print("✓ riscv_backend module imported")\n')
                 f.write(
-                    '    # Force reload attention_registry to ensure registration\n')
+                    "    # Force reload attention_registry to ensure registration\n"
+                )
                 f.write(
-                    '    from sglang.srt.layers.attention import attention_registry\n')
-                f.write('    importlib.reload(attention_registry)\n')
-                f.write('    # Verify registration\n')
+                    "    from sglang.srt.layers.attention import attention_registry\n"
+                )
+                f.write("    importlib.reload(attention_registry)\n")
+                f.write("    # Verify registration\n")
                 f.write('    if "riscv" in attention_registry.ATTENTION_BACKENDS:\n')
                 f.write('        print("✓ riscv backend is registered")\n')
-                f.write('    else:\n')
+                f.write("    else:\n")
                 f.write(
-                    '        print("⚠ riscv backend NOT registered after import!")\n')
+                    '        print("⚠ riscv backend NOT registered after import!")\n'
+                )
                 f.write(
-                    '        print(f"Available backends: {list(attention_registry.ATTENTION_BACKENDS.keys())}")\n')
-                f.write('except Exception as e:\n')
+                    '        print(f"Available backends: {list(attention_registry.ATTENTION_BACKENDS.keys())}")\n'
+                )
+                f.write("except Exception as e:\n")
                 f.write('    print(f"⚠ Error importing riscv_backend: {e}")\n')
-                f.write('    import traceback\n')
-                f.write('    traceback.print_exc()\n')
-                f.write('    # Continue anyway, may still work\n')
-                f.write('\n')
-                f.write(
-                    '# Step 3: Use subprocess to call python -m (avoids multiprocessing issues)\n')
-                f.write('import subprocess\n')
+                f.write("    traceback.print_exc()\n")
+                f.write("    # Continue anyway, may still work\n")
+                f.write("\n")
+                f.write("# Step 3: Launch server with improved error handling\n")
+                f.write("import subprocess\n")
                 f.write(f'config_file = r"{config_file}"\n')
+                f.write('print("=" * 60)\n')
+                f.write('print("Launching SGLang server...")\n')
+                f.write('print("=" * 60)\n')
+                f.write("try:\n")
+                f.write("    # Use subprocess.run to capture output and errors\n")
+                f.write("    result = subprocess.run(\n")
                 f.write(
-                    'sys.exit(subprocess.call([sys.executable, "-m", "sglang.launch_server", "--config", config_file]))\n')
+                    '        [sys.executable, "-m", "sglang.launch_server", "--config", config_file],\n'
+                )
+                f.write("        capture_output=True,\n")
+                f.write("        text=True,\n")
+                f.write("        check=False\n")
+                f.write("    )\n")
+                f.write("    # Print output to stdout/stderr\n")
+                f.write("    if result.stdout:\n")
+                f.write("        print(result.stdout)\n")
+                f.write("    if result.stderr:\n")
+                f.write("        print(result.stderr, file=sys.stderr)\n")
+                f.write("    if result.returncode != 0:\n")
+                f.write(
+                    '        print(f"\\n❌ Server exited with code {result.returncode}")\n'
+                )
+                f.write('        print("\\nFull error output:")\n')
+                f.write("        print(result.stderr)\n")
+                f.write("    sys.exit(result.returncode)\n")
+                f.write("except Exception as e:\n")
+                f.write('    print(f"\\n❌ Exception when launching server: {e}")\n')
+                f.write("    traceback.print_exc()\n")
+                f.write("    sys.exit(1)\n")
             os.chmod(wrapper_script, 0o755)
             server_cmd = [python_exe, wrapper_script]
             print(
-                "  ✓ Created wrapper script to load triton_stub and ensure riscv backend")
+                "  ✓ Created wrapper script to load triton_stub and ensure riscv backend"
+            )
         else:
             # Use standard command (real triton installed or no stub available)
             # Still need to ensure riscv backend is registered
             # Create a minimal wrapper to force registration
-            wrapper_script = os.path.join(
-                script_dir, 'launch_server_wrapper.py')
-            with open(wrapper_script, 'w') as f:
-                f.write('#!/usr/bin/env python3\n')
-                f.write(
-                    '# Wrapper script to ensure riscv backend is registered\n')
-                f.write('import sys\n')
-                f.write('import os\n')
-                f.write('import importlib\n')
+            wrapper_script = os.path.join(script_dir, "launch_server_wrapper.py")
+            with open(wrapper_script, "w") as f:
+                f.write("#!/usr/bin/env python3\n")
+                f.write("# Wrapper script to ensure riscv backend is registered\n")
+                f.write("import sys\n")
+                f.write("import os\n")
+                f.write("import importlib\n")
+                f.write("import traceback\n")
                 script_dir_real = os.path.realpath(script_dir)
                 f.write(f'sys.path.insert(0, r"{script_dir_real}")\n')
-                f.write('\n')
-                f.write('# Force import and registration of riscv backend\n')
-                f.write('try:\n')
-                f.write(
-                    '    from sglang.srt.layers.attention import riscv_backend\n')
+                f.write("\n")
+                f.write("# Force import and registration of riscv backend\n")
+                f.write("try:\n")
+                f.write("    from sglang.srt.layers.attention import riscv_backend\n")
                 f.write('    print("✓ riscv_backend module imported")\n')
                 f.write(
-                    '    from sglang.srt.layers.attention import attention_registry\n')
-                f.write('    importlib.reload(attention_registry)\n')
+                    "    from sglang.srt.layers.attention import attention_registry\n"
+                )
+                f.write("    importlib.reload(attention_registry)\n")
                 f.write('    if "riscv" in attention_registry.ATTENTION_BACKENDS:\n')
                 f.write('        print("✓ riscv backend is registered")\n')
-                f.write('    else:\n')
+                f.write("    else:\n")
                 f.write('        print("⚠ riscv backend NOT registered!")\n')
                 f.write(
-                    '        print(f"Available: {list(attention_registry.ATTENTION_BACKENDS.keys())}")\n')
-                f.write('except Exception as e:\n')
+                    '        print(f"Available: {list(attention_registry.ATTENTION_BACKENDS.keys())}")\n'
+                )
+                f.write("except Exception as e:\n")
                 f.write('    print(f"⚠ Error: {e}")\n')
-                f.write('    import traceback\n')
-                f.write('    traceback.print_exc()\n')
-                f.write('\n')
-                f.write(
-                    '# Now use subprocess to call python -m (avoids multiprocessing issues)\n')
-                f.write('import subprocess\n')
+                f.write("    traceback.print_exc()\n")
+                f.write("\n")
+                f.write("# Launch server with improved error handling\n")
+                f.write("import subprocess\n")
                 f.write(f'config_file = r"{config_file}"\n')
+                f.write('print("=" * 60)\n')
+                f.write('print("Launching SGLang server...")\n')
+                f.write('print("=" * 60)\n')
+                f.write("try:\n")
+                f.write("    # Use subprocess.run to capture output and errors\n")
+                f.write("    result = subprocess.run(\n")
                 f.write(
-                    'sys.exit(subprocess.call([sys.executable, "-m", "sglang.launch_server", "--config", config_file]))\n')
+                    '        [sys.executable, "-m", "sglang.launch_server", "--config", config_file],\n'
+                )
+                f.write("        capture_output=True,\n")
+                f.write("        text=True,\n")
+                f.write("        check=False\n")
+                f.write("    )\n")
+                f.write("    # Print output to stdout/stderr\n")
+                f.write("    if result.stdout:\n")
+                f.write("        print(result.stdout)\n")
+                f.write("    if result.stderr:\n")
+                f.write("        print(result.stderr, file=sys.stderr)\n")
+                f.write("    if result.returncode != 0:\n")
+                f.write(
+                    '        print(f"\\n❌ Server exited with code {result.returncode}")\n'
+                )
+                f.write('        print("\\nFull error output:")\n')
+                f.write("        print(result.stderr)\n")
+                f.write("    sys.exit(result.returncode)\n")
+                f.write("except Exception as e:\n")
+                f.write('    print(f"\\n❌ Exception when launching server: {e}")\n')
+                f.write("    traceback.print_exc()\n")
+                f.write("    sys.exit(1)\n")
             os.chmod(wrapper_script, 0o755)
             server_cmd = [python_exe, wrapper_script]
             print("  ✓ Created wrapper script to ensure riscv backend registration")
 
         # Start process with output redirected to log file
-        log_f = open(log_file, 'a')
+        log_f = open(log_file, "a")
         try:
             process = subprocess.Popen(
                 server_cmd,
                 stdout=log_f,
                 stderr=subprocess.STDOUT,
                 cwd=script_dir,
-                env=env
+                env=env,
             )
         finally:
             log_f.close()
@@ -553,7 +650,7 @@ def launch_server():
             print("❌ Server process exited immediately!")
             print(f"📄 Last 20 lines of log file:")
             try:
-                with open(log_file, 'r') as f:
+                with open(log_file, "r") as f:
                     lines = f.readlines()
                     for line in lines[-20:]:
                         print(f"   {line.rstrip()}")
@@ -562,7 +659,9 @@ def launch_server():
             return False
 
         # Wait for service to start with progress updates
-        print("⏳ Waiting for server to start (this may take 5-15 minutes on RISC-V)...")
+        print(
+            "⏳ Waiting for server to start (this may take 5-15 minutes on RISC-V)..."
+        )
         print("   Progress updates every 30 seconds:")
 
         start_time = time.time()
@@ -573,10 +672,11 @@ def launch_server():
             # Check if process is still running
             if process.poll() is not None:
                 print(
-                    f"\n❌ Server process exited unexpectedly (exit code: {process.returncode})")
+                    f"\n❌ Server process exited unexpectedly (exit code: {process.returncode})"
+                )
                 print(f"📄 Last 30 lines of log file:")
                 try:
-                    with open(log_file, 'r') as f:
+                    with open(log_file, "r") as f:
                         lines = f.readlines()
                         for line in lines[-30:]:
                             print(f"   {line.rstrip()}")
@@ -586,26 +686,26 @@ def launch_server():
 
             # Check for errors in log file
             try:
-                with open(log_file, 'r') as f:
+                with open(log_file, "r") as f:
                     log_content = f.read()
                     # Check for common error patterns
                     error_keywords = [
-                        'Traceback (most recent call last)',
-                        'Error:',
-                        'Exception:',
-                        'Failed to',
-                        'ImportError',
-                        'ModuleNotFoundError',
-                        'AttributeError',
-                        'ValueError',
-                        'RuntimeError',
-                        'OSError',
-                        'CUDA error',  # Even on CPU, some code might check CUDA
+                        "Traceback (most recent call last)",
+                        "Error:",
+                        "Exception:",
+                        "Failed to",
+                        "ImportError",
+                        "ModuleNotFoundError",
+                        "AttributeError",
+                        "ValueError",
+                        "RuntimeError",
+                        "OSError",
+                        "CUDA error",  # Even on CPU, some code might check CUDA
                     ]
                     for keyword in error_keywords:
                         if keyword in log_content:
                             # Find the error context (last occurrence)
-                            lines = log_content.split('\n')
+                            lines = log_content.split("\n")
                             error_line_idx = None
                             for i in range(len(lines) - 1, -1, -1):
                                 if keyword in lines[i]:
@@ -613,10 +713,10 @@ def launch_server():
                                     break
 
                             if error_line_idx is not None:
+                                print(f"\n❌ Error detected in log: '{keyword}'")
                                 print(
-                                    f"\n❌ Error detected in log: '{keyword}'")
-                                print(
-                                    f"📄 Showing error context (last 20 lines around error):")
+                                    f"📄 Showing error context (last 20 lines around error):"
+                                )
                                 # Show context around error (10 lines before, 10 lines after)
                                 start_idx = max(0, error_line_idx - 10)
                                 end_idx = min(len(lines), error_line_idx + 11)
@@ -631,8 +731,7 @@ def launch_server():
             # Check server health
             if check_server_running():
                 elapsed = int(time.time() - start_time)
-                print(
-                    f"\n✅ Server launched successfully! (took {elapsed} seconds)")
+                print(f"\n✅ Server launched successfully! (took {elapsed} seconds)")
                 return True
 
             # Print progress every 30 seconds
@@ -642,12 +741,11 @@ def launch_server():
                 print(f"   ⏱️  Still starting... ({elapsed}s elapsed)")
                 # Show last few lines of log (more context)
                 try:
-                    with open(log_file, 'r') as f:
+                    with open(log_file, "r") as f:
                         lines = f.readlines()
                         if lines:
                             # Show last 3 lines for better context
-                            last_lines = [l.strip()
-                                          for l in lines[-3:] if l.strip()]
+                            last_lines = [l.strip() for l in lines[-3:] if l.strip()]
                             if last_lines:
                                 print(f"   📝 Latest log entries:")
                                 for line in last_lines:
@@ -665,6 +763,7 @@ def launch_server():
     except Exception as e:
         print(f"❌ Failed to launch server: {e}")
         import traceback
+
         traceback.print_exc()
         return False
 
@@ -689,8 +788,7 @@ def shutdown_server():
                 proc.wait(timeout=10)
                 print(f"✅ Process {proc.pid} terminated gracefully")
             except psutil.TimeoutExpired:
-                print(
-                    f"⚠️ Process {proc.pid} didn't terminate, forcing kill...")
+                print(f"⚠️ Process {proc.pid} didn't terminate, forcing kill...")
                 proc.kill()
                 proc.wait()
                 print(f"✅ Process {proc.pid} killed")
@@ -732,15 +830,15 @@ def interactive_chat():
         try:
             user_input = input("\n👤 You: ").strip()
 
-            if user_input.lower() in ['quit', 'exit']:
+            if user_input.lower() in ["quit", "exit"]:
                 print("👋 Goodbye!")
                 break
-            elif user_input.lower() == 'shutdown':
+            elif user_input.lower() == "shutdown":
                 print("\n🛑 Shutting down server...")
                 shutdown_server()
                 print("👋 Goodbye!")
                 break
-            elif user_input.lower() == 'restart':
+            elif user_input.lower() == "restart":
                 print("\n🔄 Restarting server...")
                 shutdown_server()
                 time.sleep(2)
@@ -749,13 +847,13 @@ def interactive_chat():
                 else:
                     print("❌ Failed to restart server")
                 continue
-            elif user_input.lower() == 'health':
+            elif user_input.lower() == "health":
                 if check_server_health():
                     print("✅ Server is healthy")
                 else:
                     print("❌ Server is not responding")
                 continue
-            elif user_input.lower() == 'help':
+            elif user_input.lower() == "help":
                 print("\n📖 Help:")
                 print("  - Type questions directly to chat")
                 print("  - 'shutdown': Shutdown server and exit")
@@ -783,14 +881,17 @@ def interactive_chat():
             data = {
                 "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                 "messages": [
-                    {"role": "system", "content": "You are a helpful assistant. Keep responses very short and concise."},
-                    {"role": "user", "content": user_input}
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant. Keep responses very short and concise.",
+                    },
+                    {"role": "user", "content": user_input},
                 ],
                 "max_tokens": 100,
                 "temperature": 0.1,
                 "top_p": 0.7,
                 "stop": ["\n", "User:", "Human:", "Assistant:", "."],
-                "stream": False
+                "stream": False,
             }
 
             print("🤖 AI: ", end="", flush=True)
@@ -801,7 +902,7 @@ def interactive_chat():
 
             if response.status_code == 200:
                 result = response.json()
-                ai_response = result['choices'][0]['message']['content']
+                ai_response = result["choices"][0]["message"]["content"]
                 print(ai_response)
             else:
                 print(f"❌ HTTP Error: {response.status_code}")
@@ -859,7 +960,7 @@ def main():
         print("   Please fix libomp configuration before continuing.")
         print("")
         response = input("Continue anyway? (y/n): ").strip().lower()
-        if response not in ['y', 'yes']:
+        if response not in ["y", "yes"]:
             print("Exiting. Please fix libomp configuration first.")
             return
         print("")
@@ -879,7 +980,9 @@ def main():
             print("   5. Check missing Python modules:")
             print("      - Run setup_banana_pi.sh to install all dependencies")
             print("      - Or manually: pip install <module_name>")
-            print("      - For wheel_builder packages: pip install <module> --index-url https://gitlab.com/api/v4/projects/riseproject%2Fpython%2Fwheel_builder/packages/pypi/simple")
+            print(
+                "      - For wheel_builder packages: pip install <module> --index-url https://gitlab.com/api/v4/projects/riseproject%2Fpython%2Fwheel_builder/packages/pypi/simple"
+            )
             print("   6. Verify environment setup:")
             print("      - Run: python test_environment.py")
             print("      - Check virtual environment is activated")
