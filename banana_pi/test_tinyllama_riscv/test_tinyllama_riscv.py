@@ -16,21 +16,32 @@ import psutil
 import requests
 
 # Import stubs FIRST, before any other imports that might try to import these modules
-# This ensures triton and PIL are available in sys.modules before SGLang tries to import them
+# This ensures triton, vllm, and PIL are available in sys.modules before SGLang tries to import them
 _script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Add script directory to path
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
 
 # Load triton_stub
 _triton_stub_path = os.path.join(_script_dir, "triton_stub.py")
 if os.path.exists(_triton_stub_path):
-    # Add script directory to path
-    if _script_dir not in sys.path:
-        sys.path.insert(0, _script_dir)
     try:
         import triton_stub  # This will register triton in sys.modules
 
         # Silent import - we'll check later if needed
     except ImportError:
         pass  # Will handle later if triton is actually needed
+
+# Load vllm_stub
+_vllm_stub_path = os.path.join(_script_dir, "vllm_stub.py")
+if os.path.exists(_vllm_stub_path):
+    try:
+        import vllm_stub  # This will register vllm in sys.modules
+
+        # Silent import - we'll check later if needed
+    except ImportError:
+        pass  # Will handle later if vllm is actually needed
 
 
 def wait_for_service(max_wait=3600):
@@ -440,10 +451,14 @@ def launch_server():
                 script_dir_real = os.path.realpath(script_dir)
                 f.write(f'sys.path.insert(0, r"{script_dir_real}")\n')
                 f.write("\n")
-                f.write("# Step 1: Load triton_stub FIRST, before any other imports\n")
+                f.write(
+                    "# Step 1: Load triton_stub and vllm_stub FIRST, before any other imports\n"
+                )
                 f.write(
                     "# Try importing from venv site-packages first, then from script directory\n"
                 )
+                f.write("\n")
+                f.write("# Load triton_stub\n")
                 f.write("triton_stub_loaded = False\n")
                 f.write("try:\n")
                 f.write(
@@ -487,6 +502,52 @@ def launch_server():
                 f.write("if not triton_stub_loaded:\n")
                 f.write(
                     '    print("⚠ Warning: triton_stub not loaded, server may fail to start")\n'
+                )
+                f.write("\n")
+                f.write("# Load vllm_stub\n")
+                f.write("vllm_stub_loaded = False\n")
+                f.write("try:\n")
+                f.write(
+                    "    # Try importing from venv (if installed via setup script)\n"
+                )
+                f.write(
+                    "    import vllm_stub  # This will register vllm in sys.modules\n"
+                )
+                f.write('    print("✓ vllm_stub loaded from venv site-packages")\n')
+                f.write("    vllm_stub_loaded = True\n")
+                f.write("except ImportError:\n")
+                f.write("    # Try importing from script directory\n")
+                f.write(
+                    f'    vllm_stub_path = os.path.join(r"{script_dir_real}", "vllm_stub.py")\n'
+                )
+                f.write("    if os.path.exists(vllm_stub_path):\n")
+                f.write("        try:\n")
+                f.write("            import importlib.util\n")
+                f.write(
+                    '            spec = importlib.util.spec_from_file_location("vllm_stub", vllm_stub_path)\n'
+                )
+                f.write(
+                    "            vllm_stub = importlib.util.module_from_spec(spec)\n"
+                )
+                f.write("            spec.loader.exec_module(vllm_stub)\n")
+                f.write(
+                    '            print("✓ vllm_stub loaded from script directory")\n'
+                )
+                f.write("            vllm_stub_loaded = True\n")
+                f.write("        except Exception as e:\n")
+                f.write(
+                    '            print(f"⚠ Failed to load vllm_stub from script directory: {e}")\n'
+                )
+                f.write("            traceback.print_exc()\n")
+                f.write("    else:\n")
+                f.write(
+                    '        print("⚠ vllm_stub.py not found in script directory")\n'
+                )
+                f.write('        print(f"  Expected at: {vllm_stub_path}")\n')
+                f.write("\n")
+                f.write("if not vllm_stub_loaded:\n")
+                f.write(
+                    '    print("⚠ Warning: vllm_stub not loaded, server may fail to start")\n'
                 )
                 f.write("\n")
                 f.write("# Step 2: Force import and registration of riscv backend\n")
@@ -571,7 +632,56 @@ def launch_server():
                 script_dir_real = os.path.realpath(script_dir)
                 f.write(f'sys.path.insert(0, r"{script_dir_real}")\n')
                 f.write("\n")
-                f.write("# Force import and registration of riscv backend\n")
+                f.write("# Step 1: Load vllm_stub FIRST, before any other imports\n")
+                f.write(
+                    "# Try importing from venv site-packages first, then from script directory\n"
+                )
+                f.write("vllm_stub_loaded = False\n")
+                f.write("try:\n")
+                f.write(
+                    "    # Try importing from venv (if installed via setup script)\n"
+                )
+                f.write(
+                    "    import vllm_stub  # This will register vllm in sys.modules\n"
+                )
+                f.write('    print("✓ vllm_stub loaded from venv site-packages")\n')
+                f.write("    vllm_stub_loaded = True\n")
+                f.write("except ImportError:\n")
+                f.write("    # Try importing from script directory\n")
+                f.write(
+                    f'    vllm_stub_path = os.path.join(r"{script_dir_real}", "vllm_stub.py")\n'
+                )
+                f.write("    if os.path.exists(vllm_stub_path):\n")
+                f.write("        try:\n")
+                f.write("            import importlib.util\n")
+                f.write(
+                    '            spec = importlib.util.spec_from_file_location("vllm_stub", vllm_stub_path)\n'
+                )
+                f.write(
+                    "            vllm_stub = importlib.util.module_from_spec(spec)\n"
+                )
+                f.write("            spec.loader.exec_module(vllm_stub)\n")
+                f.write(
+                    '            print("✓ vllm_stub loaded from script directory")\n'
+                )
+                f.write("            vllm_stub_loaded = True\n")
+                f.write("        except Exception as e:\n")
+                f.write(
+                    '            print(f"⚠ Failed to load vllm_stub from script directory: {e}")\n'
+                )
+                f.write("            traceback.print_exc()\n")
+                f.write("    else:\n")
+                f.write(
+                    '        print("⚠ vllm_stub.py not found in script directory")\n'
+                )
+                f.write('        print(f"  Expected at: {vllm_stub_path}")\n')
+                f.write("\n")
+                f.write("if not vllm_stub_loaded:\n")
+                f.write(
+                    '    print("⚠ Warning: vllm_stub not loaded, server may fail to start")\n'
+                )
+                f.write("\n")
+                f.write("# Step 2: Force import and registration of riscv backend\n")
                 f.write("try:\n")
                 f.write("    from sglang.srt.layers.attention import riscv_backend\n")
                 f.write('    print("✓ riscv_backend module imported")\n')

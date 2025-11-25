@@ -512,3 +512,22 @@ class Gemma3RMSNorm(MultiPlatformOp):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
+
+if not (
+    _is_cuda or _is_hip or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_xpu
+):
+    logger.info(
+        "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
+    )
+    # Try to import from vllm, but fallback gracefully if vllm is not available
+    # SGLang already defines its own RMSNorm and GemmaRMSNorm classes above,
+    # so this import is only for compatibility
+    try:
+        from vllm.model_executor.layers.layernorm import (  # noqa: F401
+            GemmaRMSNorm,
+            RMSNorm,
+        )
+    except ImportError:
+        # vllm is not available, use SGLang's own implementations (already defined above)
+        pass

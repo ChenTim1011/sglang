@@ -1340,6 +1340,41 @@ else
     log_warn "  ⚠ triton_stub.py not found at $TRITON_STUB_SOURCE"
 fi
 
+# Install vllm stub as a proper package so subprocess can import it
+# This creates a real 'vllm' package in site-packages that can be imported directly
+log_info "Setting up vllm stub package for subprocess import..."
+VLLM_STUB_SOURCE="$PROJECT_DIR/banana_pi/test_tinyllama_riscv/vllm_stub.py"
+if [ -f "$VLLM_STUB_SOURCE" ]; then
+    # Get site-packages directory (reuse from triton stub setup)
+    if [ -n "$SITE_PACKAGES" ] && [ -d "$SITE_PACKAGES" ]; then
+        # Create vllm package directory structure
+        VLLM_PKG_DIR="$SITE_PACKAGES/vllm"
+        mkdir -p "$VLLM_PKG_DIR"
+        mkdir -p "$VLLM_PKG_DIR/model_executor/layers"
+        mkdir -p "$VLLM_PKG_DIR/distributed"
+
+        # Copy vllm_stub.py content directly to vllm/__init__.py
+        # This ensures that 'import vllm' works directly in subprocess
+        VLLM_INIT="$VLLM_PKG_DIR/__init__.py"
+        if cp "$VLLM_STUB_SOURCE" "$VLLM_INIT" 2>/dev/null; then
+            log_info "  ✓ Installed vllm stub package to $VLLM_PKG_DIR"
+            log_info "  Note: 'import vllm' will now work in subprocess (e.g., sglang.launch_server)"
+
+            # Also copy vllm_stub.py to site-packages for backward compatibility
+            VLLM_STUB_TARGET="$SITE_PACKAGES/vllm_stub.py"
+            if cp "$VLLM_STUB_SOURCE" "$VLLM_STUB_TARGET" 2>/dev/null; then
+                log_info "  ✓ Also installed vllm_stub.py to $VLLM_STUB_TARGET (for backward compatibility)"
+            fi
+        else
+            log_warn "  ✗ Failed to copy vllm_stub to vllm package directory"
+        fi
+    else
+        log_warn "  ⚠ Could not find site-packages directory"
+    fi
+else
+    log_warn "  ⚠ vllm_stub.py not found at $VLLM_STUB_SOURCE"
+fi
+
 # Display installation summary
 echo ""
 log_step "Installation Summary"
