@@ -71,6 +71,16 @@ vllm_module.model_executor.layers = _StubModule("vllm.model_executor.layers")
 vllm_module.model_executor.layers.layernorm = _StubModule(
     "vllm.model_executor.layers.layernorm"
 )
+vllm_module.model_executor.layers.activation = _StubModule(
+    "vllm.model_executor.layers.activation"
+)
+# Create quantization structure (used in fp8.py and other quantization modules)
+vllm_module.model_executor.layers.quantization = _StubModule(
+    "vllm.model_executor.layers.quantization"
+)
+vllm_module.model_executor.layers.quantization.utils = _StubModule(
+    "vllm.model_executor.layers.quantization.utils"
+)
 
 # Import SGLang's own RMSNorm and GemmaRMSNorm implementations
 # These are the actual implementations that will be used on RISC-V
@@ -98,6 +108,32 @@ except ImportError:
     vllm_module.model_executor.layers.layernorm.RMSNorm = _StubRMSNorm
     vllm_module.model_executor.layers.layernorm.GemmaRMSNorm = _StubGemmaRMSNorm
 
+# Import SGLang's own GeluAndMul and SiluAndMul implementations
+# These are the actual implementations that will be used on RISC-V
+try:
+    from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
+
+    # Export SGLang's implementations as vLLM's classes
+    # This allows code that imports from vllm to use SGLang's implementations
+    vllm_module.model_executor.layers.activation.GeluAndMul = GeluAndMul
+    vllm_module.model_executor.layers.activation.SiluAndMul = SiluAndMul
+except ImportError:
+    # If SGLang's activation is not available, create stub classes
+    class _StubGeluAndMul:
+        """Stub GeluAndMul class."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class _StubSiluAndMul:
+        """Stub SiluAndMul class."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+    vllm_module.model_executor.layers.activation.GeluAndMul = _StubGeluAndMul
+    vllm_module.model_executor.layers.activation.SiluAndMul = _StubSiluAndMul
+
 # Create vllm.distributed structure (used in parallel_state.py)
 vllm_module.distributed = _StubModule("vllm.distributed")
 vllm_module.distributed.parallel_state = _StubModule("vllm.distributed.parallel_state")
@@ -109,6 +145,15 @@ sys.modules["vllm.model_executor"] = vllm_module.model_executor
 sys.modules["vllm.model_executor.layers"] = vllm_module.model_executor.layers
 sys.modules["vllm.model_executor.layers.layernorm"] = (
     vllm_module.model_executor.layers.layernorm
+)
+sys.modules["vllm.model_executor.layers.activation"] = (
+    vllm_module.model_executor.layers.activation
+)
+sys.modules["vllm.model_executor.layers.quantization"] = (
+    vllm_module.model_executor.layers.quantization
+)
+sys.modules["vllm.model_executor.layers.quantization.utils"] = (
+    vllm_module.model_executor.layers.quantization.utils
 )
 sys.modules["vllm.distributed"] = vllm_module.distributed
 sys.modules["vllm.distributed.parallel_state"] = vllm_module.distributed.parallel_state

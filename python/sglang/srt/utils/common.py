@@ -299,6 +299,62 @@ is_sm90_supported = lru_cache(maxsize=1)(
     )
 )
 
+_warned_bool_env_var_keys = set()
+
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name, default)
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def support_triton(backend: str) -> bool:
+    """Check if triton is supported for the given backend.
+
+    Returns False if:
+    - backend is in ["torch_native", "intel_amx", "ascend"]
+    - triton is a stub (RISC-V CPU-only environments)
+    """
+    if backend in ["torch_native", "intel_amx", "ascend"]:
+        return False
+
+    # Check if triton is a stub (RISC-V CPU-only environments)
+    try:
+        import triton
+
+        version = getattr(triton, "__version__", "")
+        is_stub = "stub" in str(version).lower() or getattr(triton, "_is_stub", False)
+        if is_stub:
+            return False
+    except ImportError:
+        # triton not available
+        return False
+
+    return True
+
 
 try:
     import sgl_kernel  # noqa: F401

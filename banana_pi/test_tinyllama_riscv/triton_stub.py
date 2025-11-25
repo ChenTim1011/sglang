@@ -2,8 +2,8 @@
 """
 Triton Stub Module for RISC-V CPU-Only Environment
 
-Triton (https://github.com/openai/triton) is a language and compiler for 
-writing highly efficient custom Deep-Learning primitives. It is designed 
+Triton (https://github.com/openai/triton) is a language and compiler for
+writing highly efficient custom Deep-Learning primitives. It is designed
 for GPU execution (CUDA/ROCm) and is not available for RISC-V CPU.
 
 This stub module provides the minimal interface needed for SGLang to import
@@ -22,11 +22,10 @@ References:
       * ONNX Runtime stubs: https://github.com/microsoft/onnxruntime (provider stubs)
 """
 
-import sys
 import importlib
 import importlib.util
+import sys
 from types import ModuleType
-import importlib
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -84,13 +83,39 @@ def stub_function(*args, **kwargs):
     return _StubValue()
 
 
+class _TritonKernelStub:
+    """Stub class that mimics triton kernel behavior with [] syntax support."""
+
+    def __init__(self, func):
+        self._func = func
+
+    def __getitem__(self, grid):
+        """Support kernel[grid] syntax - returns a callable that executes the function."""
+
+        # Return a callable that will execute the original function
+        # This allows kernel[(n,)](args...) syntax
+        def kernel_launcher(*args, **kwargs):
+            # For RISC-V, we should fallback to CPU implementation
+            # But since this is a stub, we'll just return None or execute a fallback
+            # The actual implementation should handle the fallback in the calling code
+            return self._func(*args, **kwargs)
+
+        return kernel_launcher
+
+    def __call__(self, *args, **kwargs):
+        """Support direct kernel call syntax."""
+        return self._func(*args, **kwargs)
+
+
 def stub_decorator(*args, **kwargs):
-    """Decorator stub that returns the wrapped function unchanged."""
+    """Decorator stub that returns a triton kernel stub."""
     if args and callable(args[0]):
-        return args[0]
+        # Direct decoration: @triton.jit def func(...)
+        return _TritonKernelStub(args[0])
 
     def decorator(func):
-        return func
+        # Decorator with arguments: @triton.jit(...) def func(...)
+        return _TritonKernelStub(func)
 
     return decorator
 
@@ -127,12 +152,9 @@ triton_module.autotune = stub_decorator
 triton_module.heuristics = stub_decorator
 
 # Misc helpers used by torch._inductor
-triton_module.cdiv = lambda x, y: 0 if not y else (
-    int(x) + int(y) - 1) // int(y)
-triton_module.next_power_of_2 = (
-    lambda x: 1 if not x else 1 << (int(x - 1).bit_length())
-    if isinstance(x, int)
-    else 1
+triton_module.cdiv = lambda x, y: 0 if not y else (int(x) + int(y) - 1) // int(y)
+triton_module.next_power_of_2 = lambda x: (
+    1 if not x else 1 << (int(x - 1).bit_length()) if isinstance(x, int) else 1
 )
 
 # triton.language namespace
@@ -184,8 +206,7 @@ tl.pointer_type = stub_function
 triton_module.compiler.compile = stub_function
 triton_module.compiler.ASTSource = type("ASTSource", (), {})
 triton_module.compiler.AttrsDescriptor = type("AttrsDescriptor", (), {})
-triton_module.compiler.CompiledKernel = type(
-    "CompiledKernel", (), {"_is_stub": True})
+triton_module.compiler.CompiledKernel = type("CompiledKernel", (), {"_is_stub": True})
 
 
 # Basic Config object used by torch._inductor.runtime.triton_compat
@@ -247,8 +268,7 @@ class _OutOfResources(RuntimeError):
 
 autotuner_module.OutOfResources = _OutOfResources
 triton_module.runtime.autotuner = autotuner_module
-runtime_jit_module.KernelInterface = type(
-    "KernelInterface", (), {"_is_stub": True})
+runtime_jit_module.KernelInterface = type("KernelInterface", (), {"_is_stub": True})
 
 # ---------------------------------------------------------------------------
 # Register in sys.modules so any `import triton` sees the stub
