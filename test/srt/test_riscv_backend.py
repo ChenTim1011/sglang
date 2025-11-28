@@ -26,18 +26,17 @@ class TestRISCVPDetection(unittest.TestCase):
     @patch("platform.machine")
     def test_is_host_cpu_riscv_positive(self, mock_machine):
         """Test RISC-V detection for various RISC-V machine strings."""
-        test_cases = ["riscv64", "riscv32", "RISCV64", "riscv"]
+        test_cases = ["riscv64", "riscv32", "RISCV64", "RISCV32"]
         for machine in test_cases:
             mock_machine.return_value = machine
             # Re-import to get fresh function with mocked platform
             from importlib import reload
+
             import sglang.srt.utils.common as common_module
 
             reload(common_module)
             result = common_module.is_host_cpu_riscv()
-            self.assertTrue(
-                result, f"Expected {machine} to be detected as RISC-V"
-            )
+            self.assertTrue(result, f"Expected {machine} to be detected as RISC-V")
 
     @patch("platform.machine")
     def test_is_host_cpu_riscv_negative(self, mock_machine):
@@ -47,13 +46,12 @@ class TestRISCVPDetection(unittest.TestCase):
             mock_machine.return_value = machine
             # Re-import to get fresh function with mocked platform
             from importlib import reload
+
             import sglang.srt.utils.common as common_module
 
             reload(common_module)
             result = common_module.is_host_cpu_riscv()
-            self.assertFalse(
-                result, f"Expected {machine} NOT to be detected as RISC-V"
-            )
+            self.assertFalse(result, f"Expected {machine} NOT to be detected as RISC-V")
 
 
 class TestRISCVBackendRegistration(unittest.TestCase):
@@ -86,7 +84,7 @@ class TestRISCVBackendFallback(unittest.TestCase):
             return_value=Mock(shape=[1, 1, 128])
         )
 
-    @patch("sglang.srt.layers.attention.riscv_backend.is_host_cpu_riscv")
+    @patch("sglang.srt.utils.common.is_host_cpu_riscv")
     def test_fallback_when_not_riscv(self, mock_is_riscv):
         """Test that backend falls back when not on RISC-V."""
         mock_is_riscv.return_value = False
@@ -94,7 +92,7 @@ class TestRISCVBackendFallback(unittest.TestCase):
         self.assertFalse(backend.use_riscv_kernels)
         self.assertIsNotNone(backend.fallback_backend)
 
-    @patch("sglang.srt.layers.attention.riscv_backend.is_host_cpu_riscv")
+    @patch("sglang.srt.utils.common.is_host_cpu_riscv")
     @patch("torch.ops.sgl_kernel", create=True)
     def test_fallback_when_kernel_unavailable(self, mock_ops, mock_is_riscv):
         """Test that backend falls back when RISC-V kernel is unavailable."""
