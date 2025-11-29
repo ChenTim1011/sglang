@@ -1,0 +1,20 @@
+# User-specific configuration file for build_and_deploy_sgl-kernel.sh
+#
+# Copy this file to build_and_deploy_sgl-kernel.config.sh and customize it
+# with your personal paths. This file will be automatically loaded by
+# build_and_deploy_sgl-kernel.sh if it exists.
+#
+# This file is ignored by git (.gitignore), so your personal paths won't
+# be committed to the repository.
+
+# Alternative Clang toolchain directory (if not using ~/tools/clang19-riscv)
+# Example: ALT_CLANG_TOOLCHAIN_DIR="/path/to/your/clang/toolchain"
+
+# RISC-V sysroot path
+# Example: RISCV_SYSROOT="/path/to/your/riscv/sysroot"
+
+# RISC-V GCC toolchain root
+# Example: GCC_TOOLCHAIN_ROOT="/path/to/your/riscv/gcc/toolchain"
+
+# Custom sgl-kernel directory (if not in standard locations)
+# Example: SGL_KERNEL_DIR="/path/to/your/sgl-kernel"
