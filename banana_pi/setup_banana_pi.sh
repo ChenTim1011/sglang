@@ -1,6 +1,6 @@
 #!/bin/bash
 # SGLang RISC-V Setup Script for Banana Pi
-# This script helps set up SGLang on Banana Pi for running test_tinyllama_riscv.py
+# This script helps set up SGLang on Banana Pi for running test_tinyllama_rvv.py
 #
 # Features:
 # - Clone sglang repo (from pllab-sglang/riscv_backend branch)
@@ -1053,9 +1053,9 @@ log_step "Installing Python dependencies..."
 cd "$PROJECT_DIR"
 
 # Install from requirements.txt if exists
-if [ -f "banana_pi/test_tinyllama_riscv/requirements.txt" ]; then
+if [ -f "banana_pi/test_tinyllama_rvv/requirements.txt" ]; then
     log_info "Installing from requirements.txt..."
-    pip install -r "banana_pi/test_tinyllama_riscv/requirements.txt" --quiet || log_warn "Some packages failed to install"
+    pip install -r "banana_pi/test_tinyllama_rvv/requirements.txt" --quiet || log_warn "Some packages failed to install"
 fi
 
 # Install common packages that might be missing
@@ -1309,7 +1309,7 @@ fi
 # Install triton stub as a proper package so subprocess can import it
 # This creates a real 'triton' package in site-packages that can be imported directly
 log_info "Setting up triton stub package for subprocess import..."
-TRITON_STUB_SOURCE="$PROJECT_DIR/banana_pi/test_tinyllama_riscv/triton_stub.py"
+TRITON_STUB_SOURCE="$PROJECT_DIR/banana_pi/test_tinyllama_rvv/triton_stub.py"
 if [ -f "$TRITON_STUB_SOURCE" ]; then
     # Get site-packages directory
     SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || python -c "import site; print(site.USER_SITE)" 2>/dev/null || echo "")
@@ -1343,7 +1343,7 @@ fi
 # Install vllm stub as a proper package so subprocess can import it
 # This creates a real 'vllm' package in site-packages that can be imported directly
 log_info "Setting up vllm stub package for subprocess import..."
-VLLM_STUB_SOURCE="$PROJECT_DIR/banana_pi/test_tinyllama_riscv/vllm_stub.py"
+VLLM_STUB_SOURCE="$PROJECT_DIR/banana_pi/test_tinyllama_rvv/vllm_stub.py"
 if [ -f "$VLLM_STUB_SOURCE" ]; then
     # Get site-packages directory (reuse from triton stub setup)
     if [ -n "$SITE_PACKAGES" ] && [ -d "$SITE_PACKAGES" ]; then
@@ -1446,7 +1446,7 @@ cd "$PROJECT_DIR"
 VERIFY_ERRORS=0
 
 # Check if test file exists
-TEST_FILE="banana_pi/test_tinyllama_riscv/test_tinyllama_riscv.py"
+TEST_FILE="banana_pi/test_tinyllama_rvv/test_tinyllama_rvv.py"
 if [ -f "$TEST_FILE" ]; then
     log_info "✓ Test file found: $TEST_FILE"
 else
@@ -1456,12 +1456,12 @@ else
 fi
 
 # Check if config file exists
-CONFIG_FILE="banana_pi/test_tinyllama_riscv/config_riscv.yaml"
+CONFIG_FILE="banana_pi/test_tinyllama_rvv/config_rvv.yaml"
 if [ -f "$CONFIG_FILE" ]; then
     log_info "✓ Config file found: $CONFIG_FILE"
 else
     log_warn "Config file not found: $CONFIG_FILE"
-    log_warn "  └─ Ensure repository includes banana_pi/test_tinyllama_riscv assets"
+    log_warn "  └─ Ensure repository includes banana_pi/test_tinyllama_rvv assets"
     VERIFY_ERRORS=1
 fi
 
@@ -1579,5 +1579,5 @@ log_info "Setup completed!"
 log_info "To run tests manually, SSH to Banana Pi and run:"
 echo "  cd ~/.local_riscv_env/workspace/sglang"
 echo "  source ~/.local_riscv_env/workspace/venv_sglang/bin/activate"
-echo "  python banana_pi/test_tinyllama_riscv/test_tinyllama_riscv.py"
+echo "  python banana_pi/test_tinyllama_rvv/test_tinyllama_rvv.py"
 echo ""

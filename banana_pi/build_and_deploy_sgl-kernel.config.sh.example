@@ -1,20 +1,116 @@
+# =============================================================================
 # User-specific configuration file for build_and_deploy_sgl-kernel.sh
+# =============================================================================
 #
-# Copy this file to build_and_deploy_sgl-kernel.config.sh and customize it
-# with your personal paths. This file will be automatically loaded by
-# build_and_deploy_sgl-kernel.sh if it exists.
+# QUICK START:
+# 1. Change this file's name to build_and_deploy_sgl-kernel.config.sh:
+#    cp build_and_deploy_sgl-kernel.config.sh.example build_and_deploy_sgl-kernel.config.sh
 #
-# This file is ignored by git (.gitignore), so your personal paths won't
-# be committed to the repository.
+# 2. Edit build_and_deploy_sgl-kernel.config.sh with your personal paths
+#
+# 3. Run the build script:
+#    ./build_and_deploy_sgl-kernel.sh
+#
+# This config file will be automatically loaded by build_and_deploy_sgl-kernel.sh
+# =============================================================================
 
-# Alternative Clang toolchain directory (if not using ~/tools/clang19-riscv)
-# Example: ALT_CLANG_TOOLCHAIN_DIR="/path/to/your/clang/toolchain"
+# =============================================================================
+# PREREQUISITES INSTALLATION GUIDE
+# =============================================================================
+#
+# The build script requires the following toolchains. Here's how to install them:
+#
+# --- Option A: Let the script build Clang 19 automatically ---
+# The script can automatically build Clang 19 if not found.
+# Prerequisites for this (using conda environment):
+#   conda create -n build_env python=3.10 cmake ninja git -c conda-forge
+#   conda activate build_env
+#   pip install build scikit-build-core wheel
+#   # Then just run: ./build_and_deploy_sgl-kernel.sh
+#   # It will prompt to build Clang 19 (~1-2 hours, ~20GB disk space)
+#
+# --- Option B: Manual Installation ---
+#
+# 1. RISC-V GCC Toolchain (for cross-compilation):
+#    # Download from https://github.com/riscv-collab/riscv-gnu-toolchain
+#    # Or use prebuilt:
+#    wget https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2024.09.03/riscv64-glibc-ubuntu-22.04-gcc-nightly-2024.09.03-nightly.tar.gz
+#    mkdir -p ~/riscv-toolchain
+#    tar -xzf riscv64-*.tar.gz -C ~/riscv-toolchain
+#    # Result: ~/riscv-toolchain/riscv or ~/riscv-toolchain/install
+#
+# 2. RISC-V Sysroot (target system libraries):
+#    # Option 1: Use the sysroot from riscv-gnu-toolchain
+#
+# 3. Clang 19 (required for RVV intrinsics):
+#    # Build from source (recommended):
+#    cd ~/tools
+#    git clone --depth 1 --branch llvmorg-19.1.0 https://github.com/llvm/llvm-project.git
+#    mkdir llvm-project/build && cd llvm-project/build
+#    cmake -G Ninja \
+#      -DCMAKE_BUILD_TYPE=Release \
+#      -DCMAKE_INSTALL_PREFIX=~/tools/clang19-riscv \
+#      -DLLVM_ENABLE_PROJECTS="clang;lld" \
+#      -DLLVM_TARGETS_TO_BUILD="RISCV;X86" \
+#      ../llvm
+#    ninja -j8 && ninja install
+#
+# 4. PyTorch RISC-V (cross-compiled PyTorch headers):
+#    # The script can download this automatically from GitHub Release
+#    # Or manually download from:
+#    # https://github.com/nthu-pllab/pllab-sglang/releases/download/v1.1/pytorch-riscv.tar.gz
+#    mkdir -p banana_pi/riscv_pytorch
+#    tar -xzf pytorch-riscv.tar.gz -C banana_pi/riscv_pytorch
+#
+# =============================================================================
 
-# RISC-V sysroot path
-# Example: RISCV_SYSROOT="/path/to/your/riscv/sysroot"
+# =============================================================================
+# CONFIGURATION OPTIONS
+# =============================================================================
 
-# RISC-V GCC toolchain root
-# Example: GCC_TOOLCHAIN_ROOT="/path/to/your/riscv/gcc/toolchain"
+# --- Banana Pi Connection ---
+# BANANA_PI_USER="jtchen"
+# BANANA_PI_HOST="140.114.78.64"
 
+# --- Clang 19 Toolchain ---
+# Directory where Clang 19 is installed (should contain bin/clang)
+# Default: ~/tools/clang19-riscv
+
+# CLANG19_TOOLCHAIN_DIR="/path/to/your/clang19"
+
+# Alternative Clang toolchain directory
+
+# ALT_CLANG_TOOLCHAIN_DIR="/path/to/alternative/clang/toolchain"
+
+# --- RISC-V Sysroot ---
+# Path to RISC-V sysroot (target system root filesystem)
+# Should contain usr/lib, usr/include, etc.
+# RISCV_SYSROOT="/path/to/riscv/sysroot"
+
+# --- RISC-V GCC Toolchain ---
+# Path to RISC-V GCC toolchain root
+# Should contain bin/riscv64-unknown-linux-gnu-gcc
+# GCC_TOOLCHAIN_ROOT="/path/to/riscv-toolchain/riscv"
+
+# --- PyTorch RISC-V ---
+# Path to cross-compiled PyTorch (for header files during build)
+# TORCH_PY_PREFIX="/path/to/pytorch-riscv"
+
+# --- sgl-kernel Directory ---
 # Custom sgl-kernel directory (if not in standard locations)
-# Example: SGL_KERNEL_DIR="/path/to/your/sgl-kernel"
+# SGL_KERNEL_DIR="/path/to/sgl-kernel"
+
+# --- SSH/SCP Configuration ---
+# Custom SSH/SCP binaries (if not in default locations)
+# SSH_BIN="/usr/bin/ssh"
+# SCP_BIN="/usr/bin/scp"
+
+# --- Build Options ---
+# Skip building Clang 19 (use existing installation)
+# SKIP_CLANG_BUILD=1
+
+# GitHub token for downloading PyTorch RISC-V from private release
+# GITHUB_TOKEN="your_github_token"
+
+# PyTorch release tag to download
+# PYTORCH_RELEASE_TAG="v1.1"

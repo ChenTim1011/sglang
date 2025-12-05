@@ -11,7 +11,7 @@ without errors. All GPU-accelerated operations automatically fall back to
 PyTorch's CPU implementations.
 
 Usage:
-    This module is automatically loaded by test_tinyllama_riscv.py before
+    This module is automatically loaded by test_tinyllama_rvv.py before
     importing SGLang. No manual intervention is required.
 
 References:
@@ -130,7 +130,7 @@ def _constexpr(value):
 # ---------------------------------------------------------------------------
 
 triton_module = _StubModule("triton")
-triton_module.__version__ = "2.0.0-stub"
+triton_module.__version__ = "2.0.0"  # Use PEP 440 compatible version
 triton_module.__file__ = __file__
 triton_module.__spec__ = importlib.util.spec_from_loader(
     "triton", loader=None, origin=__file__
@@ -276,6 +276,13 @@ runtime_jit_module.KernelInterface = type("KernelInterface", (), {"_is_stub": Tr
 
 sys.modules["triton"] = triton_module
 sys.modules["triton.language"] = triton_module.language
+sys.modules["triton.language.extra"] = tl.extra
+sys.modules["triton.language.extra.cuda"] = tl.extra.cuda
+sys.modules["triton.language.extra.cuda.libdevice"] = tl.extra.cuda.libdevice
+sys.modules["triton.language.math"] = tl.math
+sys.modules["triton.language.core"] = tl.core
+sys.modules["triton.language.tensor"] = tl.tensor
+sys.modules["triton.language.dtype"] = tl.dtype
 sys.modules["triton.compiler"] = triton_module.compiler
 sys.modules["triton.runtime"] = triton_module.runtime
 sys.modules["triton.runtime.autotuner"] = autotuner_module

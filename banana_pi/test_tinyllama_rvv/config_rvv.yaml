@@ -1,0 +1,38 @@
+# SGLang RVV Optimized Configuration
+# Optimized for Banana Pi with limited memory and CPU performance
+
+model-path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+device: cpu
+host: 127.0.0.1
+port: 30000
+
+# Tensor Parallel (single rank on Banana Pi)
+tensor-parallel-size: 1
+# CPU binding is handled via SGLANG_CPU_OMP_THREADS_BIND env
+
+# Attention Backend
+attention-backend: rvv
+prefill-attention-backend: rvv
+decode-attention-backend: rvv
+
+# Model Implementation (Transformers)
+model-impl: transformers
+
+# KV Cache
+kv-cache-dtype: auto
+dtype: float16
+# Memory Management (Reduced for RVV)
+mem-fraction-static: 0.5
+max-running-requests: 1
+max-prefill-tokens: 32
+max-total-tokens: 64
+chunked-prefill-size: 32
+cpu-offload-gb: 1
+
+# Throughput (Adjusted for RVV performance)
+stream-interval: 2
+num-continuous-decode-steps: 1
+
+# Performance Monitoring
+enable-metrics: true
+log-requests: true

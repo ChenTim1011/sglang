@@ -12,7 +12,7 @@ fall back to PyTorch's CPU implementations or SGLang's own implementations.
 
 Usage:
     This module should be loaded before importing SGLang modules that depend
-    on vLLM. It can be loaded automatically by test_tinyllama_riscv.py or
+    on vLLM. It can be loaded automatically by test_tinyllama_rvv.py or
     manually imported.
 
 References:

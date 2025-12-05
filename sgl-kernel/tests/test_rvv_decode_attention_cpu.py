@@ -1,12 +1,12 @@
 """
-Test for decode_attention_cpu kernel (RISC-V RVV optimized).
+Test for decode_attention_cpu kernel (RVV optimized).
 
 This test verifies that the CPU attention decode kernel produces correct results.
-Designed to run on RISC-V Banana Pi platform.
+Designed to run on RISC-V hardware platforms (e.g., Banana Pi).
 
-Usage on Banana Pi:
+Usage on RISC-V hardware:
     cd ~/sglang/sgl-kernel
-    pytest tests/test_decode_attention_cpu.py -v
+    pytest tests/test_rvv_decode_attention_cpu.py -v
 """
 
 import os
@@ -457,7 +457,7 @@ def test_decode_attention_cpu_riscv_info():
 @pytest.mark.skipif(
     not is_decode_attention_available(), reason="decode_attention_cpu not available"
 )
-@pytest.mark.skipif(not is_riscv_platform(), reason="Not running on RISC-V platform")
+@pytest.mark.skipif(not is_riscv_platform(), reason="Not running on RISC-V hardware")
 def test_decode_attention_riscv_accuracy():
     """Test RISC-V RVV kernel accuracy against torch_native reference."""
     import torch.nn.functional as F
@@ -494,7 +494,7 @@ def test_decode_attention_riscv_accuracy():
     sm_scale = 1.0 / (head_dim**0.5)
     logit_cap = 50.0
 
-    # Run RISC-V kernel
+    # Run RVV kernel
     # Function signature: decode_attention_cpu(query, k_cache, v_cache, output, key, value, loc, attn_logits, req_to_token, req_pool_indices, seq_lens, sm_scale, logit_cap)
     torch.ops.sgl_kernel.decode_attention_cpu(
         query,

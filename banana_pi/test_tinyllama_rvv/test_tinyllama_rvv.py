@@ -305,9 +305,7 @@ def check_libomp():
         print("     4. Set LD_PRELOAD and LD_LIBRARY_PATH:")
         print("        export LD_PRELOAD=~/.local/lib/libomp.so")
         print("        export LD_LIBRARY_PATH=~/.local/lib:$LD_LIBRARY_PATH")
-        print(
-            "     5. Add to ~/.bashrc for permanent setting (done by setup_banana_pi.sh):"
-        )
+        print("     5. Add to ~/.bashrc for permanent setting")
         print("        echo 'export LD_PRELOAD=~/.local/lib/libomp.so' >> ~/.bashrc")
         print(
             "        echo 'export LD_LIBRARY_PATH=~/.local/lib:\\$LD_LIBRARY_PATH' >> ~/.bashrc"
@@ -334,12 +332,12 @@ def launch_server():
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Change to the script directory (where config_riscv.yaml should be)
+    # Change to the script directory (where config_rvv.yaml should be)
     os.chdir(script_dir)
     print(f"📁 Working directory: {script_dir}")
 
-    # Try config_riscv.yaml first, fallback to config.yaml
-    config_file = "config_riscv.yaml"
+    # Try config_rvv.yaml first, fallback to config.yaml
+    config_file = "config_rvv.yaml"
     if not os.path.exists(config_file):
         config_file = "config.yaml"
         if not os.path.exists(config_file):
@@ -364,7 +362,7 @@ def launch_server():
             log.write("=" * 60 + "\n\n")
             log.flush()
 
-        # Try to use triton stub if available (for RISC-V compatibility)
+        # Try to use triton stub if available
         env = os.environ.copy()
         pythonpath = env.get("PYTHONPATH", "")
         if script_dir not in pythonpath.split(":"):
@@ -555,9 +553,9 @@ def launch_server():
                     "# This ensures the backend is registered even if __pycache__ is stale\n"
                 )
                 f.write("try:\n")
-                f.write("    # Import riscv_backend to trigger registration\n")
-                f.write("    from sglang.srt.layers.attention import riscv_backend\n")
-                f.write('    print("✓ riscv_backend module imported")\n')
+                f.write("    # Import rvv_backend to trigger registration\n")
+                f.write("    from sglang.srt.layers.attention import rvv_backend\n")
+                f.write('    print("✓ rvv_backend module imported")\n')
                 f.write(
                     "    # Force reload attention_registry to ensure registration\n"
                 )
@@ -566,7 +564,7 @@ def launch_server():
                 )
                 f.write("    importlib.reload(attention_registry)\n")
                 f.write("    # Verify registration\n")
-                f.write('    if "riscv" in attention_registry.ATTENTION_BACKENDS:\n')
+                f.write('    if "rvv" in attention_registry.ATTENTION_BACKENDS:\n')
                 f.write('        print("✓ riscv backend is registered")\n')
                 f.write("    else:\n")
                 f.write(
@@ -576,7 +574,7 @@ def launch_server():
                     '        print(f"Available backends: {list(attention_registry.ATTENTION_BACKENDS.keys())}")\n'
                 )
                 f.write("except Exception as e:\n")
-                f.write('    print(f"⚠ Error importing riscv_backend: {e}")\n')
+                f.write('    print(f"⚠ Error importing rvv_backend: {e}")\n')
                 f.write("    traceback.print_exc()\n")
                 f.write("    # Continue anyway, may still work\n")
                 f.write("\n")
@@ -619,7 +617,7 @@ def launch_server():
             )
         else:
             # Use standard command (real triton installed or no stub available)
-            # Still need to ensure riscv backend is registered
+            # Still need to ensure rvv backend is registered
             # Create a minimal wrapper to force registration
             wrapper_script = os.path.join(script_dir, "launch_server_wrapper.py")
             with open(wrapper_script, "w") as f:
@@ -683,13 +681,13 @@ def launch_server():
                 f.write("\n")
                 f.write("# Step 2: Force import and registration of riscv backend\n")
                 f.write("try:\n")
-                f.write("    from sglang.srt.layers.attention import riscv_backend\n")
-                f.write('    print("✓ riscv_backend module imported")\n')
+                f.write("    from sglang.srt.layers.attention import rvv_backend\n")
+                f.write('    print("✓ rvv_backend module imported")\n')
                 f.write(
                     "    from sglang.srt.layers.attention import attention_registry\n"
                 )
                 f.write("    importlib.reload(attention_registry)\n")
-                f.write('    if "riscv" in attention_registry.ATTENTION_BACKENDS:\n')
+                f.write('    if "rvv" in attention_registry.ATTENTION_BACKENDS:\n')
                 f.write('        print("✓ riscv backend is registered")\n')
                 f.write("    else:\n")
                 f.write('        print("⚠ riscv backend NOT registered!")\n')

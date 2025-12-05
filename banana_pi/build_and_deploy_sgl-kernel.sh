@@ -1323,6 +1323,10 @@ if [ -z "${SKIP_TRANSFER}" ]; then
         fi
     fi
 
+    echo "Transferring test and benchmark files..."
+    scp_cmd "${SGL_KERNEL_DIR}/tests/test_rvv_extend_attention_cpu.py" "${BANANA_PI_USER}@${BANANA_PI_HOST}:~/test_rvv_extend_attention_cpu.py" || echo "Warning: Failed to transfer test file"
+    scp_cmd "${SGL_KERNEL_DIR}/benchmark/bench_rvv_extend_attention.py" "${BANANA_PI_USER}@${BANANA_PI_HOST}:~/bench_rvv_extend_attention.py" || echo "Warning: Failed to transfer benchmark file"
+
     echo "✅ Step 2 complete: Wheel transferred successfully"
     echo ""
 else
@@ -1346,9 +1350,15 @@ if [ -d ~/.local_riscv_env/workspace/venv_sglang ]; then
     echo "✓ Activated virtual environment"
 fi
 
-# Set up OpenMP library paths
-export LD_PRELOAD=~/.local/lib/libomp.so 2>/dev/null || true
-export LD_LIBRARY_PATH=~/.local/lib:\${LD_LIBRARY_PATH}
+# Set up OpenMP library paths for RISC-V
+# These are required for the custom-built OpenMP runtime
+if [ -f ~/.local/lib/libomp.so ]; then
+    export LD_PRELOAD=~/.local/lib/libomp.so
+    export LD_LIBRARY_PATH=~/.local/lib:$LD_LIBRARY_PATH
+    echo "✓ Set up OpenMP library paths"
+else
+    echo "⚠️  Warning: ~/.local/lib/libomp.so not found, OpenMP may not work"
+fi
 
 # Find wheel file
     WHEEL_FILE=$(find "$HOME" -maxdepth 1 -name 'sgl_kernel-*.whl' -print 2>/dev/null | sort | tail -1)
@@ -1372,6 +1382,8 @@ echo ""
 
 # Verify installation
 echo "Verifying installation..."
+echo "LD_PRELOAD=$LD_PRELOAD"
+echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 python3 -c "import sgl_kernel; print('✓ sgl_kernel imported successfully')" || {
     echo "❌ ERROR: Failed to import sgl_kernel"
     exit 1
@@ -1426,19 +1438,43 @@ fi
 if [ -n "${SGL_KERNEL_DIR}" ] && [ -d "${SGL_KERNEL_DIR}" ]; then
     cd "${SGL_KERNEL_DIR}"
 
+    # Move transferred files to correct location
+    if [ -f ~/test_rvv_extend_attention_cpu.py ]; then
+        mv ~/test_rvv_extend_attention_cpu.py tests/
+    fi
+    if [ -f ~/bench_rvv_extend_attention.py ]; then
+        mv ~/bench_rvv_extend_attention.py benchmark/
+    fi
+
     if command -v pytest >/dev/null 2>&1; then
         echo "Running RISC-V platform info test..."
-        pytest tests/test_decode_attention_cpu.py::test_decode_attention_cpu_riscv_info -v -s || echo "⚠️  Platform info test failed"
+        pytest tests/test_rvv_decode_attention_cpu.py::test_decode_attention_cpu_riscv_info -v -s || echo "⚠️  Platform info test failed"
 
         echo ""
-        echo "Running RISC-V accuracy test..."
-        pytest tests/test_decode_attention_cpu.py::test_decode_attention_riscv_accuracy -v || {
+        echo "Running RVV decode accuracy test..."
+        pytest tests/test_rvv_decode_attention_cpu.py::test_decode_attention_riscv_accuracy -v || {
             echo "❌ ERROR: Accuracy test failed"
             exit 1
         }
     else
         echo "⚠️  pytest not available, skipping tests"
     fi
+
+    echo ""
+    echo "Running RVV Extend Attention Unit Test..."
+    if command -v pytest >/dev/null 2>&1; then
+        pytest tests/test_rvv_extend_attention_cpu.py -v || {
+            echo "❌ ERROR: RVV Extend Attention Unit Test failed"
+            exit 1
+        }
+    fi
+
+    echo ""
+    echo "Running RVV Extend Attention Benchmark..."
+    python3 benchmark/bench_rvv_extend_attention.py || {
+        echo "❌ ERROR: RVV Extend Attention Benchmark failed"
+        exit 1
+    }
 else
     echo "⚠️  sgl-kernel directory not found, skipping tests"
 fi
