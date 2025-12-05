@@ -1237,6 +1237,29 @@ EOF
     export SGL_ENABLE_ROCM=OFF
     export SGL_ENABLE_VULKAN=OFF
 
+    # Switch to RVV CMakeLists.txt for RISC-V build
+    CPU_CMAKE_DIR="${SGL_KERNEL_DIR}/csrc/cpu"
+    RVV_CMAKE="${CPU_CMAKE_DIR}/RVVCMakeLists.txt"
+    ORIG_CMAKE="${CPU_CMAKE_DIR}/CMakeLists.txt"
+    BACKUP_CMAKE="${CPU_CMAKE_DIR}/CMakeLists.txt.orig"
+
+    if [ -f "${RVV_CMAKE}" ]; then
+        echo "Switching to RVV CMakeLists.txt for RISC-V build..."
+        # Backup original CMakeLists.txt if not already backed up
+        if [ ! -f "${BACKUP_CMAKE}" ]; then
+            cp "${ORIG_CMAKE}" "${BACKUP_CMAKE}"
+        fi
+        # Use RVV CMakeLists.txt
+        cp "${RVV_CMAKE}" "${ORIG_CMAKE}"
+        echo "✅ Using RVVCMakeLists.txt for RVV kernel build"
+
+        # Set cleanup trap to restore original CMakeLists.txt
+        trap 'if [ -f "${BACKUP_CMAKE}" ]; then cp "${BACKUP_CMAKE}" "${ORIG_CMAKE}"; rm -f "${BACKUP_CMAKE}"; echo "Restored original CMakeLists.txt"; fi' EXIT
+    else
+        echo "⚠️  RVVCMakeLists.txt not found at ${RVV_CMAKE}"
+        echo "   Using existing CMakeLists.txt (must have RVV support)"
+    fi
+
     # Build wheel
     echo "Building sglang-kernel wheel for RISC-V..."
     export _PYTHON_HOST_PLATFORM="linux-riscv64"
