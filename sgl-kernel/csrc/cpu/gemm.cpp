@@ -3,6 +3,10 @@
 #include "common.h"
 #include "vec.h"
 
+#if defined(CPU_CAPABILITY_RVV)
+#include "gemm_rvv.h"
+#endif
+
 namespace {
 
 // packed   layout:
@@ -656,14 +660,6 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
   RECORD_FUNCTION("sgl-kernel::weight_packed_linear", std::vector<c10::IValue>({mat1, mat2, bias}));
 
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
-  bool use_fma_gemm = false;
-  if (packed_w.scalar_type() == at::kFloat) {
-    use_fma_gemm = true;
-  }
-
-  int64_t M = mat1.size(0);
-  int64_t K = mat1.size(1);
-  int64_t N = use_fma_gemm ? mat2.size(1) : mat2.size(0);
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
@@ -771,6 +767,7 @@ at::Tensor fused_linear_sigmoid_mul(
         mat1_strideM,
         out_strideM);
   });
+#endif
 
   return out;
 }

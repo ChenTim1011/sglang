@@ -562,3 +562,29 @@ def gptq_gemm(
 
 def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
     torch.torch.ops.sgl_kernel.gptq_shuffle(q_weight, q_perm, bit)
+
+
+def weight_packed_linear(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    is_vnni: bool = False,
+) -> torch.Tensor:
+    """
+    Perform weight-packed linear operation (GEMM).
+
+    Computes: output = mat1 @ mat2.T + bias
+
+    On RISC-V platforms, this uses RVV (RISC-V Vector Extension) optimized kernels.
+    On x86 platforms, this uses AMX/AVX optimized kernels with VNNI support.
+
+    Args:
+        mat1: Input tensor of shape [M, K]
+        mat2: Weight tensor of shape [N, K]
+        bias: Optional bias tensor of shape [N]
+        is_vnni: Whether to use VNNI format (x86 only)
+
+    Returns:
+        Output tensor of shape [M, N]
+    """
+    return torch.ops.sgl_kernel.weight_packed_linear(mat1, mat2, bias, is_vnni)
