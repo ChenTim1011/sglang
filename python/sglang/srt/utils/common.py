@@ -170,6 +170,36 @@ def is_host_cpu_x86() -> bool:
     )
 
 
+def is_host_cpu_riscv() -> bool:
+    """Check if the host CPU is RISC-V architecture."""
+    machine = platform.machine().lower()
+    is_riscv = machine in ("riscv64", "riscv32", "riscv")
+
+    if not is_riscv:
+        return False
+
+    # Check if PyTorch CPU is available
+    if not (hasattr(torch, "cpu") and torch.cpu.is_available()):
+        return False
+
+    return True
+
+
+def is_host_cpu_riscv() -> bool:
+    """Check if the host CPU is RISC-V architecture."""
+    machine = platform.machine().lower()
+    is_riscv = machine in ("riscv64", "riscv32", "riscv")
+
+    if not is_riscv:
+        return False
+
+    # Check if PyTorch CPU is available
+    if not (hasattr(torch, "cpu") and torch.cpu.is_available()):
+        return False
+
+    return True
+
+
 def is_host_cpu_arm64() -> bool:
     machine = platform.machine().lower()
     return (
@@ -181,7 +211,7 @@ def is_host_cpu_arm64() -> bool:
 
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
+    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64() or is_host_cpu_riscv()
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
@@ -222,26 +252,6 @@ def device_context(device: torch.device):
 
 is_ampere_with_cuda_12_3 = lambda: _check(8)
 is_hopper_with_cuda_12_3 = lambda: _check(9)
-
-
-def is_host_cpu_riscv() -> bool:
-    """Check if the host CPU is RISC-V architecture with Vector Extension support."""
-    machine = platform.machine().lower()
-    is_riscv = machine in ("riscv64", "riscv32")
-
-    if not is_riscv:
-        return False
-
-    # Check if PyTorch CPU is available
-    if not (hasattr(torch, "cpu") and torch.cpu.is_available()):
-        return False
-
-    # Additional check: try to detect RISC-V Vector Extension support
-    # This can be done by checking if we can compile with RVV intrinsics
-    # For now, we assume that if we're on RISC-V, we have basic support
-    # The actual RVV capability will be checked at compile time via CPU_CAPABILITY_RVV macro
-
-    return True
 
 
 def is_cpu_only_runtime() -> bool:
@@ -371,6 +381,34 @@ try:
     is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
 except:
     is_amx_tile_supported = False
+
+
+# RISC-V RVV support detection
+def is_riscv_platform():
+    """Check if running on RISC-V platform."""
+    machine = platform.machine().lower()
+    return machine in ("riscv64", "riscv32", "riscv")
+
+
+try:
+    # Check if RVV kernel is available in sgl_kernel
+    _is_rvv_kernel_available = (
+        is_riscv_platform()
+        and hasattr(torch.ops, "sgl_kernel")
+        and hasattr(torch.ops.sgl_kernel, "weight_packed_linear")
+    )
+except:
+    _is_rvv_kernel_available = False
+
+
+def cpu_has_rvv_support():
+    """Check if RISC-V RVV backend is available."""
+    return _is_rvv_kernel_available
+
+
+def use_riscv_rvv_backend(layer):
+    """Check if a layer should use RISC-V RVV backend."""
+    return getattr(layer, "use_riscv_rvv_backend", False)
 
 
 def cpu_has_amx_support():

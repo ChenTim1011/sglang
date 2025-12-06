@@ -22,12 +22,14 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    cpu_has_rvv_support,
     get_bool_env_var,
     is_cpu,
     is_hip,
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
+    use_riscv_rvv_backend,
 )
 
 if TYPE_CHECKING:
@@ -38,6 +40,7 @@ if TYPE_CHECKING:
 
 
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu_rvv_available = cpu_has_rvv_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -119,6 +122,23 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        elif _is_cpu and _is_cpu_rvv_available:
+            # Check at runtime if RVV GEMM should be disabled (for baseline comparison)
+            disable_rvv_gemm = get_bool_env_var(
+                "SGLANG_DISABLE_RVV_GEMM", default="false"
+            )
+            # Debug: print once to show if RVV GEMM is enabled/disabled
+            if not getattr(UnquantizedLinearMethod, "_rvv_gemm_status_printed", False):
+                import os
+
+                print(
+                    f"[RVV-GEMM] SGLANG_DISABLE_RVV_GEMM={os.environ.get('SGLANG_DISABLE_RVV_GEMM', 'not set')}, disable_rvv_gemm={disable_rvv_gemm}"
+                )
+                UnquantizedLinearMethod._rvv_gemm_status_printed = True
+            if not disable_rvv_gemm:
+                # For RISC-V RVV, mark the layer to use RVV backend
+                # No weight packing needed for RVV (uses native FP16)
+                layer.use_riscv_rvv_backend = True
 
     def apply(
         self,
@@ -136,6 +156,42 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 bias,
                 True,  # is_vnni
             )
+            if len(x_shapes) == 3:
+                output = output.view(x_shapes[0], x_shapes[1], -1)
+            return output
+
+        if use_riscv_rvv_backend(layer):
+            x_shapes = x.shape
+            if len(x_shapes) == 3:
+                x = x.view(-1, x.shape[-1])
+
+            # DEBUG: Print once to confirm RVV path is taken
+            if not getattr(layer, "_rvv_debug_printed", False):
+                print(
+                    f"[RVV] Using RISC-V RVV kernel for Linear: x={x.shape}, w={layer.weight.shape}"
+                )
+                layer._rvv_debug_printed = True
+
+            # Convert to FP16 for RVV kernel (if not already)
+            x_fp16 = x.half() if x.dtype != torch.float16 else x
+            weight_fp16 = (
+                layer.weight.half()
+                if layer.weight.dtype != torch.float16
+                else layer.weight
+            )
+
+            # Bias must be float32 for RVV kernel
+            bias_fp32 = None
+            if bias is not None:
+                bias_fp32 = bias.float() if bias.dtype != torch.float32 else bias
+
+            output = torch.ops.sgl_kernel.weight_packed_linear(
+                x_fp16,
+                weight_fp16,
+                bias_fp32,
+                False,  # is_vnni=False for RISC-V
+            )
+
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
