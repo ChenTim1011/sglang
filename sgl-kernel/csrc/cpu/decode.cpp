@@ -2,9 +2,9 @@
 #include "gemm.h"
 #include "vec.h"
 
-// Include RISC-V specific implementations when needed
+// Include RVV specific helper functions
 #if defined(CPU_CAPABILITY_RVV)
-#include "decode_riscv.cpp"
+#include "decode_rvv.cpp"
 #endif
 
 namespace {
@@ -1682,6 +1682,8 @@ void decode_attention_cpu(
   int64_t size_per_thread = is_mla ? BLOCK_N * head_size + BLOCK_N * head_size_v : 0;
   auto buffer = at::empty({num_threads, size_per_thread}, k_buffer.options());
 
+  // Use AT_DISPATCH_REDUCED_FLOATING_TYPES for Half and BFloat16 only
+  // The RVV intrinsics inside the kernel handle FP16 natively via Zvfh extension
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "decode_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
       // update the kv buffer

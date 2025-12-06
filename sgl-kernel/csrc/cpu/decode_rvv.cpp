@@ -1,5 +1,5 @@
 // RISC-V Vector Extension (RVV) optimized decode attention kernels
-// This file contains RISC-V specific implementations for decode attention
+// This file contains RVV specific implementations for decode attention
 // Note: This file is included directly in decode.cpp, not compiled separately
 
 // For RISC-V with Clang, we need pragma BEFORE any includes
@@ -14,7 +14,7 @@
 #if defined(CPU_CAPABILITY_RVV)
 // Clang 19 version check
 #if !defined(__clang__)
-#error "RVV backend in decode_riscv.cpp requires Clang compiler. Please use Clang 19.1.0 or later to compile this file."
+#error "RVV backend in decode_rvv.cpp requires Clang compiler. Please use Clang 19.1.0 or later to compile this file."
 #endif
 
 #if !defined(__clang_major__) || __clang_major__ < 19
@@ -23,11 +23,57 @@
 
 #include <riscv_vector.h>
 
+// Check for Zvfh (FP16 vector) support
+// Spacemit X60 (Banana Pi) supports zvfh_zvfhmin
+#if defined(__riscv_zvfh) || defined(__riscv_v)
+#define HAS_ZVFH_DECODE 1
+#else
+#define HAS_ZVFH_DECODE 0
+#endif
+
 #endif
 
 namespace {
 
 #if defined(CPU_CAPABILITY_RVV)
+
+// Helper: Load scalar_t data to float32 buffer using Zvfh when available
+// For FP16 with Zvfh: Uses hardware vle16 + vfwcvt (widening convert)
+// For FP16 without Zvfh: Software conversion loop
+// For FP32: Direct copy
+//
+// This is used for Q/K/V loading before dot product computation
+template <typename scalar_t>
+inline void load_to_float32_buffer_rvv(const scalar_t* src, float* dst, int64_t len) {
+  if constexpr (std::is_same_v<scalar_t, float>) {
+    // FP32: Direct copy
+    for (int64_t i = 0; i < len; ++i) {
+      dst[i] = src[i];
+    }
+  } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if HAS_ZVFH_DECODE
+    // FP16 with Zvfh: Hardware widening conversion (fast path)
+    int64_t offset = 0;
+    while (offset < len) {
+      size_t vl = __riscv_vsetvl_e16mf2(len - offset);
+      vfloat16mf2_t v_f16 = __riscv_vle16_v_f16mf2(reinterpret_cast<const _Float16*>(src + offset), vl);
+      vfloat32m1_t v_f32 = __riscv_vfwcvt_f_f_v_f32m1(v_f16, vl);
+      __riscv_vse32_v_f32m1(dst + offset, v_f32, vl);
+      offset += vl;
+    }
+#else
+    // FP16 without Zvfh: Software conversion (slow path)
+    for (int64_t i = 0; i < len; ++i) {
+      dst[i] = static_cast<float>(src[i]);
+    }
+#endif
+  } else {
+    // Other types (BFloat16, etc.): Software conversion
+    for (int64_t i = 0; i < len; ++i) {
+      dst[i] = static_cast<float>(src[i]);
+    }
+  }
+}
 
 inline float rvv_reduce_sum_f32(const float* data, int64_t len) {
   size_t vl = __riscv_vsetvl_e32m1(len);
@@ -70,6 +116,7 @@ inline float rvv_reduce_max_f32(const float* data, int64_t len) {
 // 1. Query-Key dot product
 // Efficient query-key matrix multiplication using RVV intrinsics
 // with proper float16 to float32 conversion to ensure numerical accuracy
+// Uses Zvfh hardware acceleration when available for FP16 loading
 template <typename scalar_t, typename index_t>
 inline void index_gemm_kernel_nt_rvv(
     const scalar_t* __restrict__ A,
@@ -96,20 +143,15 @@ inline void index_gemm_kernel_nt_rvv(
   alignas(64) float k_float32[256];
 
   for (int64_t m = 0; m < M; ++m) {
-    // Convert query from scalar_t to float32
-    // This handles both float16 and float32 cases correctly
-    for (int64_t k = 0; k < K; ++k) {
-      q_float32[k] = static_cast<float>(A[m * lda + k]);
-    }
+    // Convert query from scalar_t to float32 using Zvfh when available
+    load_to_float32_buffer_rvv(A + m * lda, q_float32, K);
 
     for (int64_t n = 0; n < N; ++n) {
       int64_t b_idx = indices[n];
       TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
 
-      // Convert key from scalar_t to float32
-      for (int64_t k = 0; k < K; ++k) {
-        k_float32[k] = static_cast<float>(B[b_idx * ldb + k]);
-      }
+      // Convert key from scalar_t to float32 using Zvfh when available
+      load_to_float32_buffer_rvv(B + b_idx * ldb, k_float32, K);
 
       // Initialize dot product accumulator
       vfloat32m1_t vdot = __riscv_vfmv_v_f_f32m1(0.0f, vl);
@@ -217,6 +259,7 @@ inline void softmax_rvv(const float* __restrict__ scores, float* __restrict__ pr
 // 3. Probabilities * Value aggregation
 // Calculate output = output * scale + sum(probs * values)
 // Weighted value aggregation using computed attention probabilities
+// Uses Zvfh hardware acceleration when available for FP16 loading
 template <typename scalar_t, typename index_t>
 inline void prob_value_aggregate_rvv(
     const float* __restrict__ probs,
@@ -245,12 +288,9 @@ inline void prob_value_aggregate_rvv(
       int64_t v_idx = indices[n];
       TORCH_CHECK(v_idx < max_tokens, "value index out of scope!");
 
-      // Convert value from scalar_t to float32
-      // This handles both float16 and float32 cases correctly
-      const scalar_t* v_scalar_ptr = values + v_idx * v_strideN;
-      for (int64_t i = 0; i < current_vl; ++i) {
-        value_buffer[i] = static_cast<float>(v_scalar_ptr[d + i]);
-      }
+      // Convert value from scalar_t to float32 using Zvfh when available
+      const scalar_t* v_scalar_ptr = values + v_idx * v_strideN + d;
+      load_to_float32_buffer_rvv(v_scalar_ptr, value_buffer.data(), current_vl);
 
       // Load value vector (now correctly as float32)
       vfloat32m1_t vv = __riscv_vle32_v_f32m1(value_buffer.data(), current_vl);
@@ -274,3 +314,7 @@ inline void prob_value_aggregate_rvv(
 #endif  // CPU_CAPABILITY_RVV
 
 }  // namespace
+
+// NOTE: decode_attention_kernel_rvv is now defined in decode.cpp directly
+// inside the anonymous namespace, after all *_impl functions are defined.
+// This allows it to call decode_attention_kernel_impl and other helper functions.
