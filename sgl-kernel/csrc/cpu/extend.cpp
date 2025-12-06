@@ -3,6 +3,10 @@
 #include "vec.h"
 #include "vec_pack.h"
 
+#if defined(CPU_CAPABILITY_RVV)
+#include "extend_rvv.cpp"
+#endif
+
 namespace {
 
 // [NOTE]: extend attention for CPU
@@ -525,6 +529,23 @@ void extend_attention_cpu(
   int num_threads = at::get_num_threads();
   auto buffer = at::empty({num_threads, size_per_thread}, q_extend.options().dtype(at::kChar));
 
+#if defined(CPU_CAPABILITY_RVV)
+  extend_attention_kernel_rvv(
+      q_extend,
+      k_extend,
+      v_extend,
+      o_extend,
+      k_buffer,
+      v_buffer,
+      req_to_token,
+      req_pool_indices,
+      seq_lens,
+      extend_seq_lens,
+      extend_start_loc,
+      max_len_extend,
+      sm_scale,
+      logit_cap);
+#else
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
       extend_attention_kernel_impl<scalar_t, index_t, BLOCK_M, BLOCK_N>(
@@ -565,4 +586,5 @@ void extend_attention_cpu(
           is_prefix_skipped);
     });
   });
+#endif
 }
