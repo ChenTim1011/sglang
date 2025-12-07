@@ -35,7 +35,6 @@ SKIP_CLANG_BUILD="${SKIP_CLANG_BUILD:-}"
 SKIP_BUILD="${SKIP_BUILD:-}"
 SKIP_TRANSFER="${SKIP_TRANSFER:-}"
 SKIP_INSTALL="${SKIP_INSTALL:-}"
-RUN_TESTS="${RUN_TESTS:-0}"
 # PyTorch RISC-V GitHub Release configuration
 PYTORCH_RELEASE_TAG="${PYTORCH_RELEASE_TAG:-v1.1}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
@@ -127,14 +126,6 @@ while [[ $# -gt 0 ]]; do
             SKIP_INSTALL=1
             shift
             ;;
-        --run-tests)
-            RUN_TESTS=1
-            shift
-            ;;
-        --no-tests)
-            RUN_TESTS=0
-            shift
-            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -153,8 +144,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-build          Skip building wheel"
             echo "  --skip-transfer       Skip transferring wheel to Banana Pi"
             echo "  --skip-install        Skip installing wheel on Banana Pi"
-            echo "  --run-tests           Run tests after installation (default: off)"
-            echo "  --no-tests            Skip running tests after installation"
             echo "  --help, -h            Show this help message"
             echo ""
             echo "Environment variables:"
@@ -164,7 +153,6 @@ while [[ $# -gt 0 ]]; do
             echo "  SKIP_BUILD            Skip building wheel"
             echo "  SKIP_TRANSFER         Skip transferring wheel"
             echo "  SKIP_INSTALL          Skip installing wheel"
-            echo "  RUN_TESTS             Run tests (default: 1)"
             exit 0
             ;;
         *)
@@ -220,9 +208,6 @@ if [ -n "${SKIP_TRANSFER}" ]; then
 fi
 if [ -n "${SKIP_INSTALL}" ]; then
     echo "  ⏭️  Skip install: Yes"
-fi
-if [ "${RUN_TESTS}" = "0" ]; then
-    echo "  ⏭️  Skip tests: Yes"
 fi
 echo ""
 
@@ -596,7 +581,7 @@ setup_clang19_env() {
         "${CC}" -print-target-triple 2>/dev/null || true
         echo ""
         echo "RISC-V Vector Extension support:"
-        "${CC}" -march=rv64gcv -mabi=lp64d -E -dM - < /dev/null 2>/dev/null | grep -i "__riscv_v" | head -5 || echo "Could not verify RVV support"
+        "${CC}" -march=rv64gcv -mabi=lp64d -target=${TARGET_TRIPLE} -E -dM - < /dev/null 2>/dev/null | grep -i "__riscv_v" | head -5 || echo "Could not verify RVV support"
     else
         echo "[ERROR] clang binary not runnable."
         return 1
@@ -1346,10 +1331,6 @@ if [ -z "${SKIP_TRANSFER}" ]; then
         fi
     fi
 
-    echo "Transferring test and benchmark files..."
-    scp_cmd "${SGL_KERNEL_DIR}/tests/test_rvv_extend_attention_cpu.py" "${BANANA_PI_USER}@${BANANA_PI_HOST}:~/test_rvv_extend_attention_cpu.py" || echo "Warning: Failed to transfer test file"
-    scp_cmd "${SGL_KERNEL_DIR}/benchmark/bench_rvv_extend_attention.py" "${BANANA_PI_USER}@${BANANA_PI_HOST}:~/bench_rvv_extend_attention.py" || echo "Warning: Failed to transfer benchmark file"
-
     echo "✅ Step 2 complete: Wheel transferred successfully"
     echo ""
 else
@@ -1431,90 +1412,6 @@ else
     echo ""
 fi
 
-# Step 4: Run tests (optional)
-if [ "${RUN_TESTS}" = "1" ] && [ -z "${SKIP_INSTALL}" ]; then
-    echo "============================================"
-    echo "Step 4: Running tests on Banana Pi"
-    echo "============================================"
-    echo ""
-
-    ssh_cmd "${BANANA_PI_USER}@${BANANA_PI_HOST}" << 'ENDSSH'
-set -e
-
-# Activate virtual environment if exists
-if [ -d ~/.local_riscv_env/workspace/venv_sglang ]; then
-    source ~/.local_riscv_env/workspace/venv_sglang/bin/activate
-fi
-
-# Set up OpenMP library paths
-export LD_PRELOAD=~/.local/lib/libomp.so 2>/dev/null || true
-export LD_LIBRARY_PATH=~/.local/lib:${LD_LIBRARY_PATH}
-
-# Find sgl-kernel directory
-SGL_KERNEL_DIR=""
-if [ -d ~/.local_riscv_env/workspace/sglang/sgl-kernel ]; then
-    SGL_KERNEL_DIR=~/.local_riscv_env/workspace/sglang/sgl-kernel
-elif [ -d ~/sglang/sgl-kernel ]; then
-    SGL_KERNEL_DIR=~/sglang/sgl-kernel
-fi
-
-if [ -n "${SGL_KERNEL_DIR}" ] && [ -d "${SGL_KERNEL_DIR}" ]; then
-    cd "${SGL_KERNEL_DIR}"
-
-    # Move transferred files to correct location
-    if [ -f ~/test_rvv_extend_attention_cpu.py ]; then
-        mv ~/test_rvv_extend_attention_cpu.py tests/
-    fi
-    if [ -f ~/bench_rvv_extend_attention.py ]; then
-        mv ~/bench_rvv_extend_attention.py benchmark/
-    fi
-
-    if command -v pytest >/dev/null 2>&1; then
-        echo "Running RISC-V platform info test..."
-        pytest tests/test_rvv_decode_attention_cpu.py::test_decode_attention_cpu_riscv_info -v -s || echo "⚠️  Platform info test failed"
-
-        echo ""
-        echo "Running RVV decode accuracy test..."
-        pytest tests/test_rvv_decode_attention_cpu.py::test_decode_attention_riscv_accuracy -v || {
-            echo "❌ ERROR: Accuracy test failed"
-            exit 1
-        }
-    else
-        echo "⚠️  pytest not available, skipping tests"
-    fi
-
-    echo ""
-    echo "Running RVV Extend Attention Unit Test..."
-    if command -v pytest >/dev/null 2>&1; then
-        pytest tests/test_rvv_extend_attention_cpu.py -v || {
-            echo "❌ ERROR: RVV Extend Attention Unit Test failed"
-            exit 1
-        }
-    fi
-
-    echo ""
-    echo "Running RVV Extend Attention Benchmark..."
-    python3 benchmark/bench_rvv_extend_attention.py || {
-        echo "❌ ERROR: RVV Extend Attention Benchmark failed"
-        exit 1
-    }
-else
-    echo "⚠️  sgl-kernel directory not found, skipping tests"
-fi
-ENDSSH
-
-    if [ $? -eq 0 ]; then
-        echo ""
-        echo "✅ Step 4 complete: All tests passed"
-    else
-        echo ""
-        echo "⚠️  WARNING: Some tests failed (see output above)"
-    fi
-    echo ""
-else
-    echo "⏭️  Skipping tests (RUN_TESTS=0 or SKIP_INSTALL is set)"
-    echo ""
-fi
 
 echo "============================================"
 echo "Deployment Complete!"

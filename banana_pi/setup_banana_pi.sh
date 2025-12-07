@@ -3,7 +3,7 @@
 # This script helps set up SGLang on Banana Pi for running test_tinyllama_rvv.py
 #
 # Features:
-# - Clone sglang repo (from pllab-sglang/riscv_backend branch)
+# - Clone sglang repo (from pllab-sglang/rvv_backend branch)
 # - Install Python dependencies
 # - Install wheels (from GitHub Releases)
 # - Install libomp library (from GitHub Releases)
@@ -28,7 +28,7 @@ SKIP_CONFIRM=false
 SKIP_WHEELS=false
 SKIP_TEST=true
 SGLANG_REPO="https://github.com/nthu-pllab/pllab-sglang.git"
-SGLANG_BRANCH="riscv_backend"
+SGLANG_BRANCH="rvv_backend"
 WORKSPACE_DIR="$HOME/.local_riscv_env/workspace"
 PROJECT_DIR="$WORKSPACE_DIR/sglang"
 # GitHub Releases configuration for wheels
@@ -147,7 +147,7 @@ echo "  SGLang RISC-V Setup for Banana Pi"
 echo "============================================================"
 echo ""
 echo "This script will:"
-echo "  1. Clone/update sglang repository (pllab-sglang/riscv_backend)"
+echo "  1. Clone/update sglang repository (pllab-sglang/rvv_backend)"
 echo "  2. Download wheels and libomp from GitHub Releases"
 echo "  3. Install Python dependencies"
 echo "  4. Configure environment"
@@ -266,7 +266,7 @@ log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 WORKSPACE_DIR="$HOME/.local_riscv_env/workspace"
 PROJECT_DIR="$WORKSPACE_DIR/sglang"
 SGLANG_REPO="https://github.com/nthu-pllab/pllab-sglang.git"
-SGLANG_BRANCH="riscv_backend"
+SGLANG_BRANCH="rvv_backend"
 WHEEL_BUILDER_URL="https://gitlab.com/api/v4/projects/riseproject%2Fpython%2Fwheel_builder/packages/pypi/simple"
 
 # Step 1: Create workspace directory

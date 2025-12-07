@@ -194,24 +194,25 @@ if [[ "$RUN_BENCHMARKS" == "true" ]]; then
     echo -e "${BLUE}============================================================${NC}"
     echo ""
 
-    cd benchmark
+    BENCHMARK_DIR=$(pwd)/benchmark
+    if [ ! -d "$BENCHMARK_DIR" ]; then
+        echo -e "${RED}ERROR: Benchmark directory not found: $BENCHMARK_DIR${NC}"
+    else
+        if [[ "$RUN_DECODE" == "true" ]]; then
+            run_benchmark "RVV Decode Attention" \
+                "cd $BENCHMARK_DIR && python bench_rvv_decode_attention.py --num-iterations $BENCH_ITERATIONS"
+        fi
 
-    if [[ "$RUN_DECODE" == "true" ]]; then
-        run_benchmark "RVV Decode Attention" \
-            "python bench_rvv_decode_attention.py --num-iterations $BENCH_ITERATIONS"
+        if [[ "$RUN_EXTEND" == "true" ]]; then
+            run_benchmark "RVV Extend Attention" \
+                "cd $BENCHMARK_DIR && python bench_rvv_extend_attention.py --num-iterations $BENCH_ITERATIONS"
+        fi
+
+        if [[ "$RUN_GEMM" == "true" ]]; then
+            run_benchmark "RVV GEMM" \
+                "cd $BENCHMARK_DIR && python bench_rvv_gemm.py"
+        fi
     fi
-
-    if [[ "$RUN_EXTEND" == "true" ]]; then
-        run_benchmark "RVV Extend Attention" \
-            "python bench_rvv_extend_attention.py --num-iterations $BENCH_ITERATIONS"
-    fi
-
-    if [[ "$RUN_GEMM" == "true" ]]; then
-        run_benchmark "RVV GEMM" \
-            "python bench_rvv_gemm.py"
-    fi
-
-    cd ..
 fi
 
 # ==============================================================================
