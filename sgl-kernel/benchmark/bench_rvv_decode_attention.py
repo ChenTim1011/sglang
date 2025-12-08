@@ -6,7 +6,7 @@ This script benchmarks through SGLang's attention backend system,
 comparing `attention-backend=rvv` vs `attention-backend=torch_native`.
 
 Usage:
-    python3 bench_rvv_decode_attention.py [--num-iterations N] [--warmup N]
+    python3 bench_rvv_decode_attention.py [--quick]
 """
 
 import argparse
@@ -14,30 +14,45 @@ import os
 import platform
 import sys
 import time
+from dataclasses import dataclass
 from unittest.mock import Mock
 
 import torch
 
-# Add parent directory to path
+# ============================================================================
+# Configuration & Environment Setup
+# ============================================================================
+
+# CI environment detection
+# This checks if the script is running in a Continuous Integration environment
+# (like GitHub Actions). If true, we typically run a smaller set of tests.
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
+
+# Add parent directory to path to import sglang
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-# IMPORTANT: Load triton_stub BEFORE importing SGLang (for RISC-V environments)
-# This must happen before any SGLang imports that may use triton
-# Priority: 1. Try real triton first, 2. Fall back to triton_stub if not available
-try:
-    import triton
 
-    HAS_TRITON = True
-    triton_version = getattr(triton, "__version__", "unknown")
-    triton_file = getattr(triton, "__file__", "unknown")
-    print(f"[INFO] Using real triton module (version: {triton_version})")
-    print(f"[INFO] Triton path: {triton_file}")
-except ImportError:
-    HAS_TRITON = False
+def setup_triton_stub():
+    """
+    Setup triton_stub for RISC-V environments where full Triton is not available.
+    This allows SGLang to import without failing on missing triton dependency.
+    """
+    try:
+        import triton
+
+        print(
+            f"[INFO] Using real triton module (version: {getattr(triton, '__version__', 'unknown')})"
+        )
+        return
+    except ImportError:
+        pass
+
     print("[INFO] Real triton not available, attempting to use triton_stub...")
 
-    # Try to use triton_stub for RISC-V hardware without full triton support
-    # Check multiple possible locations
+    # Check multiple possible locations for triton_stub.py
     possible_stub_paths = [
         os.path.join(
             os.path.dirname(__file__),
@@ -66,7 +81,6 @@ except ImportError:
 
     if triton_stub_path:
         # Execute triton_stub.py directly - it registers itself in sys.modules
-        # Create a namespace with __file__ set correctly
         stub_namespace = {
             "__file__": triton_stub_path,
             "__name__": "triton_stub",
@@ -74,15 +88,15 @@ except ImportError:
         }
         stub_namespace.update(sys.modules)
         with open(triton_stub_path, "r") as f:
-            triton_stub_code = f.read()
-        # Execute in the namespace - triton_stub will register itself in sys.modules
-        exec(compile(triton_stub_code, triton_stub_path, "exec"), stub_namespace)
+            exec(compile(f.read(), triton_stub_path, "exec"), stub_namespace)
         print(f"[INFO] Using triton_stub from {triton_stub_path}")
     else:
         print(f"[WARNING] triton not available and triton_stub not found")
-        print(f"  Checked paths: {possible_stub_paths}")
 
-# Now import SGLang (triton_stub should be loaded if needed)
+
+# Setup environment
+setup_triton_stub()
+
 try:
     from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -91,12 +105,6 @@ try:
 except ImportError as e:
     HAS_SGLANG = False
     print(f"ERROR: SGLang not available: {e}")
-    print(
-        "Make sure SGLang Python package is installed and PYTHONPATH is set correctly"
-    )
-    import traceback
-
-    traceback.print_exc()
     sys.exit(1)
 
 
@@ -106,23 +114,82 @@ def is_riscv_platform():
     return machine in ("riscv64", "riscv32", "riscv")
 
 
+# ============================================================================
+# Benchmark Data Classes
+# ============================================================================
+
+
+@dataclass
+class BenchmarkConfig:
+    """Configuration for a single benchmark."""
+
+    num_requests: int
+    num_heads: int
+    head_dim: int
+    seq_len: int
+    description: str
+
+
+@dataclass
+class BenchmarkResult:
+    """Result of a single benchmark."""
+
+    config: BenchmarkConfig
+    rvv_ms: float
+    torch_ms: float
+    speedup: float
+    throughput_rvv: float
+
+
+# ============================================================================
+# Benchmark Configurations
+# ============================================================================
+
+# Standard configurations
+STANDARD_CONFIGS = [
+    BenchmarkConfig(1, 8, 64, 128, "Small Batch (BS=1)"),
+    BenchmarkConfig(4, 8, 64, 128, "Medium Batch (BS=4)"),
+    BenchmarkConfig(32, 8, 64, 128, "Large Batch (BS=32)"),
+]
+
+# TinyLlama configurations (2048 hidden, 32 heads -> 64 head_dim)
+TINYLLAMA_CONFIGS = [
+    BenchmarkConfig(1, 32, 64, 128, "TinyLlama Decode (BS=1)"),
+    BenchmarkConfig(8, 32, 64, 128, "TinyLlama Decode (BS=8)"),
+]
+
+# CI configurations (faster)
+CI_CONFIGS = [
+    BenchmarkConfig(1, 4, 32, 32, "CI Quick Test"),
+]
+
+if IS_CI:
+    ALL_CONFIGS = CI_CONFIGS
+else:
+    ALL_CONFIGS = STANDARD_CONFIGS + TINYLLAMA_CONFIGS
+
+
+# ============================================================================
+# Mocking Utilities
+# ============================================================================
+
+
 def create_mock_runner(num_heads, head_dim, v_head_dim):
     """Create a mock ModelRunner for testing."""
     mock_runner = Mock()
     mock_runner.device = torch.device("cpu")
-
-    # Mock model_config
     mock_runner.model_config = Mock()
     mock_runner.model_config.num_attention_heads = num_heads
     mock_runner.tp_size = 1
 
     # Mock token_to_kv_pool
     mock_runner.token_to_kv_pool = Mock()
+    # Return buffers large enough for testing
     mock_runner.token_to_kv_pool.get_key_buffer = Mock(
-        return_value=torch.randn(128, num_heads, head_dim, dtype=torch.float16)
+        return_value=torch.randn(10000, num_heads, head_dim, dtype=torch.float16)
     )
     mock_runner.token_to_kv_pool.get_value_buffer = Mock(
-        return_value=torch.randn(128, num_heads, v_head_dim, dtype=torch.float16)
+        return_value=torch.randn(10000, num_heads, v_head_dim, dtype=torch.float16)
     )
 
     return mock_runner
@@ -147,11 +214,12 @@ def create_mock_forward_batch(
     mock_batch = Mock()
     mock_batch.batch_size = num_requests
     mock_batch.out_cache_loc = torch.zeros(num_requests, dtype=torch.int64)
-    mock_batch.seq_lens = torch.ones(num_requests, dtype=torch.int64)
+    mock_batch.seq_lens = torch.ones(num_requests, dtype=torch.int64) * max_seq_len
     mock_batch.req_pool_indices = torch.arange(num_requests, dtype=torch.int64)
 
     # Mock req_to_token_pool
     mock_batch.req_to_token_pool = Mock()
+    # Map requests to tokens [0..seq_len]
     mock_batch.req_to_token_pool.req_to_token = torch.zeros(
         num_requests, max_seq_len, dtype=torch.int64
     )
@@ -159,201 +227,138 @@ def create_mock_forward_batch(
     # Mock token_to_kv_pool
     mock_batch.token_to_kv_pool = Mock()
     mock_batch.token_to_kv_pool.get_key_buffer = Mock(
-        return_value=torch.randn(max_seq_len, num_heads, head_dim, dtype=torch.float16)
+        return_value=torch.randn(
+            max_seq_len * num_requests + 100, num_heads, head_dim, dtype=torch.float16
+        )
     )
     mock_batch.token_to_kv_pool.get_value_buffer = Mock(
         return_value=torch.randn(
-            max_seq_len, num_heads, v_head_dim, dtype=torch.float16
+            max_seq_len * num_requests + 100, num_heads, v_head_dim, dtype=torch.float16
         )
     )
-
     return mock_batch
 
 
-def benchmark_backend(
-    backend_name,
-    num_requests,
-    num_heads,
-    head_dim,
-    max_seq_len,
-    num_iterations=100,
-    warmup=10,
-):
-    """Benchmark a specific attention backend."""
-    v_head_dim = head_dim  # Assume same for simplicity
+# ============================================================================
+# Benchmark Functions
+# ============================================================================
 
-    # Create mock objects
-    mock_runner = create_mock_runner(num_heads, head_dim, v_head_dim)
-    mock_layer = create_mock_layer(num_heads, head_dim, v_head_dim)
 
-    # Create backend
-    if backend_name == "riscv":
+def run_single_backend(backend_name, config, num_iterations=100, warmup=10):
+    """Run benchmark for a single backend."""
+    v_head_dim = config.head_dim
+
+    mock_runner = create_mock_runner(config.num_heads, config.head_dim, v_head_dim)
+    mock_layer = create_mock_layer(config.num_heads, config.head_dim, v_head_dim)
+
+    if backend_name == "rvv":
         backend = RVVAttnBackend(mock_runner)
     elif backend_name == "torch_native":
         backend = TorchNativeAttnBackend(mock_runner)
     else:
         raise ValueError(f"Unknown backend: {backend_name}")
 
-    # Create test data
+    # Data
     dtype = torch.float16
-    q = torch.randn(num_requests, num_heads, head_dim, dtype=dtype)
-    k = torch.randn(num_requests, num_heads, head_dim, dtype=dtype)
-    v = torch.randn(num_requests, num_heads, v_head_dim, dtype=dtype)
+    q = torch.randn(config.num_requests, config.num_heads, config.head_dim, dtype=dtype)
+    k = torch.randn(config.num_requests, config.num_heads, config.head_dim, dtype=dtype)
+    v = torch.randn(config.num_requests, config.num_heads, v_head_dim, dtype=dtype)
 
-    # Create forward batch
     forward_batch = create_mock_forward_batch(
-        num_requests, num_heads, head_dim, v_head_dim, max_seq_len
+        config.num_requests,
+        config.num_heads,
+        config.head_dim,
+        v_head_dim,
+        config.seq_len,
     )
 
-    # Initialize forward metadata
     backend.init_forward_metadata(forward_batch)
 
     # Warmup
     for _ in range(warmup):
-        try:
-            backend.forward_decode(
-                q, k, v, mock_layer, forward_batch, save_kv_cache=True
-            )
-        except Exception as e:
-            print(f"WARNING: Warmup failed: {e}")
-            return None
+        backend.forward_decode(q, k, v, mock_layer, forward_batch, save_kv_cache=True)
 
     # Benchmark
     start_time = time.perf_counter()
-
     for _ in range(num_iterations):
-        try:
-            backend.forward_decode(
-                q, k, v, mock_layer, forward_batch, save_kv_cache=True
-            )
-        except Exception as e:
-            print(f"ERROR: Benchmark failed: {e}")
-            return None
-
+        backend.forward_decode(q, k, v, mock_layer, forward_batch, save_kv_cache=True)
     end_time = time.perf_counter()
 
-    total_time = end_time - start_time
-    avg_time = total_time / num_iterations
-    throughput = num_requests / avg_time
+    avg_time = (end_time - start_time) / num_iterations
+    return avg_time
 
-    return {
-        "total_time": total_time,
-        "avg_time": avg_time,
-        "throughput": throughput,
-    }
+
+def run_benchmark(config: BenchmarkConfig, quick=False) -> BenchmarkResult:
+    """Run benchmark for a configuration."""
+    iterations = 10 if quick else 100
+    warmup = 2 if quick else 10
+
+    # Run RVV
+    rvv_time = run_single_backend("rvv", config, iterations, warmup)
+
+    # Run Torch Native
+    torch_time = run_single_backend("torch_native", config, iterations, warmup)
+
+    speedup = torch_time / rvv_time
+    throughput = config.num_requests / rvv_time
+
+    return BenchmarkResult(
+        config=config,
+        rvv_ms=rvv_time * 1000,
+        torch_ms=torch_time * 1000,
+        speedup=speedup,
+        throughput_rvv=throughput,
+    )
+
+
+def print_result(result: BenchmarkResult):
+    """Print result in a formatted way."""
+    c = result.config
+    print(
+        f"  {c.description:<30} | BS={c.num_requests}, H={c.num_heads}, D={c.head_dim}"
+    )
+    print(f"    RVV:   {result.rvv_ms:8.3f} ms ({result.throughput_rvv:.1f} req/s)")
+    print(f"    Torch: {result.torch_ms:8.3f} ms")
+    print(f"    Speedup: {result.speedup:.2f}x")
+    print("-" * 60)
+
+
+# ============================================================================
+# Main
+# ============================================================================
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Benchmark RISC-V vs torch_native attention backends"
-    )
-    parser.add_argument(
-        "--num-requests",
-        type=int,
-        default=1,
-        help="Number of requests (default: 1)",
-    )
-    parser.add_argument(
-        "--num-heads",
-        type=int,
-        default=4,
-        help="Number of attention heads (default: 4)",
-    )
-    parser.add_argument(
-        "--head-dim",
-        type=int,
-        default=32,
-        help="Head dimension (default: 32)",
-    )
-    parser.add_argument(
-        "--max-seq-len",
-        type=int,
-        default=32,
-        help="Maximum sequence length (default: 32)",
-    )
-    parser.add_argument(
-        "--num-iterations",
-        type=int,
-        default=100,
-        help="Number of benchmark iterations (default: 100)",
-    )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=10,
-        help="Number of warmup iterations (default: 10)",
-    )
-
+    parser = argparse.ArgumentParser(description="Benchmark RVV Decode Attention")
+    parser.add_argument("--quick", action="store_true", help="Run quick benchmark")
     args = parser.parse_args()
 
-    if not is_riscv_platform():
-        print("WARNING: Not running on RISC-V platform")
-        print(f"  Machine: {platform.machine()}")
+    # Determine configs
+    configs = ALL_CONFIGS
+    if args.quick:
+        configs = CI_CONFIGS
 
     print("=" * 60)
-    print("Attention Backend Benchmark (RISC-V vs torch_native)")
+    print("RVV Decode Attention Benchmark")
     print("=" * 60)
     print(f"Platform: {platform.machine()}")
-    print(f"Parameters:")
-    print(f"  num_requests: {args.num_requests}")
-    print(f"  num_heads: {args.num_heads}")
-    print(f"  head_dim: {args.head_dim}")
-    print(f"  max_seq_len: {args.max_seq_len}")
-    print(f"  num_iterations: {args.num_iterations}")
-    print(f"  warmup: {args.warmup}")
-    print()
+    print(f"CI Mode: {IS_CI}")
+    print(f"Quick Mode: {args.quick}")
+    print("-" * 60)
 
-    # Benchmark RISC-V backend
-    print("Benchmarking attention-backend=riscv...")
-    riscv_results = benchmark_backend(
-        "riscv",
-        args.num_requests,
-        args.num_heads,
-        args.head_dim,
-        args.max_seq_len,
-        args.num_iterations,
-        args.warmup,
-    )
+    results = []
+    for config in configs:
+        try:
+            result = run_benchmark(config, quick=args.quick)
+            results.append(result)
+            print_result(result)
+        except Exception as e:
+            print(f"FAILED {config.description}: {e}")
 
-    if riscv_results is None:
-        print("ERROR: Failed to benchmark RISC-V backend")
-        sys.exit(1)
-
-    print(f"  Average time: {riscv_results['avg_time']*1000:.3f} ms")
-    print(f"  Throughput: {riscv_results['throughput']:.2f} requests/sec")
-    print()
-
-    # Benchmark torch_native backend
-    print("Benchmarking attention-backend=torch_native...")
-    torch_native_results = benchmark_backend(
-        "torch_native",
-        args.num_requests,
-        args.num_heads,
-        args.head_dim,
-        args.max_seq_len,
-        args.num_iterations,
-        args.warmup,
-    )
-
-    if torch_native_results is None:
-        print("ERROR: Failed to benchmark torch_native backend")
-        sys.exit(1)
-
-    print(f"  Average time: {torch_native_results['avg_time']*1000:.3f} ms")
-    print(f"  Throughput: {torch_native_results['throughput']:.2f} requests/sec")
-    print()
-
-    # Calculate speedup
-    speedup = torch_native_results["avg_time"] / riscv_results["avg_time"]
-    print("=" * 60)
-    print("Comparison Results")
-    print("=" * 60)
-    print(f"attention-backend=riscv:      {riscv_results['avg_time']*1000:.3f} ms")
-    print(
-        f"attention-backend=torch_native: {torch_native_results['avg_time']*1000:.3f} ms"
-    )
-    print(f"Speedup:                      {speedup:.2f}x")
-    print("=" * 60)
+    # Summary
+    if results:
+        avg_speedup = sum(r.speedup for r in results) / len(results)
+        print(f"Average Speedup: {avg_speedup:.2f}x")
 
 
 if __name__ == "__main__":

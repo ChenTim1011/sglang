@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Benchmark script for RVV extend attention kernel.
 
@@ -5,18 +6,78 @@ This script benchmarks the RVV optimized extend attention implementation
 against PyTorch's native backend through SGLang's attention backend system.
 
 Usage:
-    python3 bench_rvv_extend_attention.py [--num-iterations N]
+    python3 bench_rvv_extend_attention.py [--quick]
 """
 
 import argparse
 import os
+import platform
 import sys
 import time
+from dataclasses import dataclass
+from unittest.mock import Mock
 
 import torch
 
-# Add parent directory to path
+# ============================================================================
+# Configuration & Environment Setup
+# ============================================================================
+
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
+
+
+def setup_triton_stub():
+    """Setup triton_stub for RISC-V environments."""
+    try:
+        import triton
+
+        return
+    except ImportError:
+        pass
+
+    possible_stub_paths = [
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "banana_pi",
+            "test_tinyllama_rvv",
+            "triton_stub.py",
+        ),
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "..",
+            "banana_pi",
+            "test_tinyllama_rvv",
+            "triton_stub.py",
+        ),
+    ]
+
+    triton_stub_path = None
+    for path in possible_stub_paths:
+        if os.path.exists(path):
+            triton_stub_path = path
+            break
+
+    if triton_stub_path:
+        stub_namespace = {
+            "__file__": triton_stub_path,
+            "__name__": "triton_stub",
+            "__package__": "",
+        }
+        stub_namespace.update(sys.modules)
+        with open(triton_stub_path, "r") as f:
+            exec(compile(f.read(), triton_stub_path, "exec"), stub_namespace)
+
+
+setup_triton_stub()
 
 try:
     from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
@@ -26,6 +87,53 @@ try:
 except ImportError:
     HAS_SGLANG = False
     print("SGLang not found")
+    sys.exit(1)
+
+# ============================================================================
+# Benchmark Data Classes
+# ============================================================================
+
+
+@dataclass
+class BenchmarkConfig:
+    num_reqs: int
+    seq_len: int
+    extend_len: int
+    num_heads: int
+    head_dim: int
+    mode: str  # "extend" or "prefill"
+    description: str
+
+
+@dataclass
+class BenchmarkResult:
+    config: BenchmarkConfig
+    rvv_ms: float
+    torch_ms: float
+    speedup: float
+
+
+# ============================================================================
+# Benchmark Configurations
+# ============================================================================
+
+STANDARD_CONFIGS = [
+    BenchmarkConfig(1, 128, 32, 8, 64, "extend", "Extend (Seq=128, Ext=32)"),
+    BenchmarkConfig(1, 128, 128, 8, 64, "prefill", "Prefill (Seq=128)"),
+]
+
+CI_CONFIGS = [
+    BenchmarkConfig(1, 32, 8, 4, 32, "extend", "CI Extend"),
+]
+
+if IS_CI:
+    ALL_CONFIGS = CI_CONFIGS
+else:
+    ALL_CONFIGS = STANDARD_CONFIGS
+
+# ============================================================================
+# Mocking Utilities
+# ============================================================================
 
 
 class MockRunner:
@@ -88,7 +196,7 @@ class MockForwardBatch:
         self.extend_seq_lens = torch.full((num_reqs,), extend_len, dtype=torch.int64)
         self.extend_prefix_lens = self.seq_lens - self.extend_seq_lens
         self.extend_start_loc = torch.arange(num_reqs) * extend_len
-        max_tokens = num_reqs * seq_len * 2  # Ensure enough space
+        max_tokens = num_reqs * seq_len * 2
         self.req_to_token_pool = MockReqToTokenPool(num_reqs, seq_len, max_tokens)
         self.token_to_kv_pool = MockTokenToKVPool(num_heads, head_dim, max_tokens)
         self.forward_mode = MockForwardMode()
@@ -99,113 +207,102 @@ class MockReqToTokenPool:
     def __init__(self, num_reqs, seq_len, max_tokens):
         self.req_to_token = torch.zeros(num_reqs, seq_len, dtype=torch.int64)
         for i in range(num_reqs):
-            # Ensure indices are within max_tokens
             self.req_to_token[i] = torch.arange(seq_len) % max_tokens
 
 
-def benchmark(
-    backend_name, num_reqs, seq_len, extend_len, num_heads, head_dim, mode="extend"
-):
-    """
-    Benchmark attention kernel.
+# ============================================================================
+# Benchmark Functions
+# ============================================================================
 
-    Args:
-        mode: "extend" (has prefix in cache) or "prefill" (no prefix, extend_len == seq_len)
-    """
-    runner = MockRunner(num_heads, head_dim)
-    layer = MockLayer(num_heads, head_dim)
+
+def run_single_backend(backend_name, config, num_iterations=20, warmup=5):
+    runner = MockRunner(config.num_heads, config.head_dim)
+    layer = MockLayer(config.num_heads, config.head_dim)
 
     if backend_name == "rvv":
         backend = RVVAttnBackend(runner)
     else:
         backend = TorchNativeAttnBackend(runner)
 
-    # For prefill mode, extend_len == seq_len (no prefix)
-    actual_extend_len = seq_len if mode == "prefill" else extend_len
-    actual_seq_len = seq_len
+    actual_extend_len = (
+        config.seq_len if config.mode == "prefill" else config.extend_len
+    )
+    actual_seq_len = config.seq_len
 
     batch = MockForwardBatch(
-        num_reqs, actual_seq_len, actual_extend_len, num_heads, head_dim
+        config.num_reqs,
+        actual_seq_len,
+        actual_extend_len,
+        config.num_heads,
+        config.head_dim,
     )
     backend.init_forward_metadata(batch)
 
-    # Data
-    total_extend_len = num_reqs * actual_extend_len
-    q = torch.randn(total_extend_len, num_heads, head_dim)
-    k = torch.randn(total_extend_len, num_heads, head_dim)
-    v = torch.randn(total_extend_len, num_heads, head_dim)
+    total_extend_len = config.num_reqs * actual_extend_len
+    q = torch.randn(total_extend_len, config.num_heads, config.head_dim)
+    k = torch.randn(total_extend_len, config.num_heads, config.head_dim)
+    v = torch.randn(total_extend_len, config.num_heads, config.head_dim)
 
-    # Warmup
-    for _ in range(5):
+    for _ in range(warmup):
         backend.forward_extend(q, k, v, layer, batch)
 
     start = time.time()
-    iters = 20
-    for _ in range(iters):
+    for _ in range(num_iterations):
         backend.forward_extend(q, k, v, layer, batch)
     end = time.time()
 
-    avg_time = (end - start) / iters
-    print(f"{backend_name}: {avg_time*1000:.2f} ms")
-    return avg_time
+    return (end - start) / num_iterations
+
+
+def run_benchmark(config: BenchmarkConfig, quick=False) -> BenchmarkResult:
+    iterations = 5 if quick else 20
+    warmup = 2 if quick else 5
+
+    rvv_time = run_single_backend("rvv", config, iterations, warmup)
+    torch_time = run_single_backend("torch_native", config, iterations, warmup)
+
+    return BenchmarkResult(
+        config=config,
+        rvv_ms=rvv_time * 1000,
+        torch_ms=torch_time * 1000,
+        speedup=torch_time / rvv_time,
+    )
+
+
+def print_result(result: BenchmarkResult):
+    c = result.config
+    print(f"  {c.description:<30} | Mode={c.mode}, Seq={c.seq_len}, Ext={c.extend_len}")
+    print(f"    RVV:   {result.rvv_ms:8.3f} ms")
+    print(f"    Torch: {result.torch_ms:8.3f} ms")
+    print(f"    Speedup: {result.speedup:.2f}x")
+    print("-" * 60)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Benchmark RVV Extend Attention")
+    parser.add_argument("--quick", action="store_true", help="Run quick benchmark")
+    args = parser.parse_args()
+
+    configs = ALL_CONFIGS
+    if args.quick:
+        configs = CI_CONFIGS
+
+    print("=" * 60)
+    print("RVV Extend Attention Benchmark")
+    print("=" * 60)
+    print(f"Platform: {platform.machine()}")
+    print(f"CI Mode: {IS_CI}")
+    print("-" * 60)
+
+    results = []
+    for config in configs:
+        try:
+            result = run_benchmark(config, quick=args.quick)
+            results.append(result)
+            print_result(result)
+        except Exception as e:
+            print(f"FAILED {config.description}: {e}")
 
 
 if __name__ == "__main__":
-    if not HAS_SGLANG:
-        sys.exit(1)
-
-    num_reqs = 1
-    num_heads = 8
-    head_dim = 64
-
-    # Test 1: Extend mode (has prefix in cache)
-    print("=" * 60)
-    print("Test 1: EXTEND mode (seq_len=128, extend_len=32, prefix_len=96)")
-    print("=" * 60)
-    seq_len = 128
-    extend_len = 32
-    print(f"Parameters: reqs={num_reqs}, seq_len={seq_len}, extend_len={extend_len}")
-
-    t_riscv_ext = benchmark(
-        "riscv", num_reqs, seq_len, extend_len, num_heads, head_dim, mode="extend"
-    )
-    t_torch_ext = benchmark(
-        "torch_native",
-        num_reqs,
-        seq_len,
-        extend_len,
-        num_heads,
-        head_dim,
-        mode="extend",
-    )
-    print(f"Extend Speedup: {t_torch_ext/t_riscv_ext:.2f}x")
-
-    # Test 2: Prefill mode (no prefix, all new tokens)
-    print()
-    print("=" * 60)
-    print("Test 2: PREFILL mode (seq_len=128, extend_len=128, prefix_len=0)")
-    print("=" * 60)
-    seq_len = 128
-    print(
-        f"Parameters: reqs={num_reqs}, seq_len={seq_len}, extend_len={seq_len} (prefill)"
-    )
-
-    t_riscv_pre = benchmark(
-        "riscv", num_reqs, seq_len, seq_len, num_heads, head_dim, mode="prefill"
-    )
-    t_torch_pre = benchmark(
-        "torch_native", num_reqs, seq_len, seq_len, num_heads, head_dim, mode="prefill"
-    )
-    print(f"Prefill Speedup: {t_torch_pre/t_riscv_pre:.2f}x")
-
-    # Summary
-    print()
-    print("=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    print(
-        f"Extend mode  - RISC-V: {t_riscv_ext*1000:.2f}ms, torch_native: {t_torch_ext*1000:.2f}ms, Speedup: {t_torch_ext/t_riscv_ext:.2f}x"
-    )
-    print(
-        f"Prefill mode - RISC-V: {t_riscv_pre*1000:.2f}ms, torch_native: {t_torch_pre*1000:.2f}ms, Speedup: {t_torch_pre/t_riscv_pre:.2f}x"
-    )
+    main()

@@ -26,8 +26,11 @@ from typing import Callable
 
 import torch
 
+# Add parent directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
+
 # ============================================================================
-# Configuration
+# Configuration & Environment Setup
 # ============================================================================
 
 # CI environment detection
@@ -35,6 +38,59 @@ IS_CI = (
     os.getenv("CI", "false").lower() == "true"
     or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 )
+
+
+def setup_triton_stub():
+    """
+    Setup triton_stub for RISC-V environments where full Triton is not available.
+    """
+    try:
+        import triton
+
+        return
+    except ImportError:
+        pass
+
+    # Check multiple possible locations for triton_stub.py
+    possible_stub_paths = [
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "banana_pi",
+            "test_tinyllama_rvv",
+            "triton_stub.py",
+        ),
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "..",
+            "banana_pi",
+            "test_tinyllama_rvv",
+            "triton_stub.py",
+        ),
+    ]
+
+    triton_stub_path = None
+    for path in possible_stub_paths:
+        if os.path.exists(path):
+            triton_stub_path = path
+            break
+
+    if triton_stub_path:
+        stub_namespace = {
+            "__file__": triton_stub_path,
+            "__name__": "triton_stub",
+            "__package__": "",
+        }
+        stub_namespace.update(sys.modules)
+        with open(triton_stub_path, "r") as f:
+            exec(compile(f.read(), triton_stub_path, "exec"), stub_namespace)
+
+
+# Setup environment
+setup_triton_stub()
 
 
 def is_riscv_platform() -> bool:
@@ -212,11 +268,6 @@ def run_benchmark(
             y_rvv = rvv_fn()
 
             # Check correctness (convert to float32 for comparison)
-            # Use relaxed tolerance for FP16 computation:
-            # - FP16 has ~3.3 decimal digits of precision (vs FP32's ~7)
-            # - Large matrix multiplications accumulate significant errors
-            # - atol=0.5 allows for absolute error (important for values near 0)
-            # - rtol=0.1 allows for 10% relative error (matches FP16 precision limits)
             correct = torch.allclose(y_ref, y_rvv.float(), atol=0.5, rtol=0.1)
 
             # Calculate speedup
