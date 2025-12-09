@@ -152,9 +152,18 @@ def test_decode_attention_cpu(num_heads, head_dim, seq_len, num_requests):
         num_requests, num_heads, 1, head_dim_v + 1, dtype=torch.float32, device=device
     )
 
+    # New key/value for the current step
+    key = torch.randn(num_requests, num_heads, head_dim, dtype=dtype, device=device)
+    value = torch.randn(num_requests, num_heads, head_dim_v, dtype=dtype, device=device)
+
+    # Locations to write the new key/value
+    loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+    for i in range(num_requests):
+        # The location for the new token (last one)
+        loc[i] = req_to_token[i, seq_len - 1]
+
     sm_scale = 1.0 / (head_dim**0.5)
     logit_cap = 50.0
-    num_kv_splits = 1
 
     # Run Kernel
     torch.ops.sgl_kernel.decode_attention_cpu(
@@ -162,20 +171,30 @@ def test_decode_attention_cpu(num_heads, head_dim, seq_len, num_requests):
         k_buffer,
         v_buffer,
         output,
+        key,
+        value,
+        loc,
+        attn_logits,
         req_to_token,
         req_pool_indices,
         seq_lens,
-        attn_logits,
-        num_kv_splits,
         sm_scale,
         logit_cap,
     )
 
     # Run Reference
+    # Update reference buffers with new key/value
+    k_buffer_ref = k_buffer.clone()
+    v_buffer_ref = v_buffer.clone()
+    for i in range(num_requests):
+        l = loc[i].item()
+        k_buffer_ref[l] = key[i]
+        v_buffer_ref[l] = value[i]
+
     ref_output = naive_attention_decode(
         query,
-        k_buffer,
-        v_buffer,
+        k_buffer_ref,
+        v_buffer_ref,
         req_to_token,
         req_pool_indices,
         seq_lens,
@@ -226,20 +245,31 @@ def test_decode_attention_cpu_numerical_stability():
         num_requests, num_heads, 1, head_dim + 1, dtype=torch.float32, device=device
     )
 
+    # New key/value for the current step
+    key = torch.randn(num_requests, num_heads, head_dim, dtype=dtype, device=device)
+    value = torch.randn(num_requests, num_heads, head_dim, dtype=dtype, device=device)
+
+    # Locations to write the new key/value
+    loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+    for i in range(num_requests):
+        # The location for the new token (last one)
+        loc[i] = req_to_token[i, seq_len - 1]
+
     sm_scale = 1.0 / (head_dim**0.5)
     logit_cap = 50.0
-    num_kv_splits = 1
 
     torch.ops.sgl_kernel.decode_attention_cpu(
         query,
         k_buffer,
         v_buffer,
         output,
+        key,
+        value,
+        loc,
+        attn_logits,
         req_to_token,
         req_pool_indices,
         seq_lens,
-        attn_logits,
-        num_kv_splits,
         sm_scale,
         logit_cap,
     )

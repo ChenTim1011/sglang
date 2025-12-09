@@ -208,6 +208,9 @@ def test_extend_attention_cpu(num_heads, head_dim, seq_len, extend_len, num_requ
 
     sm_scale = 1.0 / (head_dim**0.5)
     logit_cap = 50.0
+    max_len_extend = (
+        extend_len  # Assuming max_len_extend is the max of extend_len in the batch
+    )
 
     # Run Kernel
     torch.ops.sgl_kernel.extend_attention_cpu(
@@ -222,6 +225,7 @@ def test_extend_attention_cpu(num_heads, head_dim, seq_len, extend_len, num_requ
         seq_lens,
         extend_seq_lens,
         extend_start_loc,
+        max_len_extend,
         sm_scale,
         logit_cap,
     )
