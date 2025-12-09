@@ -145,12 +145,12 @@ class MockRunner:
 
 
 class MockTokenToKVPool:
-    def __init__(self, num_heads, head_dim, max_tokens=10000):
+    def __init__(self, num_heads, head_dim, max_tokens=10000, dtype=torch.float16):
         self.max_tokens = max_tokens
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.k_buffer = torch.randn(max_tokens, num_heads, head_dim)
-        self.v_buffer = torch.randn(max_tokens, num_heads, head_dim)
+        self.k_buffer = torch.randn(max_tokens, num_heads, head_dim, dtype=dtype)
+        self.v_buffer = torch.randn(max_tokens, num_heads, head_dim, dtype=dtype)
 
     def get_key_buffer(self, layer_id):
         return self.k_buffer
@@ -239,9 +239,10 @@ def run_single_backend(backend_name, config, num_iterations=20, warmup=5):
     backend.init_forward_metadata(batch)
 
     total_extend_len = config.num_reqs * actual_extend_len
-    q = torch.randn(total_extend_len, config.num_heads, config.head_dim)
-    k = torch.randn(total_extend_len, config.num_heads, config.head_dim)
-    v = torch.randn(total_extend_len, config.num_heads, config.head_dim)
+    dtype = torch.float16
+    q = torch.randn(total_extend_len, config.num_heads, config.head_dim, dtype=dtype)
+    k = torch.randn(total_extend_len, config.num_heads, config.head_dim, dtype=dtype)
+    v = torch.randn(total_extend_len, config.num_heads, config.head_dim, dtype=dtype)
 
     for _ in range(warmup):
         backend.forward_extend(q, k, v, layer, batch)
