@@ -153,26 +153,63 @@ inline void index_gemm_kernel_nt_rvv(
       // Convert key from scalar_t to float32 using Zvfh when available
       load_to_float32_buffer_rvv(B + b_idx * ldb, k_float32, K);
 
-      // Initialize dot product accumulator
-      vfloat32m1_t vdot = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+      // Initialize dot product accumulators (unrolled 4x)
+      vfloat32m1_t vdot0 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+      vfloat32m1_t vdot1 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+      vfloat32m1_t vdot2 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+      vfloat32m1_t vdot3 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
 
-      // Vectorized dot product calculation
+      // Vectorized dot product calculation with 4x unrolling
       int64_t k = 0;
+      for (; k + 4 * vl <= K; k += 4 * vl) {
+        vfloat32m1_t vq0 = __riscv_vle32_v_f32m1(q_float32 + k, vl);
+        vfloat32m1_t vk0 = __riscv_vle32_v_f32m1(k_float32 + k, vl);
+        vdot0 = __riscv_vfmacc_vv_f32m1(vdot0, vq0, vk0, vl);
+
+        vfloat32m1_t vq1 = __riscv_vle32_v_f32m1(q_float32 + k + vl, vl);
+        vfloat32m1_t vk1 = __riscv_vle32_v_f32m1(k_float32 + k + vl, vl);
+        vdot1 = __riscv_vfmacc_vv_f32m1(vdot1, vq1, vk1, vl);
+
+        vfloat32m1_t vq2 = __riscv_vle32_v_f32m1(q_float32 + k + 2 * vl, vl);
+        vfloat32m1_t vk2 = __riscv_vle32_v_f32m1(k_float32 + k + 2 * vl, vl);
+        vdot2 = __riscv_vfmacc_vv_f32m1(vdot2, vq2, vk2, vl);
+
+        vfloat32m1_t vq3 = __riscv_vle32_v_f32m1(q_float32 + k + 3 * vl, vl);
+        vfloat32m1_t vk3 = __riscv_vle32_v_f32m1(k_float32 + k + 3 * vl, vl);
+        vdot3 = __riscv_vfmacc_vv_f32m1(vdot3, vq3, vk3, vl);
+      }
+
+      // Handle remaining chunks
       for (; k + vl <= K; k += vl) {
-        // Load vectors (now correctly as float32)
         vfloat32m1_t vq = __riscv_vle32_v_f32m1(q_float32 + k, vl);
         vfloat32m1_t vk = __riscv_vle32_v_f32m1(k_float32 + k, vl);
-
-        // Multiply-add: dot += q * k
-        vdot = __riscv_vfmacc_vv_f32m1(vdot, vq, vk, vl);
+        vdot0 = __riscv_vfmacc_vv_f32m1(vdot0, vq, vk, vl);
       }
+
+      // Combine accumulators
+      vfloat32m1_t vdot = __riscv_vfadd_vv_f32m1(
+          __riscv_vfadd_vv_f32m1(vdot0, vdot1, vl), __riscv_vfadd_vv_f32m1(vdot2, vdot3, vl), vl);
 
       // Handle tail elements
       if (k < K) {
         size_t tail_vl = __riscv_vsetvl_e32m1(K - k);
         vfloat32m1_t vq = __riscv_vle32_v_f32m1(q_float32 + k, tail_vl);
         vfloat32m1_t vk = __riscv_vle32_v_f32m1(k_float32 + k, tail_vl);
-        vdot = __riscv_vfmacc_vv_f32m1(vdot, vq, vk, tail_vl);
+
+        // Use a separate accumulator for tail to avoid corrupting vdot elements past tail_vl
+        vfloat32m1_t vtail_acc = __riscv_vfmv_v_f_f32m1(0.0f, tail_vl);
+        vtail_acc = __riscv_vfmacc_vv_f32m1(vtail_acc, vq, vk, tail_vl);
+
+        // Reduce tail accumulator to scalar sum immediately.
+        vfloat32m1_t vtail_sum =
+            __riscv_vfredusum_vs_f32m1_f32m1(vtail_acc, __riscv_vfmv_v_f_f32m1(0.0f, tail_vl), tail_vl);
+        float tail_sum_val = __riscv_vfmv_f_s_f32m1_f32(vtail_sum);
+
+        // Add this scalar to the first element of vdot
+        // Use vfmv.s.f with tail undisturbed policy to update only index 0
+        float vdot0_scalar = __riscv_vfmv_f_s_f32m1_f32(vdot);
+        vdot0_scalar += tail_sum_val;
+        vdot = __riscv_vfmv_s_f_f32m1_tu(vdot, vdot0_scalar, vl);  // Update index 0, preserve rest
       }
 
       // Reduce sum
@@ -202,58 +239,30 @@ inline void index_gemm_kernel_nt_rvv(
   }
 }
 
-// 2. Numerically stable softmax using log-sum-exp trick
-// Calculate exp(scores - m_i) and normalize
-// Handles edge cases (zero/infinite sum by falling back to uniform distribution)
-inline void softmax_rvv(const float* __restrict__ scores, float* __restrict__ probs, int64_t N, float m_i) {
-  if (N == 0) {
-    return;
-  }
+// 2. Fast approximate exponential and sum
+// Calculate exp(scores - m_i) and return sum
+inline float exp_rvv(const float* __restrict__ scores, float* __restrict__ output, int64_t N, float m_i) {
+  if (N == 0) return 0.0f;
 
-  std::vector<float> exp_scores(N);
-
+  // 1. Calculate shifted scores: x = scores - m_i
   int64_t offset = 0;
   while (offset < N) {
     size_t vl = __riscv_vsetvl_e32m1(N - offset);
-    vfloat32m1_t vmax_broadcast = __riscv_vfmv_v_f_f32m1(m_i, vl);
     vfloat32m1_t vscores = __riscv_vle32_v_f32m1(scores + offset, vl);
-    vfloat32m1_t vshifted = __riscv_vfsub_vv_f32m1(vscores, vmax_broadcast, vl);
-    __riscv_vse32_v_f32m1(exp_scores.data() + offset, vshifted, vl);
+    vfloat32m1_t vshifted = __riscv_vfsub_vf_f32m1(vscores, m_i, vl);
+    __riscv_vse32_v_f32m1(output + offset, vshifted, vl);
     offset += vl;
   }
 
-  for (int64_t i = 0; i < N; ++i) {
-    exp_scores[i] = std::exp(exp_scores[i]);
-  }
-
+  // 2. Calculate exp using scalar std::exp and sum
   float sum_val = 0.0f;
   for (int64_t i = 0; i < N; ++i) {
-    sum_val += exp_scores[i];
+    float val = std::exp(output[i]);
+    output[i] = val;
+    sum_val += val;
   }
 
-  // Handle edge cases: sum_val is 0, Inf, or NaN
-  if (!std::isfinite(sum_val) || sum_val == 0.0f) {
-    // If sum is invalid, set uniform distribution (1/N for each element)
-    float uniform_prob = 1.0f / static_cast<float>(N);
-    offset = 0;
-    while (offset < N) {
-      size_t vl = __riscv_vsetvl_e32m1(N - offset);
-      vfloat32m1_t vuniform = __riscv_vfmv_v_f_f32m1(uniform_prob, vl);
-      __riscv_vse32_v_f32m1(probs + offset, vuniform, vl);
-      offset += vl;
-    }
-    return;
-  }
-
-  offset = 0;
-  while (offset < N) {
-    size_t vl = __riscv_vsetvl_e32m1(N - offset);
-    vfloat32m1_t vexp_chunk = __riscv_vle32_v_f32m1(exp_scores.data() + offset, vl);
-    vfloat32m1_t vsum_broadcast = __riscv_vfmv_v_f_f32m1(sum_val, vl);
-    vfloat32m1_t vprobs_chunk = __riscv_vfdiv_vv_f32m1(vexp_chunk, vsum_broadcast, vl);
-    __riscv_vse32_v_f32m1(probs + offset, vprobs_chunk, vl);
-    offset += vl;
-  }
+  return sum_val;
 }
 
 // 3. Probabilities * Value aggregation
@@ -315,6 +324,241 @@ inline void prob_value_aggregate_rvv(
 
 }  // namespace
 
-// NOTE: decode_attention_kernel_rvv is now defined in decode.cpp directly
-// inside the anonymous namespace, after all *_impl functions are defined.
-// This allows it to call decode_attention_kernel_impl and other helper functions.
+// 4. Accumulate KV splits and write to output
+// This function merges partial results from different KV splits and writes the final result to output
+template <typename scalar_t>
+inline void decode_accumulate_kv_splits_rvv(
+    scalar_t* __restrict__ output,
+    float* __restrict__ attn_logits,
+    int64_t batches,
+    int64_t num_heads,
+    int64_t head_size_v,
+    int64_t num_kv_splits,
+    int64_t l_stride1,
+    int64_t l_stride2) {
+  // parallel on [batches, num_heads]
+  at::parallel_for(0, batches * num_heads, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
+      float* __restrict__ acc = attn_logits + i * l_stride1;
+
+      float s_prime = 0.f;
+      float m_prime = -std::numeric_limits<float>::infinity();
+
+      for (int64_t kv_id = 0; kv_id < num_kv_splits; ++kv_id) {
+        float* __restrict__ tv = acc + kv_id * l_stride2;
+        const float tlogic = tv[head_size_v];
+
+        float m_i = std::max(tlogic, m_prime);
+        float m_delta = std::exp(m_prime - m_i);
+        float e_logic = std::exp(tlogic - m_i);
+
+        if (kv_id != 0) {
+          // Vectorized update: acc = acc * m_delta + tv * e_logic
+          size_t vl_max = __riscv_vsetvlmax_e32m1();
+          for (int64_t d = 0; d < head_size_v; d += vl_max) {
+            size_t vl = __riscv_vsetvl_e32m1(head_size_v - d);
+            vfloat32m1_t vacc = __riscv_vle32_v_f32m1(acc + d, vl);
+            vfloat32m1_t vtv = __riscv_vle32_v_f32m1(tv + d, vl);
+
+            vfloat32m1_t vm_delta = __riscv_vfmv_v_f_f32m1(m_delta, vl);
+            vfloat32m1_t ve_logic = __riscv_vfmv_v_f_f32m1(e_logic, vl);
+
+            // acc = acc * m_delta
+            vacc = __riscv_vfmul_vv_f32m1(vacc, vm_delta, vl);
+            // acc = acc + tv * e_logic
+            vacc = __riscv_vfmacc_vv_f32m1(vacc, ve_logic, vtv, vl);
+
+            __riscv_vse32_v_f32m1(acc + d, vacc, vl);
+          }
+        }
+
+        s_prime = s_prime * m_delta + e_logic;
+        m_prime = m_i;
+      }
+
+      // Final copy to output with scaling: output = acc * (1/s_prime)
+      float scale = 1.0f / s_prime;
+
+      size_t vl_max = __riscv_vsetvlmax_e32m1();
+      for (int64_t d = 0; d < head_size_v; d += vl_max) {
+        size_t vl = __riscv_vsetvl_e32m1(head_size_v - d);
+        vfloat32m1_t vacc = __riscv_vle32_v_f32m1(acc + d, vl);
+        vfloat32m1_t vscale = __riscv_vfmv_v_f_f32m1(scale, vl);
+        vacc = __riscv_vfmul_vv_f32m1(vacc, vscale, vl);
+
+        if constexpr (std::is_same_v<scalar_t, float>) {
+          __riscv_vse32_v_f32m1(output + i * head_size_v + d, vacc, vl);
+        } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if HAS_ZVFH_DECODE
+          vfloat16mf2_t vout = __riscv_vfncvt_f_f_w_f16mf2(vacc, vl);
+          __riscv_vse16_v_f16mf2(reinterpret_cast<_Float16*>(output + i * head_size_v + d), vout, vl);
+#else
+              // Software conversion
+              float temp[256];
+              __riscv_vse32_v_f32m1(temp, vacc, vl);
+              for(size_t j=0; j<vl; ++j) {
+                  (output + i * head_size_v + d)[j] = static_cast<at::Half>(temp[j]);
+              }
+#endif
+        } else {
+          // BFloat16 or others
+          float temp[256];
+          __riscv_vse32_v_f32m1(temp, vacc, vl);
+          for (size_t j = 0; j < vl; ++j) {
+            (output + i * head_size_v + d)[j] = static_cast<scalar_t>(temp[j]);
+          }
+        }
+      }
+    }
+  });
+}
+
+// 5. Full Decode Attention Kernel (RVV Optimized)
+// This function implements the full FlashDecoding loop using RVV intrinsics
+// It is called by decode_attention_cpu when RVV is available
+template <typename scalar_t, typename index_t, int64_t BLOCK_N>
+void decode_attention_kernel_rvv(
+    scalar_t* __restrict__ output,
+    float* __restrict__ attn_logits,
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ k_buffer,
+    const scalar_t* __restrict__ v_buffer,
+    const index_t* __restrict__ req_to_token,
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ seq_lens,
+    int64_t batches,
+    int64_t num_heads,
+    int64_t head_size,
+    int64_t head_size_v,
+    int64_t num_kv_splits,
+    int64_t q_strideM,
+    int64_t q_strideH,
+    int64_t k_strideN,
+    int64_t k_strideH,
+    int64_t v_strideN,
+    int64_t v_strideH,
+    float scaling,
+    float logit_cap,
+    int64_t max_num_reqs,
+    int64_t max_context_len,
+    int64_t max_total_num_tokens) {
+  const bool has_logit_cap = logit_cap > 0;
+  float rlogit_cap = has_logit_cap ? 1 / logit_cap : 0.f;
+
+  // strides for accumulation
+  const int64_t l_stride1 = num_kv_splits * (head_size_v + 1);
+  const int64_t l_stride2 = head_size_v + 1;
+
+  // parallel on [batches, num_heads, num_kv_splits]
+  at::parallel_for(0, batches * num_heads * num_kv_splits, 0, [&](int64_t begin, int64_t end) {
+    int64_t bs{0}, head_id{0}, kv_id{0};
+    data_index_init(begin, bs, batches, head_id, num_heads, kv_id, num_kv_splits);
+
+    // s_prime and s_delta
+    alignas(64) float s_i[BLOCK_N];
+    float* __restrict__ s_delta = s_i;
+
+    for (int64_t i = begin; i < end; ++i) {
+      // get query
+      const scalar_t* __restrict__ q_ptr = query + bs * q_strideM + head_id * q_strideH;
+
+      // get key/value
+      int64_t seq_len_kv = seq_lens[bs];
+      int64_t req_pool_id = req_pool_indices[bs];
+
+      const int64_t SPLIT_SIZE = div_up(seq_len_kv, num_kv_splits);
+      const int64_t kv_start = kv_id * SPLIT_SIZE;
+      const int64_t kv_end = std::min(kv_start + SPLIT_SIZE, seq_len_kv);
+
+      float m_prime = -std::numeric_limits<float>::infinity();
+      float s_prime = 0.f;
+
+      // get v_prime, and init to zero
+      float* __restrict__ v_prime = attn_logits + i * (head_size_v + 1);
+      // fill_stub is generic, but we can use memset for 0
+      std::memset(v_prime, 0, head_size_v * sizeof(float));
+
+      // loop over K and V sequence with BLOCK_N
+      for (int64_t n = kv_start; n < kv_end; n += BLOCK_N) {
+        int64_t n_size = std::min(BLOCK_N, kv_end - n);
+
+        // calculate s_i <- scale * Q @ K
+        index_gemm_kernel_nt_rvv<scalar_t, index_t>(
+            /* A   */ q_ptr,
+            /* B   */ k_buffer + head_id * k_strideH,
+            /* C   */ s_i,
+            /* ind */ req_to_token + req_pool_id * max_context_len + n,
+            /* scl */ scaling,
+            /* M   */ 1,
+            /* N   */ n_size,
+            /* K   */ head_size,
+            /* lda */ 1,
+            /* ldb */ k_strideN,
+            /* ldc */ 1,
+            /* mtt */ max_total_num_tokens);
+
+        if (has_logit_cap) {
+          // TODO: Vectorize tanh if needed, for now scalar loop or use sleef if available
+          // But since we are in RVV file, we could implement tanh_rvv later
+          for (int j = 0; j < n_size; ++j) {
+            s_i[j] = logit_cap * std::tanh(s_i[j] * rlogit_cap);
+          }
+        }
+
+        // m_i: max value per row
+        float m_i = std::max(rvv_reduce_max_f32(s_i, n_size), m_prime);
+
+        // m_delta <- exp(m' - m_i)
+        float m_delta = std::exp(m_prime - m_i);
+
+        // s_delta <- exp(s_i - m_i)
+        // exp_rvv computes exp(s_i - m_i) and returns sum
+        float local_sum = exp_rvv(s_i, s_delta, n_size, m_i);
+
+        s_prime *= m_delta;
+        s_prime += local_sum;
+
+        m_prime = m_i;
+
+        // calculate V' <- s_delta @ V + V' * m_delta
+        // output = output * m_delta + sum(s_delta * values)
+        prob_value_aggregate_rvv<scalar_t, index_t>(
+            s_delta,
+            v_buffer + head_id * v_strideH,
+            v_prime,
+            req_to_token + req_pool_id * max_context_len + n,
+            n_size,
+            head_size_v,
+            v_strideN,
+            m_delta,
+            max_total_num_tokens);
+      }
+
+      // update m_prime and s_prime
+      // Normalize v_prime by s_prime
+      if (kv_end > kv_start) {
+        float s = 1.0f / s_prime;
+
+        // Vectorized scaling: v_prime = v_prime * s
+        // We reuse head_size_v for loop limit
+        size_t vl_v = __riscv_vsetvl_e32m1(head_size_v);
+        for (int64_t d = 0; d < head_size_v; d += vl_v) {
+          size_t current_vl = __riscv_vsetvl_e32m1(head_size_v - d);
+          vfloat32m1_t vval = __riscv_vle32_v_f32m1(v_prime + d, current_vl);
+          vfloat32m1_t vscale = __riscv_vfmv_v_f_f32m1(s, current_vl);
+          vval = __riscv_vfmul_vv_f32m1(vval, vscale, current_vl);
+          __riscv_vse32_v_f32m1(v_prime + d, vval, current_vl);
+        }
+
+        v_prime[head_size_v] = m_prime + std::log(s_prime);
+      }
+
+      // Check for next iteration
+      data_index_step(bs, batches, head_id, num_heads, kv_id, num_kv_splits);
+    }
+  });
+
+  // Accumulate splits and write to output
+  decode_accumulate_kv_splits_rvv(
+      output, attn_logits, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2);
+}

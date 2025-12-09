@@ -5,6 +5,9 @@
 // Include RVV specific helper functions
 #if defined(CPU_CAPABILITY_RVV)
 #include "decode_rvv.cpp"
+#define decode_attention_kernel_dispatch decode_attention_kernel_rvv
+#else
+#define decode_attention_kernel_dispatch decode_attention_kernel_impl
 #endif
 
 namespace {
@@ -1103,23 +1106,6 @@ void decode_attention_kernel_impl(
         int64_t n_size = std::min(BLOCK_N, kv_end - n);
 
         // calculate s_i <- scale * Q @ K
-#if defined(CPU_CAPABILITY_RVV)
-        // RISC-V Vector Extension version
-        index_gemm_kernel_nt_rvv<scalar_t, index_t>(
-            /* A   */ q_ptr,
-            /* B   */ k_buffer + head_id * k_strideH,
-            /* C   */ s_i,
-            /* ind */ req_to_token + req_pool_id * max_context_len + n,
-            /* scl */ scaling,
-            /* M   */ 1,
-            /* N   */ n_size,
-            /* K   */ head_size,
-            /* lda */ 1,
-            /* ldb */ k_strideN,
-            /* ldc */ 1,
-            /* mtt */ max_total_num_tokens);
-#else
-        // Generic version (AVX512 or fallback)
         index_gemm_kernel_nt<scalar_t, index_t>(
             /* A   */ q_ptr,
             /* B   */ k_buffer + head_id * k_strideH,
@@ -1133,7 +1119,6 @@ void decode_attention_kernel_impl(
             /* ldb */ k_strideN,
             /* ldc */ 1,
             /* mtt */ max_total_num_tokens);
-#endif
 
         // TODO: `tanh` from torch uses sleef u10, going to be slow
         if (has_logit_cap) {
@@ -1145,49 +1130,20 @@ void decode_attention_kernel_impl(
         }
 
         // m_i: max value per row
-#if defined(CPU_CAPABILITY_RVV)
-        float m_i = std::max(rvv_reduce_max_f32(s_i, n_size), m_prime);
-#else
         float m_i = at::vec::reduce_all<float>([](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i, n_size);
         m_i = std::max(m_i, m_prime);
-#endif
 
         // m_delta <- exp(m' - m_i)
         float m_delta = std::exp(m_prime - m_i);
 
         // s_delta <- exp(s_i - m_i)
-#if defined(CPU_CAPABILITY_RVV)
-        // softmax
-        softmax_rvv(s_i, s_delta, n_size, m_i);
-#else
         at::vec::map<float>([m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta, s_i, n_size);
-#endif
-
-#if defined(CPU_CAPABILITY_RVV)
-        s_prime *= m_delta;
-        s_prime += rvv_reduce_sum_f32(s_delta, n_size);
-#else
         s_prime *= m_delta;
         s_prime += at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta, n_size);
-#endif
 
         m_prime = m_i;
 
         // calculate V' <- s_delta @ V + V' * m_delta
-#if defined(CPU_CAPABILITY_RVV)
-        // Calculate V' <- s_delta @ V + V' * m_delta
-        // output = output * m_delta + sum(s_delta * values)
-        prob_value_aggregate_rvv<scalar_t, index_t>(
-            s_delta,
-            v_buffer + head_id * v_strideH,
-            v_prime,
-            req_to_token + req_pool_id * max_context_len + n,
-            n_size,
-            head_size_v,
-            v_strideN,
-            m_delta,
-            max_total_num_tokens);
-#else
         index_gemm_kernel_nn<scalar_t, index_t>(
             /* A   */ s_delta,
             /* B   */ v_buffer + head_id * v_strideH,
@@ -1201,7 +1157,6 @@ void decode_attention_kernel_impl(
             /* ldb */ v_strideN,
             /* ldc */ 1,
             /* mtt */ max_total_num_tokens);
-#endif
       }  // loop with KV blocks
 
       // only update v' when kv_split_size > 0
@@ -1709,7 +1664,7 @@ void decode_attention_cpu(
 
       if (num_heads == num_heads_kv) {
         // MHA
-        decode_attention_kernel_impl<scalar_t, index_t, BLOCK_N>(
+        decode_attention_kernel_dispatch<scalar_t, index_t, BLOCK_N>(
             output.data_ptr<scalar_t>(),
             attn_logits.data_ptr<float>(),
             query.data_ptr<scalar_t>(),
