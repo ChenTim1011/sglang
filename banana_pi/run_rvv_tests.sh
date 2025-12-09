@@ -35,7 +35,6 @@ RUN_GEMM=true
 RUN_DECODE=true
 RUN_EXTEND=true
 QUICK_MODE=false
-BENCH_ITERATIONS=10
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -65,7 +64,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --quick)
             QUICK_MODE=true
-            BENCH_ITERATIONS=3
             shift
             ;;
         --help)
@@ -198,19 +196,25 @@ if [[ "$RUN_BENCHMARKS" == "true" ]]; then
     if [ ! -d "$BENCHMARK_DIR" ]; then
         echo -e "${RED}ERROR: Benchmark directory not found: $BENCHMARK_DIR${NC}"
     else
+        # Build benchmark command based on QUICK_MODE
+        BENCH_ARGS=""
+        if [[ "$QUICK_MODE" == "true" ]]; then
+            BENCH_ARGS="--quick"
+        fi
+
         if [[ "$RUN_DECODE" == "true" ]]; then
             run_benchmark "RVV Decode Attention" \
-                "cd $BENCHMARK_DIR && python bench_rvv_decode_attention.py --num-iterations $BENCH_ITERATIONS"
+                "cd $BENCHMARK_DIR && python bench_rvv_decode_attention.py $BENCH_ARGS"
         fi
 
         if [[ "$RUN_EXTEND" == "true" ]]; then
             run_benchmark "RVV Extend Attention" \
-                "cd $BENCHMARK_DIR && python bench_rvv_extend_attention.py --num-iterations $BENCH_ITERATIONS"
+                "cd $BENCHMARK_DIR && python bench_rvv_extend_attention.py $BENCH_ARGS"
         fi
 
         if [[ "$RUN_GEMM" == "true" ]]; then
             run_benchmark "RVV GEMM" \
-                "cd $BENCHMARK_DIR && python bench_rvv_gemm.py"
+                "cd $BENCHMARK_DIR && python bench_rvv_gemm.py $BENCH_ARGS"
         fi
     fi
 fi

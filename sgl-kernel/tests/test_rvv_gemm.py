@@ -261,6 +261,21 @@ class TestGemmRvvLLMSizes:
 
         torch.testing.assert_close(y_rvv, y_ref, **tolerances)
 
+    @pytest.mark.parametrize("M", [128, 256])
+    def test_gemm_large_prefill(self, M: int, tolerances: dict):
+        """Test GEMM with larger prefill sizes (M > 64)."""
+        # Use smaller K, N to keep test fast but test large M
+        K, N = 1024, 1024
+
+        x = torch.randn(M, K, dtype=TEST_DTYPE)
+        weight = torch.randn(N, K, dtype=TEST_DTYPE)
+        bias = torch.randn(N, dtype=BIAS_DTYPE)
+
+        y_ref = torch_linear_reference(x, weight, bias)
+        y_rvv = sgl_kernel.weight_packed_linear(x, weight, bias, False)
+
+        torch.testing.assert_close(y_rvv, y_ref, **tolerances)
+
 
 # ============================================================================
 # Unit Tests - Edge Cases and Numerical Stability
