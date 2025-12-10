@@ -14,6 +14,13 @@
 #   --gemm            Run only GEMM tests/benchmarks
 #   --decode          Run only decode attention tests/benchmarks
 #   --extend          Run only extend attention tests/benchmarks
+#   --prefill         Run only prefill attention tests/benchmarks
+#   --test-decode     Run only decode attention tests
+#   --bench-decode    Run only decode attention benchmarks
+#   --test-extend     Run only extend attention tests
+#   --bench-extend    Run only extend attention benchmarks
+#   --test-prefill    Run only prefill attention tests
+#   --bench-prefill   Run only prefill attention benchmarks
 #   --quick           Run quick tests with fewer iterations
 #   --help            Show this help message
 #
@@ -34,6 +41,7 @@ RUN_BENCHMARKS=true
 RUN_GEMM=true
 RUN_DECODE=true
 RUN_EXTEND=true
+RUN_PREFILL=true
 QUICK_MODE=false
 
 # Parse command line arguments
@@ -50,16 +58,79 @@ while [[ $# -gt 0 ]]; do
         --gemm)
             RUN_DECODE=false
             RUN_EXTEND=false
+            RUN_PREFILL=false
             shift
             ;;
         --decode)
             RUN_GEMM=false
             RUN_EXTEND=false
+            RUN_PREFILL=false
             shift
             ;;
         --extend)
             RUN_GEMM=false
             RUN_DECODE=false
+            RUN_PREFILL=false
+            shift
+            ;;
+        --prefill)
+            RUN_GEMM=false
+            RUN_DECODE=false
+            RUN_EXTEND=false
+            shift
+            ;;
+        --test-decode)
+            RUN_TESTS=true
+            RUN_BENCHMARKS=false
+            RUN_GEMM=false
+            RUN_EXTEND=false
+            RUN_PREFILL=false
+            RUN_DECODE=true
+            shift
+            ;;
+        --bench-decode)
+            RUN_TESTS=false
+            RUN_BENCHMARKS=true
+            RUN_GEMM=false
+            RUN_EXTEND=false
+            RUN_PREFILL=false
+            RUN_DECODE=true
+            shift
+            ;;
+        --test-extend)
+            RUN_TESTS=true
+            RUN_BENCHMARKS=false
+            RUN_GEMM=false
+            RUN_DECODE=false
+            RUN_PREFILL=false
+            RUN_EXTEND=true
+            shift
+            ;;
+        --bench-extend)
+            RUN_TESTS=false
+            RUN_BENCHMARKS=true
+            RUN_GEMM=false
+            RUN_DECODE=false
+            RUN_PREFILL=false
+            RUN_EXTEND=true
+            shift
+            ;;
+        --test-prefill)
+            RUN_TESTS=true
+            RUN_BENCHMARKS=false
+            RUN_GEMM=false
+            RUN_DECODE=false
+            RUN_EXTEND=false
+            RUN_PREFILL=true
+            shift
+            ;;
+        --bench-prefill)
+            RUN_TESTS=false
+            RUN_BENCHMARKS=true
+            RUN_GEMM=false
+            RUN_DECODE=false
+            RUN_EXTEND=false
+            RUN_PREFILL=true
             shift
             ;;
         --quick)
@@ -67,7 +138,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help)
-            head -30 "$0" | tail -25
+            head -40 "$0" | tail -35
             exit 0
             ;;
         *)
@@ -171,6 +242,10 @@ if [[ "$RUN_TESTS" == "true" ]]; then
         run_test "RVV Extend Attention CPU" "tests/test_rvv_extend_attention_cpu.py" || true
     fi
 
+    if [[ "$RUN_PREFILL" == "true" ]]; then
+        run_test "RVV Prefill Attention CPU" "tests/test_rvv_prefill_attention_cpu.py" || true
+    fi
+
     if [[ "$RUN_GEMM" == "true" ]]; then
         run_test "RVV GEMM" "tests/test_rvv_gemm.py" || true
     fi
@@ -210,6 +285,11 @@ if [[ "$RUN_BENCHMARKS" == "true" ]]; then
         if [[ "$RUN_EXTEND" == "true" ]]; then
             run_benchmark "RVV Extend Attention" \
                 "cd $BENCHMARK_DIR && python bench_rvv_extend_attention.py $BENCH_ARGS"
+        fi
+
+        if [[ "$RUN_PREFILL" == "true" ]]; then
+            run_benchmark "RVV Prefill Attention" \
+                "cd $BENCHMARK_DIR && python bench_rvv_prefill_attention.py $BENCH_ARGS"
         fi
 
         if [[ "$RUN_GEMM" == "true" ]]; then

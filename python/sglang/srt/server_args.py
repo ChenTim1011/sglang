@@ -138,7 +138,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
-    "riscv",  # RISC-V optimized backend
+    "rvv",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
@@ -1168,6 +1168,7 @@ class ServerArgs:
             if self.attention_backend is None:
                 # Auto-select backend based on architecture
                 from sglang.srt.utils.common import is_host_cpu_riscv, is_host_cpu_x86
+
                 if is_host_cpu_riscv():
                     self.attention_backend = "rvv"
                 elif is_host_cpu_x86():
