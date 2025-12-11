@@ -109,19 +109,16 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap);
 
-// linear attention
-std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& value,
-    const at::Tensor& g,
-    const at::Tensor& beta,
-    const at::Tensor& initial_state,
-    bool output_final_state,
-    const at::Tensor& cu_seqlens,
-    bool head_first,
-    bool use_qk_l2norm_in_kernel,
-    double eps = 1e-5);
+void prefill_cache_cpu(
+    at::Tensor& k_new,
+    at::Tensor& v_new,
+    at::Tensor& k_buffer,
+    at::Tensor& v_buffer,
+    at::Tensor& req_to_token,
+    at::Tensor& req_pool_indices,
+    at::Tensor& seq_lens,
+    at::Tensor& extend_start_loc,
+    at::Tensor& extend_seq_lens);
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
@@ -382,12 +379,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
-  // linear attn
+  // prefill
   m.def(
-      "chunk_gated_delta_rule_cpu(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
-      "Tensor initial_state, bool output_final_state, Tensor cu_seqlens, bool head_first, "
-      "bool use_qk_l2norm_in_kernel, float eps=1e-5) -> (Tensor, Tensor)");
-  m.impl("chunk_gated_delta_rule_cpu", torch::kCPU, &chunk_gated_delta_rule_cpu);
+      "prefill_cache_cpu(Tensor k_new, Tensor v_new, Tensor k_buffer, Tensor v_buffer, Tensor req_to_token, Tensor "
+      "req_pool_indices, Tensor seq_lens, Tensor extend_start_loc, Tensor extend_seq_lens) -> ()");
+  m.impl("prefill_cache_cpu", torch::kCPU, &prefill_cache_cpu);
 
   // weight prepack
   m.def("convert_weight_packed(Tensor weight) -> Tensor");
