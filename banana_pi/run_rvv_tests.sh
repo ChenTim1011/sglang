@@ -43,6 +43,7 @@ RUN_DECODE=true
 RUN_EXTEND=true
 RUN_PREFILL=true
 QUICK_MODE=false
+RUN_BACKEND=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -133,6 +134,22 @@ while [[ $# -gt 0 ]]; do
             RUN_PREFILL=true
             shift
             ;;
+        --backend)
+            # enable backend integration tests (does not change other selections)
+            RUN_BACKEND=true
+            shift
+            ;;
+        --test-backend)
+            # run only backend integration tests
+            RUN_TESTS=true
+            RUN_BENCHMARKS=false
+            RUN_GEMM=false
+            RUN_DECODE=false
+            RUN_EXTEND=false
+            RUN_PREFILL=false
+            RUN_BACKEND=true
+            shift
+            ;;
         --quick)
             QUICK_MODE=true
             shift
@@ -166,8 +183,8 @@ else
 fi
 
 # Activate virtual environment
-if [[ -f $RISCV_WORKSPACE/venv_sglang/bin/activate ]]; then
-    source $RISCV_WORKSPACE/venv_sglang/bin/activate
+if [[ -f ~/.local_riscv_env/workspace/venv_sglang/bin/activate ]]; then
+    source ~/.local_riscv_env/workspace/venv_sglang/bin/activate
 else
     echo -e "${RED}ERROR: Virtual environment not found${NC}"
     exit 1
@@ -176,9 +193,10 @@ fi
 # Set library paths
 export LD_PRELOAD=~/.local/lib/libomp.so
 export LD_LIBRARY_PATH=~/.local/lib:$LD_LIBRARY_PATH
+export PYTHONPATH=~/.local_riscv_env/workspace/sglang/python:$PYTHONPATH
 
 # Navigate to sgl-kernel directory
-cd $RISCV_WORKSPACE/sglang/sgl-kernel
+cd ~/.local_riscv_env/workspace/sglang/sgl-kernel
 
 echo -e "${GREEN}Environment:${NC}"
 echo "  Platform: $(uname -m)"
@@ -248,6 +266,11 @@ if [[ "$RUN_TESTS" == "true" ]]; then
 
     if [[ "$RUN_GEMM" == "true" ]]; then
         run_test "RVV GEMM" "tests/test_rvv_gemm.py" || true
+    fi
+
+    # Run Backend Integration Tests (Python Layer)
+    if [[ "$RUN_BACKEND" == "true" ]]; then
+        run_test "RVV Backend Integration" "../test/srt/test_rvv_backend.py" || true
     fi
 
     echo ""
