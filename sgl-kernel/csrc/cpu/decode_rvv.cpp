@@ -89,40 +89,59 @@ inline void index_gemm_kernel_nt_rvv(
 #if HAS_ZVFH_DECODE
     if constexpr (std::is_same_v<scalar_t, at::Half>) {
       // FP16 Optimized Path
-      for (; n + 1 < N; n += 2) {
+      size_t vl_max = __riscv_vsetvlmax_e16m2();
+
+      for (; n + 3 < N; n += 4) {
         int64_t b_idx0 = indices[n];
         int64_t b_idx1 = indices[n + 1];
+        int64_t b_idx2 = indices[n + 2];
+        int64_t b_idx3 = indices[n + 3];
+
         const scalar_t* k_ptr0 = B + b_idx0 * ldb;
         const scalar_t* k_ptr1 = B + b_idx1 * ldb;
-        size_t vl_max = __riscv_vsetvlmax_e32m8();
-        vfloat32m8_t v_acc0 = __riscv_vfmv_v_f_f32m8(0.0f, vl_max);
-        vfloat32m8_t v_acc1 = __riscv_vfmv_v_f_f32m8(0.0f, vl_max);
+        const scalar_t* k_ptr2 = B + b_idx2 * ldb;
+        const scalar_t* k_ptr3 = B + b_idx3 * ldb;
+
+        // Initialize accumulators
+        vfloat32m4_t v_acc0 = __riscv_vfmv_v_f_f32m4(0.0f, __riscv_vsetvlmax_e32m4());
+        vfloat32m4_t v_acc1 = __riscv_vfmv_v_f_f32m4(0.0f, __riscv_vsetvlmax_e32m4());
+        vfloat32m4_t v_acc2 = __riscv_vfmv_v_f_f32m4(0.0f, __riscv_vsetvlmax_e32m4());
+        vfloat32m4_t v_acc3 = __riscv_vfmv_v_f_f32m4(0.0f, __riscv_vsetvlmax_e32m4());
 
         for (int64_t k = 0; k < K; k += vl_max) {
-          size_t vl = __riscv_vsetvl_e32m8(K - k);
-          vfloat16m4_t v_q = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(q_ptr_base + k), vl);
+          size_t vl = __riscv_vsetvl_e16m2(K - k);
 
-          // Load K0
-          vfloat16m4_t v_k0 = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(k_ptr0 + k), vl);
+          // Persistent Query: Loaded once for the block of 4 tokens
+          vfloat16m2_t v_q = __riscv_vle16_v_f16m2(reinterpret_cast<const _Float16*>(q_ptr_base + k), vl);
 
-          // MAC 0: acc0 += q * k0
-          v_acc0 = __riscv_vfwmacc_vv_f32m8_tu(v_acc0, v_q, v_k0, vl);
+          // Token 0
+          vfloat16m2_t v_k0 = __riscv_vle16_v_f16m2(reinterpret_cast<const _Float16*>(k_ptr0 + k), vl);
+          v_acc0 = __riscv_vfwmacc_vv_f32m4_tu(v_acc0, v_q, v_k0, vl);
 
-          // Load K1 (reuse registers of v_k0 technically, but compiler handles allocation)
-          vfloat16m4_t v_k1 = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(k_ptr1 + k), vl);
+          // Token 1
+          vfloat16m2_t v_k1 = __riscv_vle16_v_f16m2(reinterpret_cast<const _Float16*>(k_ptr1 + k), vl);
+          v_acc1 = __riscv_vfwmacc_vv_f32m4_tu(v_acc1, v_q, v_k1, vl);
 
-          // MAC 1: acc1 += q * k1
-          v_acc1 = __riscv_vfwmacc_vv_f32m8_tu(v_acc1, v_q, v_k1, vl);
+          // Token 2
+          vfloat16m2_t v_k2 = __riscv_vle16_v_f16m2(reinterpret_cast<const _Float16*>(k_ptr2 + k), vl);
+          v_acc2 = __riscv_vfwmacc_vv_f32m4_tu(v_acc2, v_q, v_k2, vl);
+
+          // Token 3
+          vfloat16m2_t v_k3 = __riscv_vle16_v_f16m2(reinterpret_cast<const _Float16*>(k_ptr3 + k), vl);
+          v_acc3 = __riscv_vfwmacc_vv_f32m4_tu(v_acc3, v_q, v_k3, vl);
         }
+
+        // Reductions
         vfloat32m1_t v_zero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
-        vfloat32m1_t v_sum0 = __riscv_vfredusum_vs_f32m8_f32m1(v_acc0, v_zero, vl_max);
-        vfloat32m1_t v_sum1 = __riscv_vfredusum_vs_f32m8_f32m1(v_acc1, v_zero, vl_max);
+        vfloat32m1_t v_sum0 = __riscv_vfredusum_vs_f32m4_f32m1(v_acc0, v_zero, __riscv_vsetvlmax_e32m4());
+        vfloat32m1_t v_sum1 = __riscv_vfredusum_vs_f32m4_f32m1(v_acc1, v_zero, __riscv_vsetvlmax_e32m4());
+        vfloat32m1_t v_sum2 = __riscv_vfredusum_vs_f32m4_f32m1(v_acc2, v_zero, __riscv_vsetvlmax_e32m4());
+        vfloat32m1_t v_sum3 = __riscv_vfredusum_vs_f32m4_f32m1(v_acc3, v_zero, __riscv_vsetvlmax_e32m4());
 
-        float s0 = __riscv_vfmv_f_s_f32m1_f32(v_sum0);
-        float s1 = __riscv_vfmv_f_s_f32m1_f32(v_sum1);
-
-        C[m * ldc + n] = s0 * scale;
-        C[m * ldc + n + 1] = s1 * scale;
+        C[m * ldc + n] = __riscv_vfmv_f_s_f32m1_f32(v_sum0) * scale;
+        C[m * ldc + n + 1] = __riscv_vfmv_f_s_f32m1_f32(v_sum1) * scale;
+        C[m * ldc + n + 2] = __riscv_vfmv_f_s_f32m1_f32(v_sum2) * scale;
+        C[m * ldc + n + 3] = __riscv_vfmv_f_s_f32m1_f32(v_sum3) * scale;
       }
     }
 #endif
@@ -152,17 +171,17 @@ inline void index_gemm_kernel_nt_rvv(
       } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
 #if HAS_ZVFH_DECODE
         // FP16 Widening path (Remainder)
-        size_t vl_max = __riscv_vsetvlmax_e32m8();
-        vfloat32m8_t v_acc = __riscv_vfmv_v_f_f32m8(0.0f, vl_max);
+        size_t vl_max = __riscv_vsetvlmax_e16m4();
+        vfloat32m8_t v_acc = __riscv_vfmv_v_f_f32m8(0.0f, __riscv_vsetvlmax_e32m8());
 
         for (int64_t k = 0; k < K; k += vl_max) {
-          size_t vl = __riscv_vsetvl_e32m8(K - k);
+          size_t vl = __riscv_vsetvl_e16m4(K - k);
           vfloat16m4_t vq = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(q_ptr_base + k), vl);
           vfloat16m4_t vk = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(k_ptr + k), vl);
           v_acc = __riscv_vfwmacc_vv_f32m8_tu(v_acc, vq, vk, vl);
         }
         vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
-        vfloat32m1_t vred = __riscv_vfredusum_vs_f32m8_f32m1(v_acc, vzero, vl_max);
+        vfloat32m1_t vred = __riscv_vfredusum_vs_f32m8_f32m1(v_acc, vzero, __riscv_vsetvlmax_e32m8());
         scalar_sum = __riscv_vfmv_f_s_f32m1_f32(vred);
 #else
         // Fallback Software Convert
@@ -217,7 +236,111 @@ inline void prob_value_aggregate_rvv(
     // Initialize accumulator for this chunk of head dimensions
     vfloat32m8_t vacc = __riscv_vfmv_v_f_f32m8(0.0f, vl);
 
-    for (int64_t n = 0; n < N; ++n) {
+    int64_t n = 0;
+
+    // Unroll N (Tokens) by 4
+    for (; n + 3 < N; n += 4) {
+      float p0 = probs[n];
+      float p1 = probs[n + 1];
+      float p2 = probs[n + 2];
+      float p3 = probs[n + 3];
+
+      int64_t v_idx0 = indices[n];
+      int64_t v_idx1 = indices[n + 1];
+      int64_t v_idx2 = indices[n + 2];
+      int64_t v_idx3 = indices[n + 3];
+
+      // Process 4 tokens
+      const scalar_t* v_ptr0 = values + v_idx0 * v_strideN + d;
+      const scalar_t* v_ptr1 = values + v_idx1 * v_strideN + d;
+      const scalar_t* v_ptr2 = values + v_idx2 * v_strideN + d;
+      const scalar_t* v_ptr3 = values + v_idx3 * v_strideN + d;
+
+      if constexpr (std::is_same_v<scalar_t, float>) {
+        vfloat32m8_t vv0 = __riscv_vle32_v_f32m8(v_ptr0, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p0, vv0, vl);
+
+        vfloat32m8_t vv1 = __riscv_vle32_v_f32m8(v_ptr1, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p1, vv1, vl);
+
+        vfloat32m8_t vv2 = __riscv_vle32_v_f32m8(v_ptr2, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p2, vv2, vl);
+
+        vfloat32m8_t vv3 = __riscv_vle32_v_f32m8(v_ptr3, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p3, vv3, vl);
+      } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if HAS_ZVFH_DECODE
+        // FP16 path
+        vfloat16m4_t vv0_16 = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(v_ptr0), vl);
+        vfloat32m8_t vv0 = __riscv_vfwcvt_f_f_v_f32m8(vv0_16, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p0, vv0, vl);
+
+        vfloat16m4_t vv1_16 = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(v_ptr1), vl);
+        vfloat32m8_t vv1 = __riscv_vfwcvt_f_f_v_f32m8(vv1_16, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p1, vv1, vl);
+
+        vfloat16m4_t vv2_16 = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(v_ptr2), vl);
+        vfloat32m8_t vv2 = __riscv_vfwcvt_f_f_v_f32m8(vv2_16, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p2, vv2, vl);
+
+        vfloat16m4_t vv3_16 = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(v_ptr3), vl);
+        vfloat32m8_t vv3 = __riscv_vfwcvt_f_f_v_f32m8(vv3_16, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p3, vv3, vl);
+#else
+        // Fallback
+        float temp[256];
+
+        // v0
+        for (size_t j = 0; j < vl; ++j)
+          temp[j] = static_cast<float>(v_ptr0[j]);
+        vfloat32m8_t vv = __riscv_vle32_v_f32m8(temp, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p0, vv, vl);
+
+        // v1
+        for (size_t j = 0; j < vl; ++j)
+          temp[j] = static_cast<float>(v_ptr1[j]);
+        vv = __riscv_vle32_v_f32m8(temp, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p1, vv, vl);
+
+        // v2
+        for (size_t j = 0; j < vl; ++j)
+          temp[j] = static_cast<float>(v_ptr2[j]);
+        vv = __riscv_vle32_v_f32m8(temp, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p2, vv, vl);
+
+        // v3
+        for (size_t j = 0; j < vl; ++j)
+          temp[j] = static_cast<float>(v_ptr3[j]);
+        vv = __riscv_vle32_v_f32m8(temp, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p3, vv, vl);
+#endif
+      } else {
+        // BFloat16/Other
+        float temp[256];
+        // v0
+        for (size_t j = 0; j < vl; ++j)
+          temp[j] = static_cast<float>(v_ptr0[j]);
+        vfloat32m8_t vv = __riscv_vle32_v_f32m8(temp, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p0, vv, vl);
+        // v1
+        for (size_t j = 0; j < vl; ++j)
+          temp[j] = static_cast<float>(v_ptr1[j]);
+        vv = __riscv_vle32_v_f32m8(temp, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p1, vv, vl);
+        // v2
+        for (size_t j = 0; j < vl; ++j)
+          temp[j] = static_cast<float>(v_ptr2[j]);
+        vv = __riscv_vle32_v_f32m8(temp, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p2, vv, vl);
+        // v3
+        for (size_t j = 0; j < vl; ++j)
+          temp[j] = static_cast<float>(v_ptr3[j]);
+        vv = __riscv_vle32_v_f32m8(temp, vl);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p3, vv, vl);
+      }
+    }
+
+    for (; n < N; ++n) {
       float prob = probs[n];
       int64_t v_idx = indices[n];
       const scalar_t* v_ptr = values + v_idx * v_strideN + d;
@@ -231,6 +354,14 @@ inline void prob_value_aggregate_rvv(
         vfloat16m4_t vv_16 = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(v_ptr), vl);
 
         // Widening MAC: vacc += prob * vv_16
+        // vfwmacc here uses float16 * scalar_float? No such intrinsic.
+        // We must convert vv_16 to float32 first.
+        // There is vfwmacc_vf but it might expect scalar to be fp16 too?
+        // RISC-V V spec: vfwmacc.vf (wide accumulate vector-scalar)
+        // vd[i] += f[rs1] * vs2[i]
+        // If vd is f32, f[rs1] is f16, vs2 is f16.
+        // But prob is float(32).
+        // So we need to convert vv_16 to vv_32, then mac.
         vfloat32m8_t vv = __riscv_vfwcvt_f_f_v_f32m8(vv_16, vl);
         vacc = __riscv_vfmacc_vf_f32m8(vacc, prob, vv, vl);
 #else
