@@ -85,7 +85,7 @@ def naive_prefill_cache(
 def test_prefill_cache_cpu(num_heads, head_dim, seq_len, extend_len, num_requests):
     """Test prefill_cache_cpu with various configurations."""
     if extend_len > seq_len:
-        pytest.skip("extend_len cannot be larger than seq_len")
+        seq_len = extend_len
 
     torch.manual_seed(42)
     dtype = torch.float16
