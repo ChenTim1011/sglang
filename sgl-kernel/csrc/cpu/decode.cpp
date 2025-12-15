@@ -1630,7 +1630,11 @@ void decode_attention_cpu(
   const bool is_mla = (k_buffer_data == v_buffer_data) && (num_heads_kv == 1) && (head_size == head_size_v + 64);
 
   // block length for k_buffer and v_buffer
+#ifdef CPU_CAPABILITY_RVV
+  constexpr int BLOCK_N = 64;
+#else
   constexpr int BLOCK_N = 256;
+#endif
 
   // buffer for packing k_cache and v_cache
   int num_threads = at::get_num_threads();
@@ -1638,7 +1642,6 @@ void decode_attention_cpu(
   auto buffer = at::empty({num_threads, size_per_thread}, k_buffer.options());
 
   // Use AT_DISPATCH_REDUCED_FLOATING_TYPES for Half and BFloat16 only
-  // The RVV intrinsics inside the kernel handle FP16 natively via Zvfh extension
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "decode_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
       // update the kv buffer
