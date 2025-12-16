@@ -1,14 +1,5 @@
 // RISC-V Vector Extension (RVV) optimized GEMM kernels
 // This file contains RVV specific implementations for Linear layers (QKV projection, FFN)
-// Note: This provides RVV-accelerated alternatives to the AVX512 implementations in gemm.cpp
-//
-// Key optimizations:
-// 1. Uses RVV intrinsics for vectorized computation
-// 2. Native FP16 computation with Zvfh extension (no type conversion overhead)
-// 3. Tiled GEMM for better cache utilization
-// 4. Multi-row processing for better instruction-level parallelism
-// 5. Thread-local scratch buffers to avoid allocation overhead
-// 6. OpenMP parallelization across M dimension
 
 #if defined(CPU_CAPABILITY_RVV) && defined(__clang__)
 #pragma clang riscv intrinsic vector
@@ -29,7 +20,6 @@
 #include <cstring>
 
 // Check for Zvfh (FP16 vector) support
-// Most modern RISC-V implementations with RVV 1.0 include Zvfh
 #if defined(__riscv_zvfh) || defined(__riscv_v)
 #define HAS_ZVFH 1
 #else
@@ -38,45 +28,150 @@
 
 namespace {
 
-// ============================================================================
-// Constants and Configuration
-// ============================================================================
-
-// Maximum vector length elements (conservative for VLEN up to 16384 bits)
 constexpr size_t MAX_VL_ELEMENTS = 512;
-
-// Block sizes for tiled GEMM
-// These are tuned for typical RISC-V implementations
-constexpr int BLOCK_M_RVV = 4;   // Process 4 rows at a time
-constexpr int BLOCK_K_RVV = 64;  // K dimension block size
-
-// ============================================================================
-// FP16 Native GEMM Kernels (Zvfh extension)
-// ============================================================================
+constexpr int BLOCK_M_RVV = 4;
+constexpr int BLOCK_K_RVV = 64;
 
 #if HAS_ZVFH
 
-// Optimized FP16 GEMM for Linear layers using native Zvfh instructions
-// C = A @ B^T + bias where:
-//   A: [M, K] input activation (float16)
-//   B: [N, K] weight (float16, stored as [out_features, in_features])
-//   C: [M, N] output (float16)
-//   bias: [N] (float32)
-//
-// This version uses native FP16 computation throughout, avoiding costly
-// FP16->FP32 conversions. The bias addition is done with widening to FP32.
+// C = A @ B^T + bias
 template <typename scalar_t>
 void gemm_fp16_native_rvv(
-    const scalar_t* __restrict__ A,  // [M, K]
-    const scalar_t* __restrict__ B,  // [N, K]
-    scalar_t* __restrict__ C,        // [M, N]
-    const float* __restrict__ bias,  // [N] or nullptr
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    const float* __restrict__ bias,
     int64_t M,
     int64_t N,
     int64_t K,
     int64_t lda,
     int64_t ldb,
     int64_t ldc) {
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+    size_t vl_max_fp32m4 = __riscv_vsetvlmax_e32m4();
+
+    constexpr int64_t TILE_M = 4;
+
+// Parallelize over M tiles
+#pragma omp parallel for schedule(static) if (M > TILE_M)
+    for (int64_t m0 = 0; m0 < M; m0 += TILE_M) {
+      int64_t current_m_size = std::min(TILE_M, M - m0);
+
+      for (int64_t n = 0; n < N; ++n) {
+        // Pointers for B (weight row - logically col in matrix algebra terms)
+        const uint16_t* b_ptr_start = reinterpret_cast<const uint16_t*>(B + n * ldb);
+        float bias_val = (bias != nullptr) ? bias[n] : 0.0f;
+
+        // Initialize accumulators
+        vfloat32m4_t v_acc0 = __riscv_vfmv_v_f_f32m4(0.0f, vl_max_fp32m4);
+        vfloat32m4_t v_acc1 = __riscv_vfmv_v_f_f32m4(0.0f, vl_max_fp32m4);
+        vfloat32m4_t v_acc2 = __riscv_vfmv_v_f_f32m4(0.0f, vl_max_fp32m4);
+        vfloat32m4_t v_acc3 = __riscv_vfmv_v_f_f32m4(0.0f, vl_max_fp32m4);
+
+        // Inner loop over K
+        int64_t k = 0;
+        for (; k + static_cast<int64_t>(vl_max_fp32m4) <= K; k += vl_max_fp32m4) {
+          // 1. Load B vector (shared across M rows)
+          vuint16m2_t v_b_u16 = __riscv_vle16_v_u16m2(b_ptr_start + k, vl_max_fp32m4);
+          vuint32m4_t v_b_u32 = __riscv_vzext_vf2_u32m4(v_b_u16, vl_max_fp32m4);
+          v_b_u32 = __riscv_vsll_vx_u32m4(v_b_u32, 16, vl_max_fp32m4);
+          vfloat32m4_t v_b_f32 = __riscv_vreinterpret_v_u32m4_f32m4(v_b_u32);
+
+          // 2. Process each M row (Unrolled)
+          if (current_m_size > 0) {
+            const uint16_t* a_ptr = reinterpret_cast<const uint16_t*>(A + (m0 + 0) * lda + k);
+            vuint16m2_t v_a_u16 = __riscv_vle16_v_u16m2(a_ptr, vl_max_fp32m4);
+            vuint32m4_t v_a_u32 = __riscv_vzext_vf2_u32m4(v_a_u16, vl_max_fp32m4);
+            v_a_u32 = __riscv_vsll_vx_u32m4(v_a_u32, 16, vl_max_fp32m4);
+            vfloat32m4_t v_a_f32 = __riscv_vreinterpret_v_u32m4_f32m4(v_a_u32);
+            v_acc0 = __riscv_vfmacc_vv_f32m4(v_acc0, v_a_f32, v_b_f32, vl_max_fp32m4);
+          }
+          if (current_m_size > 1) {
+            const uint16_t* a_ptr = reinterpret_cast<const uint16_t*>(A + (m0 + 1) * lda + k);
+            vuint16m2_t v_a_u16 = __riscv_vle16_v_u16m2(a_ptr, vl_max_fp32m4);
+            vuint32m4_t v_a_u32 = __riscv_vzext_vf2_u32m4(v_a_u16, vl_max_fp32m4);
+            v_a_u32 = __riscv_vsll_vx_u32m4(v_a_u32, 16, vl_max_fp32m4);
+            vfloat32m4_t v_a_f32 = __riscv_vreinterpret_v_u32m4_f32m4(v_a_u32);
+            v_acc1 = __riscv_vfmacc_vv_f32m4(v_acc1, v_a_f32, v_b_f32, vl_max_fp32m4);
+          }
+          if (current_m_size > 2) {
+            const uint16_t* a_ptr = reinterpret_cast<const uint16_t*>(A + (m0 + 2) * lda + k);
+            vuint16m2_t v_a_u16 = __riscv_vle16_v_u16m2(a_ptr, vl_max_fp32m4);
+            vuint32m4_t v_a_u32 = __riscv_vzext_vf2_u32m4(v_a_u16, vl_max_fp32m4);
+            v_a_u32 = __riscv_vsll_vx_u32m4(v_a_u32, 16, vl_max_fp32m4);
+            vfloat32m4_t v_a_f32 = __riscv_vreinterpret_v_u32m4_f32m4(v_a_u32);
+            v_acc2 = __riscv_vfmacc_vv_f32m4(v_acc2, v_a_f32, v_b_f32, vl_max_fp32m4);
+          }
+          if (current_m_size > 3) {
+            const uint16_t* a_ptr = reinterpret_cast<const uint16_t*>(A + (m0 + 3) * lda + k);
+            vuint16m2_t v_a_u16 = __riscv_vle16_v_u16m2(a_ptr, vl_max_fp32m4);
+            vuint32m4_t v_a_u32 = __riscv_vzext_vf2_u32m4(v_a_u16, vl_max_fp32m4);
+            v_a_u32 = __riscv_vsll_vx_u32m4(v_a_u32, 16, vl_max_fp32m4);
+            vfloat32m4_t v_a_f32 = __riscv_vreinterpret_v_u32m4_f32m4(v_a_u32);
+            v_acc3 = __riscv_vfmacc_vv_f32m4(v_acc3, v_a_f32, v_b_f32, vl_max_fp32m4);
+          }
+        }
+
+        // Handle tail loop
+        if (k < K) {
+          size_t tail_vl = __riscv_vsetvl_e32m4(K - k);
+
+          // Initialize zero vectors
+          vuint16m2_t v_b_u16 = __riscv_vmv_v_x_u16m2(0, vl_max_fp32m4);
+          v_b_u16 = __riscv_vle16_v_u16m2_tu(v_b_u16, b_ptr_start + k, tail_vl);
+
+          vuint32m4_t v_b_u32 = __riscv_vzext_vf2_u32m4(v_b_u16, vl_max_fp32m4);
+          v_b_u32 = __riscv_vsll_vx_u32m4(v_b_u32, 16, vl_max_fp32m4);
+          vfloat32m4_t v_b_f32 = __riscv_vreinterpret_v_u32m4_f32m4(v_b_u32);
+
+          auto load_a_and_acc = [&](const uint16_t* ptr, vfloat32m4_t& acc) {
+            vuint16m2_t v_a_u16 = __riscv_vmv_v_x_u16m2(0, vl_max_fp32m4);
+            v_a_u16 = __riscv_vle16_v_u16m2_tu(v_a_u16, ptr, tail_vl);
+
+            vuint32m4_t v_a_u32 = __riscv_vzext_vf2_u32m4(v_a_u16, vl_max_fp32m4);
+            v_a_u32 = __riscv_vsll_vx_u32m4(v_a_u32, 16, vl_max_fp32m4);
+            vfloat32m4_t v_a_f32 = __riscv_vreinterpret_v_u32m4_f32m4(v_a_u32);
+
+            // Accumulate using FULL VL to preserve the non-tail partial sums
+            acc = __riscv_vfmacc_vv_f32m4(acc, v_a_f32, v_b_f32, vl_max_fp32m4);
+          };
+
+          if (current_m_size > 0) load_a_and_acc(reinterpret_cast<const uint16_t*>(A + (m0 + 0) * lda + k), v_acc0);
+          if (current_m_size > 1) load_a_and_acc(reinterpret_cast<const uint16_t*>(A + (m0 + 1) * lda + k), v_acc1);
+          if (current_m_size > 2) load_a_and_acc(reinterpret_cast<const uint16_t*>(A + (m0 + 2) * lda + k), v_acc2);
+          if (current_m_size > 3) load_a_and_acc(reinterpret_cast<const uint16_t*>(A + (m0 + 3) * lda + k), v_acc3);
+        }
+
+        // 3. Reduction and Store
+        vfloat32m1_t v_zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+
+        // Helper lambda for store
+        auto store_result = [&](vfloat32m4_t v_acc, int offset) {
+          vfloat32m1_t v_red = __riscv_vfredusum_vs_f32m4_f32m1(v_acc, v_zero, vl_max_fp32m4);
+          float sum = __riscv_vfmv_f_s_f32m1_f32(v_red);
+          sum += bias_val;
+          uint32_t sum_as_int;
+          std::memcpy(&sum_as_int, &sum, sizeof(float));
+          // Use Round-to-Nearest (RN) instead of Truncation for better precision
+          if (std::isnan(sum)) {
+            sum_as_int = 0x7FC00000;  // Canonical NaN
+          } else {
+            sum_as_int += 0x8000;
+          }
+          uint16_t res_bf16 = static_cast<uint16_t>(sum_as_int >> 16);
+          at::BFloat16* c_val = C + (m0 + offset) * ldc + n;
+          *reinterpret_cast<uint16_t*>(c_val) = res_bf16;
+        };
+
+        if (current_m_size > 0) store_result(v_acc0, 0);
+        if (current_m_size > 1) store_result(v_acc1, 1);
+        if (current_m_size > 2) store_result(v_acc2, 2);
+        if (current_m_size > 3) store_result(v_acc3, 3);
+      }
+    }
+    return;
+  }
+
   // Only use FP16 path for Half type
   if constexpr (!std::is_same_v<scalar_t, at::Half>) {
     // Fall back to FP32 path for other types
@@ -84,8 +179,8 @@ void gemm_fp16_native_rvv(
   }
 
   // Get max vector lengths for different LMUL
-  size_t vl_max_f16m4 = __riscv_vsetvlmax_e16m4();  // FP16 with LMUL=4
-  size_t vl_max_f16m1 = __riscv_vsetvlmax_e16m1();  // FP16 with LMUL=1
+  size_t vl_max_f16m4 = __riscv_vsetvlmax_e16m4();
+  size_t vl_max_f16m1 = __riscv_vsetvlmax_e16m1();
 
 // Parallel over M (each row of output is independent)
 #pragma omp parallel for schedule(static) if (M > 1)
@@ -137,10 +232,10 @@ void gemm_fp16_native_rvv(
 // Tiled FP16 GEMM for better cache utilization with larger batches
 template <typename scalar_t>
 void gemm_fp16_tiled_rvv(
-    const scalar_t* __restrict__ A,  // [M, K]
-    const scalar_t* __restrict__ B,  // [N, K]
-    scalar_t* __restrict__ C,        // [M, N]
-    const float* __restrict__ bias,  // [N] or nullptr
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    const float* __restrict__ bias,
     int64_t M,
     int64_t N,
     int64_t K,
@@ -151,9 +246,8 @@ void gemm_fp16_tiled_rvv(
     return;
   }
 
-  // Tile sizes
   constexpr int64_t TILE_M = 4;
-  constexpr int64_t TILE_N = 4;  // Process multiple N at once to reduce reduce operations
+  constexpr int64_t TILE_N = 4;
 
   size_t vl_max = __riscv_vsetvlmax_e16m4();
 
@@ -223,10 +317,6 @@ void gemm_fp16_tiled_rvv(
 
 #endif  // HAS_ZVFH
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
 // Load scalar_t data into float vector with type conversion
 template <typename scalar_t>
 inline vfloat32m1_t load_as_float_m1(const scalar_t* ptr, size_t vl, float* scratch) {
@@ -240,7 +330,7 @@ inline vfloat32m1_t load_as_float_m1(const scalar_t* ptr, size_t vl, float* scra
   }
 }
 
-// Load with m4 (4x register group for higher throughput)
+// Load with m4
 template <typename scalar_t>
 inline vfloat32m4_t load_as_float_m4(const scalar_t* ptr, size_t vl, float* scratch) {
   if constexpr (std::is_same_v<scalar_t, float>) {
@@ -278,33 +368,57 @@ inline void store_from_float_m4(scalar_t* ptr, vfloat32m4_t v, size_t vl, float*
   }
 }
 
-// ============================================================================
-// Core GEMM Kernels
-// ============================================================================
+// Load strided scalar_t data into float vector
+template <typename scalar_t>
+inline vfloat32m4_t load_strided_as_float_m4(const scalar_t* ptr, ptrdiff_t stride_byte, size_t vl, float* scratch) {
+  if constexpr (std::is_same_v<scalar_t, float>) {
+    // Native FP32 strided load
+    return __riscv_vlse32_v_f32m4(ptr, stride_byte, vl);
+  } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+    // FP16 strided load -> extend to FP32
+    // Load as FP16 (vlse16)
+    vfloat16m2_t v_f16 = __riscv_vlse16_v_f16m2(reinterpret_cast<const _Float16*>(ptr), stride_byte, vl);
+    // Convert to FP32 (vfwcvt)
+    return __riscv_vfwcvt_f_f_v_f32m4(v_f16, vl);
+  } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+    // BF16 strided load -> convert to FP32
+    // Load as u16 bits
+    vuint16m2_t v_bf16 = __riscv_vlse16_v_u16m2(reinterpret_cast<const uint16_t*>(ptr), stride_byte, vl);
+    // Zero extend to u32
+    vuint32m4_t v_u32 = __riscv_vzext_vf2_u32m4(v_bf16, vl);
+    // Shift left 16
+    v_u32 = __riscv_vsll_vx_u32m4(v_u32, 16, vl);
+    // Reinterpret as float
+    return __riscv_vreinterpret_v_u32m4_f32m4(v_u32);
+  } else {
+    // Generic fallback
+    for (size_t i = 0; i < vl; ++i) {
+      const scalar_t* elem_ptr =
+          reinterpret_cast<const scalar_t*>(reinterpret_cast<const char*>(ptr) + i * stride_byte);
+      scratch[i] = static_cast<float>(*elem_ptr);
+    }
+    return __riscv_vle32_v_f32m4(scratch, vl);
+  }
+}
 
 // GEMM kernel: C = A @ B
-// A: [M, K], B: [K, N] (B is in packed/transposed format for Linear layers)
+// A: [M, K], B: [K, N]
 // C: [M, N]
-// This is the main kernel for Linear layers (QKV projection, FFN)
-//
-// For Linear layers, the weight is typically stored as [out_features, in_features]
-// which means B^T in our notation. We compute C = A @ B^T
 template <typename scalar_t>
 void gemm_rvv_impl(
-    const scalar_t* __restrict__ A,  // [M, K]
-    const scalar_t* __restrict__ B,  // [N, K] (weight, stored as [out_features, in_features])
-    scalar_t* __restrict__ C,        // [M, N]
-    const float* __restrict__ bias,  // [N] or nullptr
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    const float* __restrict__ bias,
     int64_t M,
     int64_t N,
     int64_t K,
-    int64_t lda,                    // stride of A (typically K)
-    int64_t ldb,                    // stride of B (typically K)
-    int64_t ldc,                    // stride of C (typically N)
-    float* __restrict__ scratch_a,  // scratch buffer for A conversion
-    float* __restrict__ scratch_b,  // scratch buffer for B conversion
-    float* __restrict__ acc_buf) {  // accumulator buffer [BLOCK_M_RVV, N]
-
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    float* __restrict__ scratch_a,
+    float* __restrict__ scratch_b,
+    float* __restrict__ acc_buf) {
   // Use m4 for higher throughput when possible
   size_t vl_max_m1 = __riscv_vsetvlmax_e32m1();
   size_t vl_max_m4 = __riscv_vsetvlmax_e32m4();
@@ -329,7 +443,7 @@ void gemm_rvv_impl(
       }
     }
 
-    // Main GEMM computation: C[m, n] += A[m, k] * B[n, k] (B is transposed)
+    // Main GEMM computation: C[m, n] += A[m, k] * B[n, k]
     // Iterate over K
     for (int64_t k = 0; k < K; ++k) {
       // For each row in the block
@@ -345,15 +459,9 @@ void gemm_rvv_impl(
         for (int64_t n = 0; n < N; n += vl) {
           vl = __riscv_vsetvl_e32m4(N - n);
 
-          // Load B values (strided access: B[n, k], B[n+1, k], ...)
-          // Since B is stored as [N, K], B[n, k] = B[n * ldb + k]
-          // We need to gather or use scalar loop for non-unit stride
-
-          // For now, use scalar gather (can be optimized with segment load if available)
-          for (size_t i = 0; i < vl; ++i) {
-            scratch_b[i] = static_cast<float>(B[(n + i) * ldb + k]);
-          }
-          vfloat32m4_t v_b = __riscv_vle32_v_f32m4(scratch_b, vl);
+          // ldb is in elements, so stride in bytes is ldb * sizeof(scalar_t)
+          ptrdiff_t stride_bytes = ldb * sizeof(scalar_t);
+          vfloat32m4_t v_b = load_strided_as_float_m4(B + n * ldb + k, stride_bytes, vl, scratch_b);
 
           // Load accumulator
           vfloat32m4_t v_acc = __riscv_vle32_v_f32m4(acc_row + n, vl);
@@ -386,10 +494,10 @@ void gemm_rvv_impl(
 // C = A @ B^T where B is [N, K] stored contiguously
 template <typename scalar_t>
 void gemm_nt_rvv_linear(
-    const scalar_t* __restrict__ A,  // [M, K]
-    const scalar_t* __restrict__ B,  // [N, K]
-    scalar_t* __restrict__ C,        // [M, N]
-    const float* __restrict__ bias,  // [N] or nullptr
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    const float* __restrict__ bias,
     int64_t M,
     int64_t N,
     int64_t K,
@@ -448,41 +556,31 @@ void gemm_nt_rvv_linear(
   }
 }
 
-// ============================================================================
-// Tiled GEMM for better cache utilization
-// ============================================================================
-
 // Tiled GEMM: C = A @ B^T + bias
 // Uses blocking to improve cache efficiency
-//
-// Key optimization: Process multiple M rows per iteration to amortize
-// the overhead of loading B weights
 template <typename scalar_t>
 void gemm_tiled_rvv(
-    const scalar_t* __restrict__ A,  // [M, K]
-    const scalar_t* __restrict__ B,  // [N, K]
-    scalar_t* __restrict__ C,        // [M, N]
-    const float* __restrict__ bias,  // [N] or nullptr
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    const float* __restrict__ bias,
     int64_t M,
     int64_t N,
     int64_t K,
     int64_t lda,
     int64_t ldb,
     int64_t ldc) {
-  // Tile sizes tuned for typical RISC-V cache configurations
-  constexpr int64_t TILE_M = 4;    // Process 4 rows at a time
-  constexpr int64_t TILE_K = 128;  // K tile size for cache efficiency
+  constexpr int64_t TILE_M = 4;
+  constexpr int64_t TILE_K = 128;
 
-  // Get max vector length
   size_t vl_max = __riscv_vsetvlmax_e32m1();
 
-// Parallel over M dimension
 #pragma omp parallel
   {
-    // Thread-local scratch buffers (avoid allocation per call)
+    // Thread-local scratch buffers
     alignas(64) float scratch_a[MAX_VL_ELEMENTS];
     alignas(64) float scratch_b[MAX_VL_ELEMENTS];
-    alignas(64) float acc_rows[TILE_M * 4096];  // Accumulator for tile rows
+    alignas(64) float acc_rows[TILE_M * 4096];
 
 #pragma omp for schedule(static)
     for (int64_t m0 = 0; m0 < M; m0 += TILE_M) {
@@ -546,21 +644,7 @@ void gemm_tiled_rvv(
 
 }  // anonymous namespace
 
-// ============================================================================
-// Public API - Called from gemm.cpp when RVV is available
-// ============================================================================
-
 // Main entry point for RVV GEMM - matches the signature in gemm.h
-// This is called from weight_packed_linear_kernel_impl when running on RISC-V
-//
-// Parameters:
-//   out: [M, N] output tensor
-//   mat1: [M, K] input activation
-//   mat2: [N, K] weight (transposed, so B^T layout)
-//   bias: [N] bias vector or nullptr
-//   M, N, K: matrix dimensions
-//   mat1_strideM: stride of mat1 in M dimension
-//   out_strideM: stride of out in M dimension
 template <typename scalar_t>
 void weight_packed_linear_kernel_impl_rvv(
     scalar_t* __restrict__ out,
@@ -582,6 +666,11 @@ void weight_packed_linear_kernel_impl_rvv(
       // Larger batch: use tiled version
       gemm_fp16_tiled_rvv(mat1, mat2, out, bias, M, N, K, mat1_strideM, K, out_strideM);
     }
+    return;
+  }
+  // Use Optimized BF16 Emulation kernel
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+    gemm_fp16_native_rvv(mat1, mat2, out, bias, M, N, K, mat1_strideM, K, out_strideM);
     return;
   }
 #endif
