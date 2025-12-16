@@ -150,22 +150,51 @@ inline void index_gemm_kernel_nt_rvv(
       // BFloat16 Optimized Path (Bitwise Shift Widening)
       size_t vl_max = __riscv_vsetvlmax_e32m4();
 
-      for (; n + 3 < N; n += 4) {
-        int64_t b_idx0 = indices[n];
-        int64_t b_idx1 = indices[n + 1];
-        int64_t b_idx2 = indices[n + 2];
-        int64_t b_idx3 = indices[n + 3];
+      // Check contiguous
+      bool is_contiguous = true;
+      int64_t start_idx = indices[0];
+      // Need a loop if N > VLEN
+      size_t vl_chk_max = __riscv_vsetvlmax_e32m4();
+      // Note: indices is index_t (int64_t). e32m4 is for float loops.
+      // For indices (int64), we need e64.
+      size_t vl_idx_max = __riscv_vsetvlmax_e64m4();
+
+      for (int64_t ck = 0; ck < N; ck += vl_idx_max) {
+        size_t vl = __riscv_vsetvl_e64m4(N - ck);
+        vint64m4_t v_idx = __riscv_vle64_v_i64m4(reinterpret_cast<const int64_t*>(indices + ck), vl);
+
+        // Expected: start_idx + ck + vid
+        vint64m4_t v_seq = __riscv_vid_v_i64m4(vl);
+        v_seq = __riscv_vadd_vx_i64m4(v_seq, start_idx + ck, vl);
+
+        // Compare: v_idx == v_seq?
+        vbool16_t v_mask = __riscv_vmseq_vv_i64m4_b16(v_idx, v_seq, vl);
+
+        // Count matches
+        long matches = __riscv_vcpop_m_b16(v_mask, vl);
+        if (matches != vl) {
+          is_contiguous = false;
+          break;
+        }
+      }
+
+      // Unroll 2 for BF16 to save registers
+      for (; n + 1 < N; n += 2) {
+        int64_t b_idx0, b_idx1;
+        if (is_contiguous) {
+          b_idx0 = start_idx + n;
+          b_idx1 = start_idx + n + 1;
+        } else {
+          b_idx0 = indices[n];
+          b_idx1 = indices[n + 1];
+        }
 
         const scalar_t* k_ptr0 = B + b_idx0 * ldb;
         const scalar_t* k_ptr1 = B + b_idx1 * ldb;
-        const scalar_t* k_ptr2 = B + b_idx2 * ldb;
-        const scalar_t* k_ptr3 = B + b_idx3 * ldb;
 
         // Initialize accumulators to 0
         vfloat32m4_t v_acc0 = __riscv_vfmv_v_f_f32m4(0.0f, vl_max);
         vfloat32m4_t v_acc1 = __riscv_vfmv_v_f_f32m4(0.0f, vl_max);
-        vfloat32m4_t v_acc2 = __riscv_vfmv_v_f_f32m4(0.0f, vl_max);
-        vfloat32m4_t v_acc3 = __riscv_vfmv_v_f_f32m4(0.0f, vl_max);
 
         for (int64_t k = 0; k < K; k += vl_max) {
           size_t vl = __riscv_vsetvl_e32m4(K - k);
@@ -191,21 +220,15 @@ inline void index_gemm_kernel_nt_rvv(
 
           process_token(v_acc0, k_ptr0);
           process_token(v_acc1, k_ptr1);
-          process_token(v_acc2, k_ptr2);
-          process_token(v_acc3, k_ptr3);
         }
 
         // Reductions
         vfloat32m1_t v_zero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
         vfloat32m1_t v_sum0 = __riscv_vfredusum_vs_f32m4_f32m1(v_acc0, v_zero, vl_max);
         vfloat32m1_t v_sum1 = __riscv_vfredusum_vs_f32m4_f32m1(v_acc1, v_zero, vl_max);
-        vfloat32m1_t v_sum2 = __riscv_vfredusum_vs_f32m4_f32m1(v_acc2, v_zero, vl_max);
-        vfloat32m1_t v_sum3 = __riscv_vfredusum_vs_f32m4_f32m1(v_acc3, v_zero, vl_max);
 
         C[m * ldc + n] = __riscv_vfmv_f_s_f32m1_f32(v_sum0) * scale;
         C[m * ldc + n + 1] = __riscv_vfmv_f_s_f32m1_f32(v_sum1) * scale;
-        C[m * ldc + n + 2] = __riscv_vfmv_f_s_f32m1_f32(v_sum2) * scale;
-        C[m * ldc + n + 3] = __riscv_vfmv_f_s_f32m1_f32(v_sum3) * scale;
       }
     }
 
@@ -290,16 +313,89 @@ inline void index_gemm_kernel_nt_rvv(
   }
 }
 
+// Helper for Fast Exp and Tanh
+namespace {
+
+// Polynomial coefficients for exp(x) approximation
+// using 2^x = 2^(n + f) = 2^n * 2^f
+// coefficients for 2^f in [-0.5, 0.5]
+const float c0 = 1.0f;
+const float c1 = 0.69314718056f;
+const float c2 = 0.24022650695f;
+const float c3 = 0.05550410866f;
+const float c4 = 0.00961812910f;
+const float c5 = 0.00133335581f;
+const float log2_e = 1.44269504089f;
+
+inline vfloat32m8_t vfexp_f32m8(vfloat32m8_t vx, size_t vl) {
+  // x = x * log2(e)
+  vfloat32m8_t v_log2e = __riscv_vfmv_v_f_f32m8(log2_e, vl);
+  vfloat32m8_t vz = __riscv_vfmul_vv_f32m8(vx, v_log2e, vl);
+
+  // n = round(z)
+  vint32m8_t vn_int = __riscv_vfcvt_x_f_v_i32m8(vz, vl);
+  vfloat32m8_t vn = __riscv_vfcvt_f_x_v_f32m8(vn_int, vl);
+
+  // f = z - n
+  vfloat32m8_t vf = __riscv_vfsub_vv_f32m8(vz, vn, vl);
+
+  // Polynomial approximation for 2^f
+  // p = c0 + f * (c1 + f * (c2 + f * (c3 + f * (c4 + f * c5))))
+  vfloat32m8_t v_c1 = __riscv_vfmv_v_f_f32m8(c1, vl);
+  vfloat32m8_t v_c2 = __riscv_vfmv_v_f_f32m8(c2, vl);
+  vfloat32m8_t v_c3 = __riscv_vfmv_v_f_f32m8(c3, vl);
+  vfloat32m8_t v_c4 = __riscv_vfmv_v_f_f32m8(c4, vl);
+  vfloat32m8_t v_c5 = __riscv_vfmv_v_f_f32m8(c5, vl);
+  vfloat32m8_t v_1 = __riscv_vfmv_v_f_f32m8(1.0f, vl);
+
+  vfloat32m8_t poly = __riscv_vfmadd_vv_f32m8(v_c5, vf, v_c4, vl);
+  poly = __riscv_vfmadd_vv_f32m8(poly, vf, v_c3, vl);
+  poly = __riscv_vfmadd_vv_f32m8(poly, vf, v_c2, vl);
+  poly = __riscv_vfmadd_vv_f32m8(poly, vf, v_c1, vl);
+  poly = __riscv_vfmadd_vv_f32m8(poly, vf, v_1, vl);
+
+  // 2^n part: construct float from integer exponent
+  // bias = 127. val = 2^n -> exponent = n + 127
+  vint32m8_t v_127 = __riscv_vmv_v_x_i32m8(127, vl);
+  vint32m8_t v_exp = __riscv_vadd_vv_i32m8(vn_int, v_127, vl);
+  // shift to sign position (23)
+  v_exp = __riscv_vsll_vx_i32m8(v_exp, 23, vl);
+
+  // Combine
+  vfloat32m8_t v_pow2n = __riscv_vreinterpret_v_i32m8_f32m8(v_exp);
+  vfloat32m8_t result = __riscv_vfmul_vv_f32m8(poly, v_pow2n, vl);
+
+  return result;
+}
+
+}  // namespace
+
 // 2. Softmax
 inline float exp_rvv(const float* __restrict__ scores, float* __restrict__ output, int64_t N, float m_i) {
-  float sum = 0.0f;
-  for (int64_t i = 0; i < N; ++i) {
-    float x = scores[i] - m_i;
-    float val = std::exp(x);
-    output[i] = val;
-    sum += val;
+  size_t vl_max = __riscv_vsetvlmax_e32m8();
+  vfloat32m1_t v_sum_scalar = __riscv_vfmv_s_f_f32m1(0.0f, 1);
+  vfloat32m8_t v_sum_acc = __riscv_vfmv_v_f_f32m8(0.0f, vl_max);
+
+  int64_t i = 0;
+  for (; i < N; i += vl_max) {
+    size_t vl = __riscv_vsetvl_e32m8(N - i);
+    vfloat32m8_t vx = __riscv_vle32_v_f32m8(scores + i, vl);
+    // vx = vx - m_i
+    vx = __riscv_vfsub_vf_f32m8(vx, m_i, vl);
+
+    // Fast Exp using vector helper
+    vfloat32m8_t vex = vfexp_f32m8(vx, vl);
+
+    // Store
+    __riscv_vse32_v_f32m8(output + i, vex, vl);
+
+    // Accumulate
+    v_sum_acc = __riscv_vfadd_vv_f32m8(v_sum_acc, vex, vl);
   }
-  return sum;
+
+  // Reduction
+  v_sum_scalar = __riscv_vfredusum_vs_f32m8_f32m1(v_sum_acc, v_sum_scalar, vl_max);
+  return __riscv_vfmv_f_s_f32m1_f32(v_sum_scalar);
 }
 
 // 3. Probabilities * Value aggregation
@@ -682,8 +778,33 @@ void decode_attention_kernel_rvv(
             /* mtt */ max_total_num_tokens);
 
         if (has_logit_cap) {
-          for (int j = 0; j < n_size; ++j) {
-            s_i[j] = logit_cap * std::tanh(s_i[j] * rlogit_cap);
+          // Tanh(x) = (e^(2x) - 1) / (e^(2x) + 1)
+          size_t vl_max = __riscv_vsetvlmax_e32m8();
+          for (int64_t j = 0; j < n_size; j += vl_max) {
+            size_t vl = __riscv_vsetvl_e32m8(n_size - j);
+            vfloat32m8_t vx = __riscv_vle32_v_f32m8(s_i + j, vl);
+
+            // vx = vx * rlogit_cap
+            vx = __riscv_vfmul_vf_f32m8(vx, rlogit_cap, vl);
+
+            // 2x
+            vfloat32m8_t v2x = __riscv_vfmul_vf_f32m8(vx, 2.0f, vl);
+
+            // exp(2x)
+            vfloat32m8_t vex = vfexp_f32m8(v2x, vl);
+
+            // (ex - 1)
+            vfloat32m8_t v_numerator = __riscv_vfsub_vf_f32m8(vex, 1.0f, vl);
+            // (ex + 1)
+            vfloat32m8_t v_denom = __riscv_vfadd_vf_f32m8(vex, 1.0f, vl);
+
+            // tanh = numerator / denom
+            vfloat32m8_t vtanh = __riscv_vfdiv_vv_f32m8(v_numerator, v_denom, vl);
+
+            // result = logit_cap * tanh
+            vfloat32m8_t vres = __riscv_vfmul_vf_f32m8(vtanh, logit_cap, vl);
+
+            __riscv_vse32_v_f32m8(s_i + j, vres, vl);
           }
         }
 
