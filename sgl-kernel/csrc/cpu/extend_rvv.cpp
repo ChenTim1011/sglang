@@ -83,8 +83,24 @@ void gemm_nt_rvv_tiled_transposed(
           acc1 = __riscv_vfwmacc_vf_f32m4(acc1, (_Float16)(q1), v_k, vl);
           acc2 = __riscv_vfwmacc_vf_f32m4(acc2, (_Float16)(q2), v_k, vl);
           acc3 = __riscv_vfwmacc_vf_f32m4(acc3, (_Float16)(q3), v_k, vl);
+        } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+          // BF16 Emulation: Load u16 -> zext to u32 -> shift left 16 -> reinterpret as f32
+          vuint16m2_t v_k_raw = __riscv_vle16_v_u16m2(reinterpret_cast<const uint16_t*>(k_ptr), vl);
+          vuint32m4_t v_k_ext = __riscv_vzext_vf2_u32m4(v_k_raw, vl);
+          vuint32m4_t v_k_shift = __riscv_vsll_vx_u32m4(v_k_ext, 16, vl);
+          vfloat32m4_t v_k = __riscv_vreinterpret_v_u32m4_f32m4(v_k_shift);
+
+          float q0 = static_cast<float>(Q[(m + 0) * q_strideM + k]);
+          float q1 = static_cast<float>(Q[(m + 1) * q_strideM + k]);
+          float q2 = static_cast<float>(Q[(m + 2) * q_strideM + k]);
+          float q3 = static_cast<float>(Q[(m + 3) * q_strideM + k]);
+
+          acc0 = __riscv_vfmacc_vf_f32m4(acc0, q0, v_k, vl);
+          acc1 = __riscv_vfmacc_vf_f32m4(acc1, q1, v_k, vl);
+          acc2 = __riscv_vfmacc_vf_f32m4(acc2, q2, v_k, vl);
+          acc3 = __riscv_vfmacc_vf_f32m4(acc3, q3, v_k, vl);
         } else {
-          // Fallback for non-Half types (BFloat16, Float)
+          // Fallback for non-Half types (Float)
           float k_tmp[32];
           for (size_t i = 0; i < vl; ++i)
             k_tmp[i] = static_cast<float>(k_ptr[i]);
@@ -175,6 +191,16 @@ void gemm_nn_rvv_tiled(
           if (m_count > 1) acc1 = __riscv_vfwmacc_vf_f32m4(acc1, (_Float16)p1, v_v, vl);
           if (m_count > 2) acc2 = __riscv_vfwmacc_vf_f32m4(acc2, (_Float16)p2, v_v, vl);
           if (m_count > 3) acc3 = __riscv_vfwmacc_vf_f32m4(acc3, (_Float16)p3, v_v, vl);
+        } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+          vuint16m2_t v_v_raw = __riscv_vle16_v_u16m2(reinterpret_cast<const uint16_t*>(v_ptr), vl);
+          vuint32m4_t v_v_ext = __riscv_vzext_vf2_u32m4(v_v_raw, vl);
+          vuint32m4_t v_v_shift = __riscv_vsll_vx_u32m4(v_v_ext, 16, vl);
+          vfloat32m4_t v_v = __riscv_vreinterpret_v_u32m4_f32m4(v_v_shift);
+
+          acc0 = __riscv_vfmacc_vf_f32m4(acc0, p0, v_v, vl);
+          if (m_count > 1) acc1 = __riscv_vfmacc_vf_f32m4(acc1, p1, v_v, vl);
+          if (m_count > 2) acc2 = __riscv_vfmacc_vf_f32m4(acc2, p2, v_v, vl);
+          if (m_count > 3) acc3 = __riscv_vfmacc_vf_f32m4(acc3, p3, v_v, vl);
         } else {
           float v_tmp[32];
           for (size_t i = 0; i < vl; ++i)
@@ -501,6 +527,11 @@ void extend_attention_kernel_rvv_impl(
                 for (int k = 0; k < vl; ++k)
                   out_row[d + k] = static_cast<scalar_t>(temp[k]);
 #endif
+              } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+                // Truncate to BF16 (shift right logic)
+                vuint32m4_t v_u32 = __riscv_vreinterpret_v_f32m4_u32m4(v_val);
+                vuint16m2_t v_bf16 = __riscv_vnsrl_wx_u16m2(v_u32, 16, vl);
+                __riscv_vse16_v_u16m2(reinterpret_cast<uint16_t*>(out_row + d), v_bf16, vl);
               } else {
                 __riscv_vse32_v_f32m4((float*)out_row + d, v_val, vl);
               }

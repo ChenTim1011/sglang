@@ -142,13 +142,15 @@ def naive_extend_attention(
 @pytest.mark.parametrize("seq_len", [32, 128, 256])
 @pytest.mark.parametrize("extend_len", [16, 32, 128])
 @pytest.mark.parametrize("num_requests", [1, 2, 4])  # Added batch size testing
-def test_extend_attention_cpu(num_heads, head_dim, seq_len, extend_len, num_requests):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_extend_attention_cpu(
+    num_heads, head_dim, seq_len, extend_len, num_requests, dtype
+):
     """Test extend_attention_cpu with various configurations."""
     if extend_len > seq_len:
         pytest.skip("extend_len cannot be larger than seq_len")
 
     device = "cpu"
-    dtype = torch.float16
 
     head_dim_v = head_dim
     max_context_len = seq_len + 16

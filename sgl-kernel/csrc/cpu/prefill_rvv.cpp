@@ -57,6 +57,9 @@ void cache_store_kernel_rvv_impl(
 
     for (int i = 0; i < new_len; ++i) {
       int64_t token_idx = req_to_token[req_idx * max_context_len + prefix_len + i];
+      if (token_idx < 0 || token_idx >= max_total_num_tokens) {
+        continue;
+      }
 
       for (int h = 0; h < num_heads_kv; ++h) {
         // Copy K

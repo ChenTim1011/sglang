@@ -82,16 +82,18 @@ def naive_prefill_cache(
 @pytest.mark.parametrize("seq_len", [32, 128, 256])
 @pytest.mark.parametrize("extend_len", [16, 32, 128])
 @pytest.mark.parametrize("num_requests", [1, 2, 4])
-def test_prefill_cache_cpu(num_heads, head_dim, seq_len, extend_len, num_requests):
-    """Test prefill_cache_cpu with various configurations."""
-    if extend_len > seq_len:
-        seq_len = extend_len
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_prefill_cache_cpu(
+    num_heads, head_dim, seq_len, extend_len, num_requests, dtype
+):
+    """Test prefill_cache_cpu with various configurations and data types."""
+
+    actual_seq_len = max(seq_len, extend_len)
 
     torch.manual_seed(42)
-    dtype = torch.float16
     head_dim_v = head_dim
 
-    max_context_len = seq_len + 16
+    max_context_len = actual_seq_len + 16
     max_total_tokens = num_requests * max_context_len
 
     # Create buffers
@@ -111,7 +113,7 @@ def test_prefill_cache_cpu(num_heads, head_dim, seq_len, extend_len, num_request
     used_tokens = 0
 
     for i in range(num_requests):
-        s_len = seq_len
+        s_len = actual_seq_len
         e_len = extend_len
 
         seq_lens_list.append(s_len)
