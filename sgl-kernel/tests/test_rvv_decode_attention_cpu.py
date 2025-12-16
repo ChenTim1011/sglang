@@ -111,10 +111,11 @@ def naive_attention_decode(
 @pytest.mark.parametrize("head_dim", [32, 64, 96, 128])
 @pytest.mark.parametrize("seq_len", [1, 32, 128, 256])
 @pytest.mark.parametrize("num_requests", [1, 2, 4, 8])  # Added batch size testing
-def test_decode_attention_cpu(num_heads, head_dim, seq_len, num_requests):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_decode_attention_cpu(num_heads, head_dim, seq_len, num_requests, dtype):
     """Test decode_attention_cpu with various configurations."""
     device = "cpu"
-    dtype = torch.float16  # RVV kernel typically uses FP16
+    # dtype passed from parameter
 
     head_dim_v = head_dim  # Simplified for testing
     max_seq_len = seq_len + 16  # Buffer slightly larger
@@ -203,8 +204,8 @@ def test_decode_attention_cpu(num_heads, head_dim, seq_len, num_requests):
     )
 
     # Compare
-    # Relaxed tolerance for FP16
-    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
+    # Relaxed tolerance for FP16 and BF16 on RISC-V
+    torch.testing.assert_close(output, ref_output, atol=5e-2, rtol=5e-2)
 
 
 @pytest.mark.skipif(

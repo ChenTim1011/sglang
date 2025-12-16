@@ -146,6 +146,69 @@ inline void index_gemm_kernel_nt_rvv(
     }
 #endif
 
+    if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+      // BFloat16 Optimized Path (Bitwise Shift Widening)
+      size_t vl_max = __riscv_vsetvlmax_e32m4();
+
+      for (; n + 3 < N; n += 4) {
+        int64_t b_idx0 = indices[n];
+        int64_t b_idx1 = indices[n + 1];
+        int64_t b_idx2 = indices[n + 2];
+        int64_t b_idx3 = indices[n + 3];
+
+        const scalar_t* k_ptr0 = B + b_idx0 * ldb;
+        const scalar_t* k_ptr1 = B + b_idx1 * ldb;
+        const scalar_t* k_ptr2 = B + b_idx2 * ldb;
+        const scalar_t* k_ptr3 = B + b_idx3 * ldb;
+
+        // Initialize accumulators to 0
+        vfloat32m4_t v_acc0 = __riscv_vfmv_v_f_f32m4(0.0f, vl_max);
+        vfloat32m4_t v_acc1 = __riscv_vfmv_v_f_f32m4(0.0f, vl_max);
+        vfloat32m4_t v_acc2 = __riscv_vfmv_v_f_f32m4(0.0f, vl_max);
+        vfloat32m4_t v_acc3 = __riscv_vfmv_v_f_f32m4(0.0f, vl_max);
+
+        for (int64_t k = 0; k < K; k += vl_max) {
+          size_t vl = __riscv_vsetvl_e32m4(K - k);
+
+          // Persistent Query: Convert BF16 Q -> FP32 Q
+          // Load Q as uint16 (LMUL=2)
+          vuint16m2_t vq_bf16 = __riscv_vle16_v_u16m2(reinterpret_cast<const uint16_t*>(q_ptr_base + k), vl);
+          // Zero-extend to uint32 (LMUL=4)
+          vuint32m4_t vq_u32 = __riscv_vzext_vf2_u32m4(vq_bf16, vl);
+          // Shift left by 16 to become FP32
+          vq_u32 = __riscv_vsll_vx_u32m4(vq_u32, 16, vl);
+          // Reinterpret as float32
+          vfloat32m4_t v_q = __riscv_vreinterpret_v_u32m4_f32m4(vq_u32);
+
+          // Helper lambda for BF16 load-convert-MAC
+          auto process_token = [&](vfloat32m4_t& acc, const scalar_t* ptr) {
+            vuint16m2_t vk_bf16 = __riscv_vle16_v_u16m2(reinterpret_cast<const uint16_t*>(ptr + k), vl);
+            vuint32m4_t vk_u32 = __riscv_vzext_vf2_u32m4(vk_bf16, vl);
+            vk_u32 = __riscv_vsll_vx_u32m4(vk_u32, 16, vl);
+            vfloat32m4_t v_k = __riscv_vreinterpret_v_u32m4_f32m4(vk_u32);
+            acc = __riscv_vfmacc_vv_f32m4_tu(acc, v_q, v_k, vl);
+          };
+
+          process_token(v_acc0, k_ptr0);
+          process_token(v_acc1, k_ptr1);
+          process_token(v_acc2, k_ptr2);
+          process_token(v_acc3, k_ptr3);
+        }
+
+        // Reductions
+        vfloat32m1_t v_zero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
+        vfloat32m1_t v_sum0 = __riscv_vfredusum_vs_f32m4_f32m1(v_acc0, v_zero, vl_max);
+        vfloat32m1_t v_sum1 = __riscv_vfredusum_vs_f32m4_f32m1(v_acc1, v_zero, vl_max);
+        vfloat32m1_t v_sum2 = __riscv_vfredusum_vs_f32m4_f32m1(v_acc2, v_zero, vl_max);
+        vfloat32m1_t v_sum3 = __riscv_vfredusum_vs_f32m4_f32m1(v_acc3, v_zero, vl_max);
+
+        C[m * ldc + n] = __riscv_vfmv_f_s_f32m1_f32(v_sum0) * scale;
+        C[m * ldc + n + 1] = __riscv_vfmv_f_s_f32m1_f32(v_sum1) * scale;
+        C[m * ldc + n + 2] = __riscv_vfmv_f_s_f32m1_f32(v_sum2) * scale;
+        C[m * ldc + n + 3] = __riscv_vfmv_f_s_f32m1_f32(v_sum3) * scale;
+      }
+    }
+
     // Remainder loop / Non-FP16 loop
     for (; n < N; ++n) {
       int64_t b_idx = indices[n];
@@ -189,8 +252,34 @@ inline void index_gemm_kernel_nt_rvv(
           scalar_sum += static_cast<float>(q_ptr_base[k]) * static_cast<float>(k_ptr[k]);
         }
 #endif
+      } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+        // BFloat16 Optimized Path (Remainder / Single Processing)
+        size_t vl_max = __riscv_vsetvlmax_e32m8();
+        vfloat32m8_t v_acc = __riscv_vfmv_v_f_f32m8(0.0f, vl_max);
+
+        for (int64_t k = 0; k < K; k += vl_max) {
+          size_t vl = __riscv_vsetvl_e32m8(K - k);
+
+          // Q: Load u16m4 -> ZeroExt u32m8 -> Shift 16 -> Reinterpret f32m8
+          vuint16m4_t vq_bf16 = __riscv_vle16_v_u16m4(reinterpret_cast<const uint16_t*>(q_ptr_base + k), vl);
+          vuint32m8_t vq_u32 = __riscv_vzext_vf2_u32m8(vq_bf16, vl);
+          vq_u32 = __riscv_vsll_vx_u32m8(vq_u32, 16, vl);
+          vfloat32m8_t vq = __riscv_vreinterpret_v_u32m8_f32m8(vq_u32);
+
+          // K: Load u16m4 -> ZeroExt u32m8 -> Shift 16 -> Reinterpret f32m8
+          vuint16m4_t vk_bf16 = __riscv_vle16_v_u16m4(reinterpret_cast<const uint16_t*>(k_ptr + k), vl);
+          vuint32m8_t vk_u32 = __riscv_vzext_vf2_u32m8(vk_bf16, vl);
+          vk_u32 = __riscv_vsll_vx_u32m8(vk_u32, 16, vl);
+          vfloat32m8_t vk = __riscv_vreinterpret_v_u32m8_f32m8(vk_u32);
+
+          v_acc = __riscv_vfmacc_vv_f32m8_tu(v_acc, vq, vk, vl);
+        }
+        vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
+        vfloat32m1_t vred = __riscv_vfredusum_vs_f32m8_f32m1(v_acc, vzero, vl_max);
+        scalar_sum = __riscv_vfmv_f_s_f32m1_f32(vred);
+
       } else {
-        // BFloat16 etc
+        // Fallback or other types without optimization
         for (int64_t k = 0; k < K; ++k) {
           scalar_sum += static_cast<float>(q_ptr_base[k]) * static_cast<float>(k_ptr[k]);
         }
@@ -314,8 +403,30 @@ inline void prob_value_aggregate_rvv(
         vv = __riscv_vle32_v_f32m8(temp, vl);
         vacc = __riscv_vfmacc_vf_f32m8(vacc, p3, vv, vl);
 #endif
+      } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+        // BFloat16 Path
+        // Convert input BF16 vectors to FP32, then vfmacc
+        auto load_convert = [&](const scalar_t* ptr) {
+          vuint16m4_t v_bf16 = __riscv_vle16_v_u16m4(reinterpret_cast<const uint16_t*>(ptr), vl);
+          vuint32m8_t v_u32 = __riscv_vzext_vf2_u32m8(v_bf16, vl);
+          v_u32 = __riscv_vsll_vx_u32m8(v_u32, 16, vl);
+          return __riscv_vreinterpret_v_u32m8_f32m8(v_u32);
+        };
+
+        vfloat32m8_t vv0 = load_convert(v_ptr0);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p0, vv0, vl);
+
+        vfloat32m8_t vv1 = load_convert(v_ptr1);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p1, vv1, vl);
+
+        vfloat32m8_t vv2 = load_convert(v_ptr2);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p2, vv2, vl);
+
+        vfloat32m8_t vv3 = load_convert(v_ptr3);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, p3, vv3, vl);
+
       } else {
-        // BFloat16/Other
+        // Other types
         float temp[256];
         // v0
         for (size_t j = 0; j < vl; ++j)
@@ -354,14 +465,6 @@ inline void prob_value_aggregate_rvv(
         vfloat16m4_t vv_16 = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(v_ptr), vl);
 
         // Widening MAC: vacc += prob * vv_16
-        // vfwmacc here uses float16 * scalar_float? No such intrinsic.
-        // We must convert vv_16 to float32 first.
-        // There is vfwmacc_vf but it might expect scalar to be fp16 too?
-        // RISC-V V spec: vfwmacc.vf (wide accumulate vector-scalar)
-        // vd[i] += f[rs1] * vs2[i]
-        // If vd is f32, f[rs1] is f16, vs2 is f16.
-        // But prob is float(32).
-        // So we need to convert vv_16 to vv_32, then mac.
         vfloat32m8_t vv = __riscv_vfwcvt_f_f_v_f32m8(vv_16, vl);
         vacc = __riscv_vfmacc_vf_f32m8(vacc, prob, vv, vl);
 #else
@@ -372,8 +475,15 @@ inline void prob_value_aggregate_rvv(
         vfloat32m8_t vv = __riscv_vle32_v_f32m8(temp, vl);
         vacc = __riscv_vfmacc_vf_f32m8(vacc, prob, vv, vl);
 #endif
+      } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+        // BFloat16 Remainder
+        vuint16m4_t v_bf16 = __riscv_vle16_v_u16m4(reinterpret_cast<const uint16_t*>(v_ptr), vl);
+        vuint32m8_t v_u32 = __riscv_vzext_vf2_u32m8(v_bf16, vl);
+        v_u32 = __riscv_vsll_vx_u32m8(v_u32, 16, vl);
+        vfloat32m8_t vv = __riscv_vreinterpret_v_u32m8_f32m8(v_u32);
+        vacc = __riscv_vfmacc_vf_f32m8(vacc, prob, vv, vl);
       } else {
-        // BFloat16
+        // Fallback
         float temp[256];
         for (size_t j = 0; j < vl; ++j)
           temp[j] = static_cast<float>(v_ptr[j]);
@@ -469,8 +579,14 @@ inline void decode_accumulate_kv_splits_rvv(
                   (output + i * head_size_v + d)[j] = static_cast<at::Half>(temp[j]);
               }
 #endif
+        } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+          // BFloat16 Store
+          vuint32m8_t vacc_u32 = __riscv_vreinterpret_v_f32m8_u32m8(vacc);
+          vuint16m4_t vout = __riscv_vnsrl_wx_u16m4(vacc_u32, 16, vl);
+          __riscv_vse16_v_u16m4(reinterpret_cast<uint16_t*>(output + i * head_size_v + d), vout, vl);
+
         } else {
-          // BFloat16 or others
+          // Others
           float temp[256];
           __riscv_vse32_v_f32m8(temp, vacc, vl);
           for (size_t j = 0; j < vl; ++j) {
@@ -566,8 +682,6 @@ void decode_attention_kernel_rvv(
             /* mtt */ max_total_num_tokens);
 
         if (has_logit_cap) {
-          // TODO: Vectorize tanh if needed, for now scalar loop or use sleef if available
-          // But since we are in RVV file, we could implement tanh_rvv later
           for (int j = 0; j < n_size; ++j) {
             s_i[j] = logit_cap * std::tanh(s_i[j] * rlogit_cap);
           }
