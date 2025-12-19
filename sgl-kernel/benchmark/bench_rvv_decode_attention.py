@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Benchmark script comparing RVV and torch_native attention backends.
 
@@ -156,6 +155,7 @@ STANDARD_CONFIGS = [
 TINYLLAMA_CONFIGS = [
     BenchmarkConfig(1, 32, 64, 128, "TinyLlama Decode (BS=1)"),
     BenchmarkConfig(8, 32, 64, 128, "TinyLlama Decode (BS=8)"),
+    BenchmarkConfig(1, 32, 64, 2048, "TinyLlama Decode (BS=1, Seq=2048)"),
 ]
 
 # CI configurations (faster)

@@ -21,6 +21,7 @@
 #   --bench-extend    Run only extend attention benchmarks
 #   --test-prefill    Run only prefill attention tests
 #   --bench-prefill   Run only prefill attention benchmarks
+#   --test-backend    Run only backend integration tests
 #   --quick           Run quick tests with fewer iterations
 #   --help            Show this help message
 #
@@ -132,11 +133,6 @@ while [[ $# -gt 0 ]]; do
             RUN_DECODE=false
             RUN_EXTEND=false
             RUN_PREFILL=true
-            shift
-            ;;
-        --backend)
-            # enable backend integration tests (does not change other selections)
-            RUN_BACKEND=true
             shift
             ;;
         --test-backend)

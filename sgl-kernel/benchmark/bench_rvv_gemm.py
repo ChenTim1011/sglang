@@ -341,8 +341,8 @@ def print_summary(results: list[BenchmarkResult]):
 def main():
     """Main benchmark entry point."""
     parser = argparse.ArgumentParser(description="Benchmark RVV GEMM kernel")
-    parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations")
-    parser.add_argument("--repeat", type=int, default=10, help="Timed iterations")
+    parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
+    parser.add_argument("--repeat", type=int, default=100, help="Timed iterations")
     parser.add_argument(
         "--quick", action="store_true", help="Run quick benchmark (CI mode)"
     )
@@ -350,6 +350,10 @@ def main():
 
     # Override configs for quick mode
     configs = SMALL_CONFIGS if args.quick else ALL_CONFIGS
+
+    if args.quick:
+        args.warmup = 2
+        args.repeat = 10
 
     print("=" * 70)
     print("RVV GEMM Kernel Benchmark")

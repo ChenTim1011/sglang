@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Benchmark script for RVV extend attention kernel.
 
@@ -256,8 +255,8 @@ def run_single_backend(backend_name, config, num_iterations=20, warmup=5):
 
 
 def run_benchmark(config: BenchmarkConfig, quick=False) -> BenchmarkResult:
-    iterations = 5 if quick else 20
-    warmup = 2 if quick else 5
+    iterations = 10 if quick else 100
+    warmup = 2 if quick else 10
 
     rvv_time = run_single_backend("rvv", config, iterations, warmup)
     torch_time = run_single_backend("torch_native", config, iterations, warmup)

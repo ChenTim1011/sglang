@@ -602,43 +602,29 @@ def run_benchmark_suite(
                 print(f"      Run {run_idx + 1}: FAILED - {result.error_msg}")
 
     # Calculate summary statistics
-    successful_results = [r for r in results if r.success]
+    # User requested to exclude the first run from the average calculation if possible
+    stats_results = successful_results
+    if len(successful_results) > 1:
+        stats_results = successful_results[1:]
 
-    if not successful_results:
-        return BenchmarkSummary(
-            backend=backend,
-            num_runs=len(results),
-            avg_ttft_ms=0,
-            min_ttft_ms=0,
-            max_ttft_ms=0,
-            avg_throughput_tps=0,
-            min_throughput_tps=0,
-            max_throughput_tps=0,
-            avg_total_time_ms=0,
-            avg_decode_latency_ms=0,
-            avg_tokens_generated=0,
-            success_rate=0,
-            results=results,
-        )
-
-    ttfts = [r.ttft_ms for r in successful_results]
-    throughputs = [r.throughput_tps for r in successful_results if r.throughput_tps > 0]
-    total_times = [r.total_time_ms for r in successful_results]
+    ttfts = [r.ttft_ms for r in stats_results]
+    throughputs = [r.throughput_tps for r in stats_results if r.throughput_tps > 0]
+    total_times = [r.total_time_ms for r in stats_results]
     decode_latencies = [
-        r.decode_latency_ms for r in successful_results if r.decode_latency_ms > 0
+        r.decode_latency_ms for r in stats_results if r.decode_latency_ms > 0
     ]
-    tokens_list = [r.tokens_generated for r in successful_results]
+    tokens_list = [r.tokens_generated for r in stats_results]
 
     return BenchmarkSummary(
         backend=backend,
         num_runs=len(results),
-        avg_ttft_ms=sum(ttfts) / len(ttfts),
-        min_ttft_ms=min(ttfts),
-        max_ttft_ms=max(ttfts),
+        avg_ttft_ms=sum(ttfts) / len(ttfts) if ttfts else 0,
+        min_ttft_ms=min(ttfts) if ttfts else 0,
+        max_ttft_ms=max(ttfts) if ttfts else 0,
         avg_throughput_tps=sum(throughputs) / len(throughputs) if throughputs else 0,
         min_throughput_tps=min(throughputs) if throughputs else 0,
         max_throughput_tps=max(throughputs) if throughputs else 0,
-        avg_total_time_ms=sum(total_times) / len(total_times),
+        avg_total_time_ms=sum(total_times) / len(total_times) if total_times else 0,
         avg_decode_latency_ms=(
             sum(decode_latencies) / len(decode_latencies) if decode_latencies else 0
         ),
@@ -802,7 +788,7 @@ Examples:
         "--warmup", type=int, default=2, help="Number of warmup runs before measurement"
     )
     parser.add_argument(
-        "--num-runs", type=int, default=5, help="Number of measurement runs per prompt"
+        "--num-runs", type=int, default=6, help="Number of measurement runs per prompt"
     )
     parser.add_argument(
         "--max-tokens", type=int, default=50, help="Maximum tokens to generate"
@@ -812,11 +798,6 @@ Examples:
     )
     parser.add_argument(
         "--output", type=str, default=None, help="Output JSON file for results"
-    )
-    parser.add_argument(
-        "--restart",
-        action="store_true",
-        help="Restart server for each backend (shutdown existing and launch new)",
     )
 
     args = parser.parse_args()
@@ -845,7 +826,6 @@ Examples:
     print(f"   Measurement runs: {args.num_runs}")
     print(f"   Max tokens: {args.max_tokens}")
     print(f"   Prompts: {len(prompts)}")
-    print(f"   Restart server: {args.restart}")
     print("=" * 60)
 
     for backend in backends_to_test:
@@ -853,36 +833,21 @@ Examples:
         print(f"# Testing {backend.upper()} Backend")
         print(f"{'#'*60}")
 
-        if args.restart:
-            # Shutdown any existing server and launch new one
-            shutdown_server()
-            time.sleep(3)
+        shutdown_server()
+        time.sleep(3)
 
-            # Create config and launch server
-            config_path = create_config_file(backend, script_dir)
-            log_file = os.path.join(script_dir, f"benchmark_{backend}.log")
+        # Create config and launch server
+        config_path = create_config_file(backend, script_dir)
+        log_file = os.path.join(script_dir, f"benchmark_{backend}.log")
 
-            if not launch_server(
-                config_path, log_file, timeout=args.timeout, backend=backend
-            ):
-                print(f"❌ Failed to start server for {backend} backend")
-                continue
+        if not launch_server(
+            config_path, log_file, timeout=args.timeout, backend=backend
+        ):
+            print(f"❌ Failed to start server for {backend} backend")
+            continue
 
-            # Give server a moment to stabilize
-            time.sleep(5)
-        else:
-            # Use existing server - just verify it's running
-            if not check_server_running():
-                print(f"⚠️  No server running. Starting server for {backend} backend...")
-                config_path = create_config_file(backend, script_dir)
-                log_file = os.path.join(script_dir, f"benchmark_{backend}.log")
-
-                if not launch_server(
-                    config_path, log_file, timeout=args.timeout, backend=backend
-                ):
-                    print(f"❌ Failed to start server for {backend} backend")
-                    continue
-                time.sleep(5)
+        # Give server a moment to stabilize
+        time.sleep(5)
 
         # Run benchmarks
         summary = run_benchmark_suite(
@@ -894,9 +859,9 @@ Examples:
         )
         summaries.append(summary)
 
-        if args.restart:
-            shutdown_server()
-            time.sleep(2)
+        # Shutdown after run
+        shutdown_server()
+        time.sleep(2)
 
     # Print comparison
     if summaries:

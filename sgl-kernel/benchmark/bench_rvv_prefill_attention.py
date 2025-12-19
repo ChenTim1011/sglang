@@ -111,11 +111,10 @@ def naive_prefill_cache(
         k_src = k_new[start_loc : start_loc + new_len]
         v_src = v_new[start_loc : start_loc + new_len]
 
-        # Write to buffer
-        for j in range(new_len):
-            token_idx = req_to_token[req_idx, prefix_len + j].item()
-            k_buffer[token_idx] = k_src[j]
-            v_buffer[token_idx] = v_src[j]
+        # Write to buffer (Vectorized version)
+        token_indices = req_to_token[req_idx, prefix_len : prefix_len + new_len].long()
+        k_buffer.index_copy_(0, token_indices, k_src)
+        v_buffer.index_copy_(0, token_indices, v_src)
 
 
 # ============================================================================
@@ -232,8 +231,8 @@ def run_single_impl(impl_name, config, num_iterations=20, warmup=5):
 
 
 def run_benchmark(config: BenchmarkConfig, quick=False) -> BenchmarkResult:
-    iterations = 5 if quick else 20
-    warmup = 2 if quick else 5
+    iterations = 10 if quick else 100
+    warmup = 2 if quick else 10
 
     rvv_time = run_single_impl("rvv", config, iterations, warmup)
     torch_time = run_single_impl("torch", config, iterations, warmup)
