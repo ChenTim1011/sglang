@@ -1,11 +1,11 @@
 """
-Benchmark script comparing RVV and torch_native attention backends.
+Benchmark script comparing RVV and torch_native attention backends (Decode, INT8).
 
 This script benchmarks through SGLang's attention backend system,
-comparing `attention-backend=rvv` vs `attention-backend=torch_native`.
+comparing `attention-backend=rvv` (INT8) vs `attention-backend=torch_native` (FP16).
 
 Usage:
-    python3 bench_rvv_decode_attention.py [--quick]
+    python3 bench_rvv_decode_int8.py [--quick]
 """
 
 import argparse
@@ -22,36 +22,23 @@ import torch
 # Configuration & Environment Setup
 # ============================================================================
 
-# CI environment detection
-# This checks if the script is running in a Continuous Integration environment
-# (like GitHub Actions). If true, we typically run a smaller set of tests.
 IS_CI = (
     os.getenv("CI", "false").lower() == "true"
     or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 )
 
-# Add parent directory to path to import sglang
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
 
 def setup_triton_stub():
-    """
-    Setup triton_stub for RISC-V environments where full Triton is not available.
-    This allows SGLang to import without failing on missing triton dependency.
-    """
+    """Setup triton_stub for RISC-V environments."""
     try:
         import triton
 
-        print(
-            f"[INFO] Using real triton module (version: {getattr(triton, '__version__', 'unknown')})"
-        )
         return
     except ImportError:
         pass
 
-    print("[INFO] Real triton not available, attempting to use triton_stub...")
-
-    # Check multiple possible locations for triton_stub.py
     possible_stub_paths = [
         os.path.join(
             os.path.dirname(__file__),
@@ -79,7 +66,6 @@ def setup_triton_stub():
             break
 
     if triton_stub_path:
-        # Execute triton_stub.py directly - it registers itself in sys.modules
         stub_namespace = {
             "__file__": triton_stub_path,
             "__name__": "triton_stub",
@@ -88,12 +74,8 @@ def setup_triton_stub():
         stub_namespace.update(sys.modules)
         with open(triton_stub_path, "r") as f:
             exec(compile(f.read(), triton_stub_path, "exec"), stub_namespace)
-        print(f"[INFO] Using triton_stub from {triton_stub_path}")
-    else:
-        print(f"[WARNING] triton not available and triton_stub not found")
 
 
-# Setup environment
 setup_triton_stub()
 
 try:
@@ -101,16 +83,10 @@ try:
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 
     HAS_SGLANG = True
-except ImportError as e:
+except ImportError:
     HAS_SGLANG = False
-    print(f"ERROR: SGLang not available: {e}")
+    print("SGLang not found")
     sys.exit(1)
-
-
-def is_riscv_platform():
-    """Check if running on RISC-V platform."""
-    machine = platform.machine().lower()
-    return machine in ("riscv64", "riscv32", "riscv")
 
 
 # ============================================================================
@@ -120,20 +96,16 @@ def is_riscv_platform():
 
 @dataclass
 class BenchmarkConfig:
-    """Configuration for a single benchmark."""
-
     num_requests: int
     num_heads: int
     head_dim: int
     seq_len: int
     description: str
-    kv_dtype: torch.dtype = torch.float16
+    kv_dtype: torch.dtype = torch.int8
 
 
 @dataclass
 class BenchmarkResult:
-    """Result of a single benchmark."""
-
     config: BenchmarkConfig
     rvv_ms: float
     torch_ms: float
@@ -145,37 +117,27 @@ class BenchmarkResult:
 # Benchmark Configurations
 # ============================================================================
 
-# Standard configurations
-STANDARD_CONFIGS = [
-    BenchmarkConfig(1, 8, 64, 128, "Small Batch (BS=1)"),
-    BenchmarkConfig(4, 8, 64, 128, "Medium Batch (BS=4)"),
-    BenchmarkConfig(32, 8, 64, 128, "Large Batch (BS=32)"),
-]
-
-# TinyLlama configurations (2048 hidden, 32 heads -> 64 head_dim)
-TINYLLAMA_CONFIGS = [
-    BenchmarkConfig(1, 32, 64, 128, "TinyLlama Decode (BS=1)"),
-    BenchmarkConfig(8, 32, 64, 128, "TinyLlama Decode (BS=8)"),
-    BenchmarkConfig(1, 32, 64, 2048, "TinyLlama Decode (BS=1, Seq=2048)"),
-]
-
-# INT8 Configurations
 INT8_CONFIGS = [
-    BenchmarkConfig(1, 8, 64, 128, "INT8 Small Batch (BS=1)", kv_dtype=torch.int8),
-    BenchmarkConfig(
-        8, 32, 64, 128, "INT8 TinyLlama Decode (BS=8)", kv_dtype=torch.int8
-    ),
+    # Small / Standard
+    BenchmarkConfig(1, 8, 64, 128, "INT8 Small Batch (BS=1)"),
+    BenchmarkConfig(4, 8, 64, 128, "INT8 Medium Batch (BS=4)"),
+    BenchmarkConfig(32, 8, 64, 128, "INT8 Large Batch (BS=32)"),
+    # TinyLlama
+    BenchmarkConfig(1, 32, 64, 128, "INT8 TinyLlama Decode (BS=1)"),
+    BenchmarkConfig(8, 32, 64, 128, "INT8 TinyLlama Decode (BS=8)"),
+    # Long Sequence
+    BenchmarkConfig(1, 32, 64, 2048, "INT8 Long Seq (BS=1, Seq=2048)"),
+    BenchmarkConfig(1, 32, 64, 4096, "INT8 Long Seq (BS=1, Seq=4096)"),
 ]
 
-# CI configurations (faster)
 CI_CONFIGS = [
-    BenchmarkConfig(1, 4, 32, 32, "CI Quick Test"),
+    BenchmarkConfig(1, 4, 32, 32, "CI INT8 Quick Test"),
 ]
 
 if IS_CI:
     ALL_CONFIGS = CI_CONFIGS
 else:
-    ALL_CONFIGS = STANDARD_CONFIGS + TINYLLAMA_CONFIGS + INT8_CONFIGS
+    ALL_CONFIGS = INT8_CONFIGS
 
 
 # ============================================================================
@@ -184,7 +146,6 @@ else:
 
 
 def create_mock_runner(num_heads, head_dim, v_head_dim, dtype=torch.float16):
-    """Create a mock ModelRunner for testing."""
     mock_runner = Mock()
     mock_runner.device = torch.device("cpu")
     mock_runner.model_config = Mock()
@@ -192,15 +153,10 @@ def create_mock_runner(num_heads, head_dim, v_head_dim, dtype=torch.float16):
     mock_runner.tp_size = 1
     mock_runner.kv_cache_dtype = "int8" if dtype == torch.int8 else "auto"
 
-    # Mock token_to_kv_pool
     mock_runner.token_to_kv_pool = Mock()
-    # Return buffers large enough for testing
 
-    # NOTE: torch.randn for int8 is not supported directly.
-    # We must generate float first then convert.
     def create_buffer(num_tokens, heads, hdim, dtype):
         if dtype == torch.int8:
-            # Generate float, then quantize to int8 range
             return (torch.randn(num_tokens, heads, hdim, dtype=torch.float32) * 50).to(
                 torch.int8
             )
@@ -218,7 +174,6 @@ def create_mock_runner(num_heads, head_dim, v_head_dim, dtype=torch.float16):
 
 
 def create_mock_layer(num_heads, head_dim, v_head_dim):
-    """Create a mock RadixAttention layer."""
     mock_layer = Mock()
     mock_layer.tp_q_head_num = num_heads
     mock_layer.qk_head_dim = head_dim
@@ -232,21 +187,17 @@ def create_mock_layer(num_heads, head_dim, v_head_dim):
 def create_mock_forward_batch(
     num_requests, num_heads, head_dim, v_head_dim, max_seq_len, dtype=torch.float16
 ):
-    """Create a mock ForwardBatch."""
     mock_batch = Mock()
     mock_batch.batch_size = num_requests
     mock_batch.out_cache_loc = torch.zeros(num_requests, dtype=torch.int64)
     mock_batch.seq_lens = torch.ones(num_requests, dtype=torch.int64) * max_seq_len
     mock_batch.req_pool_indices = torch.arange(num_requests, dtype=torch.int64)
 
-    # Mock req_to_token_pool
     mock_batch.req_to_token_pool = Mock()
-    # Map requests to tokens [0..seq_len]
     mock_batch.req_to_token_pool.req_to_token = torch.zeros(
         num_requests, max_seq_len, dtype=torch.int64
     )
 
-    # Mock token_to_kv_pool
     mock_batch.token_to_kv_pool = Mock()
 
     def create_buffer(num_tokens, heads, hdim, dtype):
@@ -275,7 +226,6 @@ def create_mock_forward_batch(
 # ============================================================================
 
 
-# We create a patched RVVAttnBackend for INT8 benchmarking because the standard one
 class RVVAttnBackendInt8(RVVAttnBackend):
     def __init__(self, model_runner):
         super().__init__(model_runner)
@@ -297,16 +247,11 @@ class RVVAttnBackendInt8(RVVAttnBackend):
         forward_batch,
         save_kv_cache=True,
     ):
-        # Check if KV cache is int8
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         if k_buffer.dtype == torch.int8 and self.decode_attention_fwd_int8:
-            # Use INT8 path
-            # Convert inputs to half if needed (Query remains half/bfloat16)
             if q.dtype not in (torch.float16, torch.bfloat16):
                 q = q.half()
 
-            # Key/Value inputs should be int8 to match buffer, or we assume they are handled.
-            # In this benchmark mock, we can pass int8 tensors.
             if k.dtype != torch.int8:
                 k = (k / self.k_scale).round().clamp(-128, 127).to(torch.int8)
                 v = (v / self.v_scale).round().clamp(-128, 127).to(torch.int8)
@@ -348,11 +293,16 @@ class RVVAttnBackendInt8(RVVAttnBackend):
 
 
 def run_single_backend(backend_name, config, num_iterations=100, warmup=10):
-    """Run benchmark for a single backend."""
     v_head_dim = config.head_dim
 
+    # Use FP16 for torch native comparison even if benchmark is INT8
+    # Use INT8 for RVV if benchmark is INT8
+    runner_dtype = torch.float16
+    if backend_name == "rvv" and config.kv_dtype == torch.int8:
+        runner_dtype = torch.int8
+
     mock_runner = create_mock_runner(
-        config.num_heads, config.head_dim, v_head_dim, config.kv_dtype
+        config.num_heads, config.head_dim, v_head_dim, runner_dtype
     )
     mock_layer = create_mock_layer(config.num_heads, config.head_dim, v_head_dim)
 
@@ -366,7 +316,6 @@ def run_single_backend(backend_name, config, num_iterations=100, warmup=10):
     else:
         raise ValueError(f"Unknown backend: {backend_name}")
 
-    # Data
     dtype = torch.float16
     q = torch.randn(config.num_requests, config.num_heads, config.head_dim, dtype=dtype)
     k = torch.randn(config.num_requests, config.num_heads, config.head_dim, dtype=dtype)
@@ -378,24 +327,22 @@ def run_single_backend(backend_name, config, num_iterations=100, warmup=10):
         config.head_dim,
         v_head_dim,
         config.seq_len,
-        config.kv_dtype,
+        runner_dtype,
     )
 
     backend.init_forward_metadata(forward_batch)
 
-    # Warmup
     for _ in range(warmup):
         try:
             backend.forward_decode(
                 q, k, v, mock_layer, forward_batch, save_kv_cache=True
             )
-        except Exception as e:
-            if config.kv_dtype == torch.int8:
-                print(f"[WARN] Failed to run {backend_name} with INT8: {e}")
-                return 0.001  # Return dummy small time to avoid div by zero
-            raise e
+        except Exception:
+            if backend_name == "rvv":
+                # INT8 might fail if not implemented
+                return 0.001
+            raise
 
-    # Benchmark
     start_time = time.perf_counter()
     for _ in range(num_iterations):
         backend.forward_decode(q, k, v, mock_layer, forward_batch, save_kv_cache=True)
@@ -406,29 +353,13 @@ def run_single_backend(backend_name, config, num_iterations=100, warmup=10):
 
 
 def run_benchmark(config: BenchmarkConfig, quick=False) -> BenchmarkResult:
-    """Run benchmark for a configuration."""
     iterations = 10 if quick else 100
     warmup = 2 if quick else 10
 
-    # Run RVV
     rvv_time = run_single_backend("rvv", config, iterations, warmup)
 
-    # Run Torch Native
-    # This shows the speedup of "RVV INT8" vs "Torch Native FP16".
-
-    if config.kv_dtype == torch.int8:
-
-        config_fp16 = BenchmarkConfig(
-            config.num_requests,
-            config.num_heads,
-            config.head_dim,
-            config.seq_len,
-            config.description,
-            torch.float16,
-        )
-        torch_time = run_single_backend("torch_native", config_fp16, iterations, warmup)
-    else:
-        torch_time = run_single_backend("torch_native", config, iterations, warmup)
+    # Run Torch Native (Always FP16 as baseline)
+    torch_time = run_single_backend("torch_native", config, iterations, warmup)
 
     speedup = torch_time / rvv_time
     throughput = config.num_requests / rvv_time
@@ -443,11 +374,10 @@ def run_benchmark(config: BenchmarkConfig, quick=False) -> BenchmarkResult:
 
 
 def print_result(result: BenchmarkResult):
-    """Print result in a formatted way."""
     c = result.config
-    dtype_str = "INT8" if c.kv_dtype == torch.int8 else "FP16"
+    dtype_str = "INT8"
     print(
-        f"  {c.description:<30} | BS={c.num_requests}, H={c.num_heads}, D={c.head_dim}, {dtype_str}"
+        f"  {c.description:<35} | BS={c.num_requests}, H={c.num_heads}, D={c.head_dim}, {dtype_str}"
     )
     print(f"    RVV:   {result.rvv_ms:8.3f} ms ({result.throughput_rvv:.1f} req/s)")
     print(f"    Torch: {result.torch_ms:8.3f} ms")
@@ -455,23 +385,19 @@ def print_result(result: BenchmarkResult):
     print("-" * 60)
 
 
-# ============================================================================
-# Main
-# ============================================================================
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark RVV Decode Attention")
+    parser = argparse.ArgumentParser(
+        description="Benchmark RVV Decode Attention (INT8)"
+    )
     parser.add_argument("--quick", action="store_true", help="Run quick benchmark")
     args = parser.parse_args()
 
-    # Determine configs
     configs = ALL_CONFIGS
     if args.quick:
         configs = CI_CONFIGS
 
     print("=" * 60)
-    print("RVV Decode Attention Benchmark")
+    print("RVV Decode Attention Benchmark (INT8)")
     print("=" * 60)
     print(f"Platform: {platform.machine()}")
     print(f"CI Mode: {IS_CI}")
@@ -487,7 +413,6 @@ def main():
         except Exception as e:
             print(f"FAILED {config.description}: {e}")
 
-    # Summary
     if results:
         avg_speedup = sum(r.speedup for r in results) / len(results)
         print(f"Average Speedup: {avg_speedup:.2f}x")

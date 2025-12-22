@@ -249,11 +249,13 @@ if [[ "$RUN_TESTS" == "true" ]]; then
     echo ""
 
     if [[ "$RUN_DECODE" == "true" ]]; then
-        run_test "RVV Decode Attention CPU" "tests/test_rvv_decode_attention_cpu.py" || true
+        run_test "RVV Decode Attention (FP16/BF16)" "tests/test_rvv_decode.py" || true
+        run_test "RVV Decode Attention (INT8)" "tests/test_rvv_decode_int8.py" || true
     fi
 
     if [[ "$RUN_EXTEND" == "true" ]]; then
-        run_test "RVV Extend Attention CPU" "tests/test_rvv_extend_attention_cpu.py" || true
+        run_test "RVV Extend Attention (FP16/BF16)" "tests/test_rvv_extend.py" || true
+        run_test "RVV Extend Attention (INT8)" "tests/test_rvv_extend_int8.py" || true
     fi
 
     if [[ "$RUN_PREFILL" == "true" ]]; then
@@ -297,13 +299,17 @@ if [[ "$RUN_BENCHMARKS" == "true" ]]; then
         fi
 
         if [[ "$RUN_DECODE" == "true" ]]; then
-            run_benchmark "RVV Decode Attention" \
-                "cd $BENCHMARK_DIR && python bench_rvv_decode_attention.py $BENCH_ARGS"
+            run_benchmark "RVV Decode Attention (FP16)" \
+                "cd $BENCHMARK_DIR && python bench_rvv_decode.py $BENCH_ARGS"
+            run_benchmark "RVV Decode Attention (INT8)" \
+                "cd $BENCHMARK_DIR && python bench_rvv_decode_int8.py $BENCH_ARGS"
         fi
 
         if [[ "$RUN_EXTEND" == "true" ]]; then
-            run_benchmark "RVV Extend Attention" \
-                "cd $BENCHMARK_DIR && python bench_rvv_extend_attention.py $BENCH_ARGS"
+            run_benchmark "RVV Extend Attention (FP16)" \
+                "cd $BENCHMARK_DIR && python bench_rvv_extend.py $BENCH_ARGS"
+            run_benchmark "RVV Extend Attention (INT8)" \
+                "cd $BENCHMARK_DIR && python bench_rvv_extend_int8.py $BENCH_ARGS"
         fi
 
         if [[ "$RUN_PREFILL" == "true" ]]; then

@@ -1,13 +1,8 @@
 """
-Unit Test for extend_attention_cpu kernel (RVV optimized).
+Unit Test for extend_attention_cpu kernel (RVV optimized, INT8).
 
-This test verifies that the CPU extend attention kernel produces correct results
-by comparing against a naive PyTorch reference implementation.
-Designed to run on RISC-V hardware platforms (e.g., Banana Pi).
-
-Usage on RISC-V hardware:
-    cd ~/.local_riscv_env/workspace/sglang/sgl-kernel
-    pytest tests/test_rvv_extend_attention_cpu.py -v
+Usage:
+    python3 tests/test_rvv_extend_int8.py -v
 """
 
 import os
@@ -29,11 +24,11 @@ except ImportError:
 
 
 def _has_extend_attention_cpu() -> bool:
-    """Check if extend_attention_cpu op is available."""
+    """Check if extend_attention_int8_cpu op is available."""
     if not HAS_SGL_KERNEL:
         return False
     try:
-        return hasattr(torch.ops.sgl_kernel, "extend_attention_cpu")
+        return hasattr(torch.ops.sgl_kernel, "extend_attention_int8_cpu")
     except (AttributeError, RuntimeError):
         return False
 
@@ -51,6 +46,8 @@ def naive_extend_attention(
     extend_start_loc,  # [num_seqs] - start locations in q_extend
     sm_scale,
     logit_cap,
+    k_scale=1.0,
+    v_scale=1.0,
 ):
     """
     Naive reference implementation of extend attention using PyTorch.
@@ -84,12 +81,22 @@ def naive_extend_attention(
         v_prefix = []
         for j in range(prefix_len):
             token_idx = req_to_token[req_idx, j].item()
-            k_prefix.append(k_buffer[token_idx])
-            v_prefix.append(v_buffer[token_idx])
+
+            k_val = k_buffer[token_idx]
+            v_val = v_buffer[token_idx]
+
+            # Dequantize if needed
+            if k_val.dtype == torch.int8:
+                k_val = k_val.to(torch.float32) * k_scale
+            if v_val.dtype == torch.int8:
+                v_val = v_val.to(torch.float32) * v_scale
+
+            k_prefix.append(k_val)
+            v_prefix.append(v_val)
 
         if prefix_len > 0:
-            k_prefix = torch.stack(k_prefix)
-            v_prefix = torch.stack(v_prefix)
+            k_prefix = torch.stack(k_prefix).to(q.dtype)
+            v_prefix = torch.stack(v_prefix).to(q.dtype)
         else:
             k_prefix = torch.empty(
                 0, num_heads, head_dim, dtype=q.dtype, device=q.device
@@ -137,24 +144,27 @@ def naive_extend_attention(
 @pytest.mark.skipif(
     not _has_extend_attention_cpu(), reason="extend_attention_cpu not available"
 )
-@pytest.mark.parametrize("num_heads", [4, 8, 16])
+@pytest.mark.parametrize("num_heads", [4, 8, 16, 32])
 @pytest.mark.parametrize("head_dim", [32, 64, 128])
-@pytest.mark.parametrize("seq_len", [32, 128, 256])
+@pytest.mark.parametrize("seq_len", [1, 32, 128, 256])
 @pytest.mark.parametrize("extend_len", [16, 32, 128])
-@pytest.mark.parametrize("num_requests", [1, 2, 4])  # Added batch size testing
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_extend_attention_cpu(
+@pytest.mark.parametrize("num_requests", [1, 2, 4])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_extend_attention_cpu_int8(
     num_heads, head_dim, seq_len, extend_len, num_requests, dtype
 ):
-    """Test extend_attention_cpu with various configurations."""
+    """Test extend_attention_cpu with INT8 KV cache (Prefix part)."""
     if extend_len > seq_len:
         pytest.skip("extend_len cannot be larger than seq_len")
 
     device = "cpu"
-
     head_dim_v = head_dim
     max_context_len = seq_len + 16
     max_total_tokens = num_requests * max_context_len
+
+    # Quantization params
+    k_scale = 0.01
+    v_scale = 0.01
 
     # Setup requests
     seq_lens = torch.tensor([seq_len] * num_requests, dtype=torch.int64, device=device)
@@ -173,6 +183,7 @@ def test_extend_attention_cpu(
     total_extend_len = extend_len * num_requests
 
     # Create tensors
+    # Query and Extend K/V are still in float/bf16
     q_extend = torch.randn(
         total_extend_len, num_heads, head_dim, dtype=dtype, device=device
     )
@@ -186,13 +197,23 @@ def test_extend_attention_cpu(
         total_extend_len, num_heads, head_dim_v, dtype=dtype, device=device
     )
 
-    # KV cache buffers
-    k_buffer = torch.randn(
-        max_total_tokens, num_heads, head_dim, dtype=dtype, device=device
+    # KV cache buffers (INT8)
+    # Generate float data first, then quantize
+    k_buffer_float = (
+        torch.randn(
+            max_total_tokens, num_heads, head_dim, dtype=torch.float32, device=device
+        )
+        * 5.0
     )
-    v_buffer = torch.randn(
-        max_total_tokens, num_heads, head_dim_v, dtype=dtype, device=device
+    v_buffer_float = (
+        torch.randn(
+            max_total_tokens, num_heads, head_dim_v, dtype=torch.float32, device=device
+        )
+        * 5.0
     )
+
+    k_buffer_int8 = (k_buffer_float / k_scale).round().clamp(-128, 127).to(torch.int8)
+    v_buffer_int8 = (v_buffer_float / v_scale).round().clamp(-128, 127).to(torch.int8)
 
     # Request to token mapping
     req_to_token = torch.zeros(
@@ -210,18 +231,17 @@ def test_extend_attention_cpu(
 
     sm_scale = 1.0 / (head_dim**0.5)
     logit_cap = 50.0
-    max_len_extend = (
-        extend_len  # Assuming max_len_extend is the max of extend_len in the batch
-    )
+    max_len_extend = extend_len
 
-    # Run Kernel
-    torch.ops.sgl_kernel.extend_attention_cpu(
+    # Run Kernel (INT8)
+    # Note: k_buffer and v_buffer are INT8, k_extend and v_extend are FP16/BF16
+    torch.ops.sgl_kernel.extend_attention_int8_cpu(
         q_extend,
         k_extend,
         v_extend,
         o_extend,
-        k_buffer,
-        v_buffer,
+        k_buffer_int8,
+        v_buffer_int8,
         req_to_token,
         req_pool_indices,
         seq_lens,
@@ -230,6 +250,8 @@ def test_extend_attention_cpu(
         max_len_extend,
         sm_scale,
         logit_cap,
+        k_scale,
+        v_scale,
     )
 
     # Run Reference
@@ -237,8 +259,8 @@ def test_extend_attention_cpu(
         q_extend,
         k_extend,
         v_extend,
-        k_buffer,
-        v_buffer,
+        k_buffer_int8,
+        v_buffer_int8,
         req_to_token,
         req_pool_indices,
         seq_lens,
@@ -246,10 +268,12 @@ def test_extend_attention_cpu(
         extend_start_loc,
         sm_scale,
         logit_cap,
+        k_scale,
+        v_scale,
     )
 
-    # Compare
-    torch.testing.assert_close(o_extend, ref_output, atol=1e-2, rtol=1e-2)
+    # Compare (looser tolerance for INT8)
+    torch.testing.assert_close(o_extend, ref_output, atol=1e-1, rtol=1e-1)
 
 
 if __name__ == "__main__":

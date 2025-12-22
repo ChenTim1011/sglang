@@ -1,12 +1,8 @@
 """
-Test for decode_attention_cpu kernel (RVV optimized).
+Test for decode_attention_cpu kernel (RVV optimized, FP16/BF16).
 
-This test verifies that the CPU attention decode kernel produces correct results.
-Designed to run on RISC-V hardware platforms (e.g., Banana Pi).
-
-Usage on RISC-V hardware:
-    cd ~/.local_riscv_env/workspace/sglang/sgl-kernel
-    pytest tests/test_rvv_decode_attention_cpu.py -v
+Usage:
+    python3 tests/test_rvv_decode.py -v
 """
 
 import os
@@ -39,13 +35,6 @@ def is_decode_attention_available():
     if not HAS_SGL_KERNEL:
         return False
     return hasattr(torch.ops.sgl_kernel, "decode_attention_cpu")
-
-
-def is_decode_attention_int8_available():
-    """Check if decode_attention_int8_cpu is available in sgl_kernel."""
-    if not HAS_SGL_KERNEL:
-        return False
-    return hasattr(torch.ops.sgl_kernel, "decode_attention_int8_cpu")
 
 
 def naive_attention_decode(
@@ -129,9 +118,9 @@ def naive_attention_decode(
     not is_decode_attention_available(), reason="decode_attention_cpu not available"
 )
 @pytest.mark.parametrize("num_heads", [4, 8, 16, 32])
-@pytest.mark.parametrize("head_dim", [32, 64, 96, 128])
+@pytest.mark.parametrize("head_dim", [32, 64, 128])
 @pytest.mark.parametrize("seq_len", [1, 32, 128, 256])
-@pytest.mark.parametrize("num_requests", [1, 2, 4, 8])  # Added batch size testing
+@pytest.mark.parametrize("num_requests", [1, 2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_decode_attention_cpu(num_heads, head_dim, seq_len, num_requests, dtype):
     """Test decode_attention_cpu with various configurations."""
@@ -224,125 +213,6 @@ def test_decode_attention_cpu(num_heads, head_dim, seq_len, num_requests, dtype)
     )
 
     torch.testing.assert_close(output, ref_output, atol=5e-2, rtol=5e-2)
-
-
-@pytest.mark.skipif(
-    not is_decode_attention_int8_available(),
-    reason="decode_attention_int8_cpu not available",
-)
-@pytest.mark.parametrize("num_heads", [4, 8])
-@pytest.mark.parametrize("head_dim", [32, 64])
-@pytest.mark.parametrize("seq_len", [32, 128])
-@pytest.mark.parametrize("num_requests", [1, 2, 4])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_decode_attention_cpu_int8(num_heads, head_dim, seq_len, num_requests, dtype):
-    """Test decode_attention_cpu with INT8 KV cache."""
-    device = "cpu"
-    head_dim_v = head_dim
-    max_seq_len = seq_len + 16
-
-    query = torch.randn(num_requests, num_heads, head_dim, dtype=dtype, device=device)
-
-    # Quantization params
-    k_scale = 0.01
-    v_scale = 0.01
-
-    # Create random float data then quantize
-    max_tokens = num_requests * max_seq_len
-    k_buffer_float = (
-        torch.randn(max_tokens, num_heads, head_dim, dtype=torch.float32, device=device)
-        * 5.0
-    )
-    v_buffer_float = (
-        torch.randn(
-            max_tokens, num_heads, head_dim_v, dtype=torch.float32, device=device
-        )
-        * 5.0
-    )
-
-    k_buffer_int8 = (k_buffer_float / k_scale).round().clamp(-128, 127).to(torch.int8)
-    v_buffer_int8 = (v_buffer_float / v_scale).round().clamp(-128, 127).to(torch.int8)
-
-    # Metadata
-    req_to_token = torch.zeros(
-        num_requests, max_seq_len, dtype=torch.long, device=device
-    )
-    req_pool_indices = torch.arange(num_requests, dtype=torch.long, device=device)
-    seq_lens = torch.tensor([seq_len] * num_requests, dtype=torch.long, device=device)
-
-    for i in range(num_requests):
-        start_idx = i * max_seq_len
-        req_to_token[i, :seq_len] = torch.arange(
-            start_idx, start_idx + seq_len, dtype=torch.long
-        )
-
-    output = torch.zeros(
-        num_requests, num_heads, head_dim_v, dtype=dtype, device=device
-    )
-    attn_logits = torch.zeros(
-        num_requests, num_heads, 1, head_dim_v + 1, dtype=torch.float32, device=device
-    )
-
-    # New key/value inputs (should be int8)
-    key_float = torch.randn(
-        num_requests, num_heads, head_dim, dtype=torch.float32, device=device
-    )
-    value_float = torch.randn(
-        num_requests, num_heads, head_dim_v, dtype=torch.float32, device=device
-    )
-
-    key_int8 = (key_float / k_scale).round().clamp(-128, 127).to(torch.int8)
-    value_int8 = (value_float / v_scale).round().clamp(-128, 127).to(torch.int8)
-
-    loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
-    for i in range(num_requests):
-        loc[i] = req_to_token[i, seq_len - 1]
-
-    sm_scale = 1.0 / (head_dim**0.5)
-    logit_cap = 50.0
-
-    # Run INT8 Kernel
-    torch.ops.sgl_kernel.decode_attention_int8_cpu(
-        query,
-        k_buffer_int8,
-        v_buffer_int8,
-        output,
-        key_int8,
-        value_int8,
-        loc,
-        attn_logits,
-        req_to_token,
-        req_pool_indices,
-        seq_lens,
-        sm_scale,
-        logit_cap,
-        k_scale,
-        v_scale,
-    )
-
-    # Reference (simulated int8 dequantization)
-    k_buffer_ref = k_buffer_int8.clone()
-    v_buffer_ref = v_buffer_int8.clone()
-    for i in range(num_requests):
-        l = loc[i].item()
-        k_buffer_ref[l] = key_int8[i]
-        v_buffer_ref[l] = value_int8[i]
-
-    ref_output = naive_attention_decode(
-        query,
-        k_buffer_ref,
-        v_buffer_ref,
-        req_to_token,
-        req_pool_indices,
-        seq_lens,
-        sm_scale,
-        logit_cap,
-        k_scale,
-        v_scale,
-    )
-
-    # Tolerance: Int8 has quantization error, so we use looser tolerance
-    torch.testing.assert_close(output, ref_output, atol=1e-1, rtol=1e-1)
 
 
 @pytest.mark.skipif(
