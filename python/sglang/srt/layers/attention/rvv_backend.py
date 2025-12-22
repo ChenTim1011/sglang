@@ -63,9 +63,6 @@ class RVVAttnBackend(AttentionBackend):
                 # Try to load RVV optimized kernels
                 has_decode = hasattr(torch.ops.sgl_kernel, "decode_attention_cpu")
                 has_extend = hasattr(torch.ops.sgl_kernel, "extend_attention_cpu")
-                has_prefill_cache = hasattr(
-                    torch.ops.sgl_kernel, "prefill_cache_kernel"
-                )
 
                 if has_decode:
                     self.decode_attention_fwd = (
@@ -93,10 +90,6 @@ class RVVAttnBackend(AttentionBackend):
                         "[RVV Backend] ⚠ Extend kernel not available, will use fallback",
                         flush=True,
                     )
-
-                if has_prefill_cache:
-                    self.prefill_cache_fwd = torch.ops.sgl_kernel.prefill_cache_kernel
-                    print("[RVV Backend] ✓ RVV prefill cache kernel loaded", flush=True)
 
             except (ImportError, AttributeError) as e:
                 print(
@@ -166,19 +159,6 @@ class RVVAttnBackend(AttentionBackend):
 
         return True
 
-    def _supports_rvv_prefill_cache(
-        self, layer: RadixAttention, forward_batch: ForwardBatch
-    ) -> bool:
-        """Check if RVV prefill cache kernel is available and supported."""
-        if not hasattr(self, "prefill_cache_fwd") or self.prefill_cache_fwd is None:
-            return False
-
-        # Same checks as extend
-        if not self._check_head_dim_alignment(layer.qk_head_dim, layer.v_head_dim):
-            return False
-
-        return True
-
     def get_backend_info(self) -> dict:
         """Get information about available RVV kernels."""
         return {
@@ -186,8 +166,6 @@ class RVVAttnBackend(AttentionBackend):
             "use_rvv_kernels": self.use_rvv_kernels,
             "has_decode": self.decode_attention_fwd is not None,
             "has_extend": self.extend_attention_fwd is not None,
-            "has_prefill_cache": hasattr(self, "prefill_cache_fwd")
-            and self.prefill_cache_fwd is not None,
         }
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -429,37 +407,8 @@ class RVVAttnBackend(AttentionBackend):
         # (extend kernel handles both prefix + new tokens efficiently)
         output = self.forward_extend(q, k, v, layer, forward_batch, save_kv_cache=False)
 
-        # 2. Optimized KV cache writing (if RVV prefill cache kernel available)
-        if (
-            save_kv_cache
-            and hasattr(self, "prefill_cache_fwd")
-            and self.prefill_cache_fwd is not None
-        ):
-            # Use RVV optimized cache store
-            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-
-            # Convert to FP16 if needed
-            if k.dtype not in (torch.float16, torch.bfloat16):
-                k = k.half()
-                v = v.half()
-            if k_buffer.dtype not in (torch.float16, torch.bfloat16):
-                k_buffer = k_buffer.half()
-                v_buffer = v_buffer.half()
-
-            self.prefill_cache_fwd(
-                k,
-                v,
-                k_buffer,
-                v_buffer,
-                forward_batch.req_to_token_pool.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.extend_start_loc,
-                forward_batch.extend_seq_lens,
-            )
-        elif save_kv_cache:
-            # Fallback: use standard set_kv_buffer
+        # 2. Write K/V to cache using standard set_kv_buffer
+        if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )

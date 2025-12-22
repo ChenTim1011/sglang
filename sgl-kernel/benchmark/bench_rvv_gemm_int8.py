@@ -70,9 +70,11 @@ ALL_CONFIGS = SMALL_CONFIGS if IS_CI else SMALL_CONFIGS + TINYLLAMA_CONFIGS
 def benchmark_function(
     fn: Callable, warmup: int = 3, repeat: int = 10
 ) -> tuple[float, float]:
+    # Warmup
     for _ in range(warmup):
         fn()
 
+    # Timed runs
     times = []
     for _ in range(repeat):
         start = time.perf_counter()

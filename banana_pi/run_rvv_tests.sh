@@ -14,13 +14,12 @@
 #   --gemm            Run only GEMM tests/benchmarks
 #   --decode          Run only decode attention tests/benchmarks
 #   --extend          Run only extend attention tests/benchmarks
-#   --prefill         Run only prefill attention tests/benchmarks
 #   --test-decode     Run only decode attention tests
 #   --bench-decode    Run only decode attention benchmarks
 #   --test-extend     Run only extend attention tests
 #   --bench-extend    Run only extend attention benchmarks
-#   --test-prefill    Run only prefill attention tests
-#   --bench-prefill   Run only prefill attention benchmarks
+#   --test-gemm       Run only GEMM tests
+#   --bench-gemm      Run only GEMM benchmarks
 #   --test-backend    Run only backend integration tests
 #   --quick           Run quick tests with fewer iterations
 #   --help            Show this help message
@@ -42,7 +41,6 @@ RUN_BENCHMARKS=true
 RUN_GEMM=true
 RUN_DECODE=true
 RUN_EXTEND=true
-RUN_PREFILL=true
 QUICK_MODE=false
 RUN_BACKEND=false
 
@@ -60,25 +58,16 @@ while [[ $# -gt 0 ]]; do
         --gemm)
             RUN_DECODE=false
             RUN_EXTEND=false
-            RUN_PREFILL=false
             shift
             ;;
         --decode)
             RUN_GEMM=false
             RUN_EXTEND=false
-            RUN_PREFILL=false
             shift
             ;;
         --extend)
             RUN_GEMM=false
             RUN_DECODE=false
-            RUN_PREFILL=false
-            shift
-            ;;
-        --prefill)
-            RUN_GEMM=false
-            RUN_DECODE=false
-            RUN_EXTEND=false
             shift
             ;;
         --test-decode)
@@ -86,7 +75,6 @@ while [[ $# -gt 0 ]]; do
             RUN_BENCHMARKS=false
             RUN_GEMM=false
             RUN_EXTEND=false
-            RUN_PREFILL=false
             RUN_DECODE=true
             shift
             ;;
@@ -95,7 +83,6 @@ while [[ $# -gt 0 ]]; do
             RUN_BENCHMARKS=true
             RUN_GEMM=false
             RUN_EXTEND=false
-            RUN_PREFILL=false
             RUN_DECODE=true
             shift
             ;;
@@ -104,7 +91,6 @@ while [[ $# -gt 0 ]]; do
             RUN_BENCHMARKS=false
             RUN_GEMM=false
             RUN_DECODE=false
-            RUN_PREFILL=false
             RUN_EXTEND=true
             shift
             ;;
@@ -113,26 +99,23 @@ while [[ $# -gt 0 ]]; do
             RUN_BENCHMARKS=true
             RUN_GEMM=false
             RUN_DECODE=false
-            RUN_PREFILL=false
             RUN_EXTEND=true
             shift
             ;;
-        --test-prefill)
+        --test-gemm)
             RUN_TESTS=true
             RUN_BENCHMARKS=false
-            RUN_GEMM=false
+            RUN_GEMM=true
             RUN_DECODE=false
             RUN_EXTEND=false
-            RUN_PREFILL=true
             shift
             ;;
-        --bench-prefill)
+        --bench-gemm)
             RUN_TESTS=false
             RUN_BENCHMARKS=true
-            RUN_GEMM=false
+            RUN_GEMM=true
             RUN_DECODE=false
             RUN_EXTEND=false
-            RUN_PREFILL=true
             shift
             ;;
         --test-backend)
@@ -142,7 +125,6 @@ while [[ $# -gt 0 ]]; do
             RUN_GEMM=false
             RUN_DECODE=false
             RUN_EXTEND=false
-            RUN_PREFILL=false
             RUN_BACKEND=true
             shift
             ;;
@@ -258,10 +240,6 @@ if [[ "$RUN_TESTS" == "true" ]]; then
         run_test "RVV Extend Attention (INT8)" "tests/test_rvv_extend_int8.py" || true
     fi
 
-    if [[ "$RUN_PREFILL" == "true" ]]; then
-        run_test "RVV Prefill Attention CPU" "tests/test_rvv_prefill_attention_cpu.py" || true
-    fi
-
     if [[ "$RUN_GEMM" == "true" ]]; then
         run_test "RVV GEMM (FP16/BF16)" "tests/test_rvv_gemm.py" || true
         run_test "RVV GEMM (INT8)" "tests/test_rvv_gemm_int8.py" || true
@@ -311,11 +289,6 @@ if [[ "$RUN_BENCHMARKS" == "true" ]]; then
                 "cd $BENCHMARK_DIR && python bench_rvv_extend.py $BENCH_ARGS"
             run_benchmark "RVV Extend Attention (INT8)" \
                 "cd $BENCHMARK_DIR && python bench_rvv_extend_int8.py $BENCH_ARGS"
-        fi
-
-        if [[ "$RUN_PREFILL" == "true" ]]; then
-            run_benchmark "RVV Prefill Attention" \
-                "cd $BENCHMARK_DIR && python bench_rvv_prefill_attention.py $BENCH_ARGS"
         fi
 
         if [[ "$RUN_GEMM" == "true" ]]; then
