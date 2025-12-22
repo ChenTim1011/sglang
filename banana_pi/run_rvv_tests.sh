@@ -263,7 +263,8 @@ if [[ "$RUN_TESTS" == "true" ]]; then
     fi
 
     if [[ "$RUN_GEMM" == "true" ]]; then
-        run_test "RVV GEMM" "tests/test_rvv_gemm.py" || true
+        run_test "RVV GEMM (FP16/BF16)" "tests/test_rvv_gemm.py" || true
+        run_test "RVV GEMM (INT8)" "tests/test_rvv_gemm_int8.py" || true
     fi
 
     # Run Backend Integration Tests (Python Layer)
@@ -318,8 +319,10 @@ if [[ "$RUN_BENCHMARKS" == "true" ]]; then
         fi
 
         if [[ "$RUN_GEMM" == "true" ]]; then
-            run_benchmark "RVV GEMM" \
+            run_benchmark "RVV GEMM (FP16/BF16)" \
                 "cd $BENCHMARK_DIR && python bench_rvv_gemm.py $BENCH_ARGS"
+            run_benchmark "RVV GEMM (INT8)" \
+                "cd $BENCHMARK_DIR && python bench_rvv_gemm_int8.py $BENCH_ARGS"
         fi
     fi
 fi

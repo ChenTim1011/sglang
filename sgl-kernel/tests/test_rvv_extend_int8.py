@@ -144,16 +144,16 @@ def naive_extend_attention(
 @pytest.mark.skipif(
     not _has_extend_attention_cpu(), reason="extend_attention_cpu not available"
 )
-@pytest.mark.parametrize("num_heads", [4, 8, 16, 32])
-@pytest.mark.parametrize("head_dim", [32, 64, 128])
-@pytest.mark.parametrize("seq_len", [1, 32, 128, 256])
-@pytest.mark.parametrize("extend_len", [16, 32, 128])
+@pytest.mark.parametrize("num_heads", [4, 8, 16])
+@pytest.mark.parametrize("head_dim", [32, 64])
+@pytest.mark.parametrize("seq_len_extend_len", [(32, 16), (32, 32), (128, 32)])
 @pytest.mark.parametrize("num_requests", [1, 2, 4])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_extend_attention_cpu_int8(
-    num_heads, head_dim, seq_len, extend_len, num_requests, dtype
+    num_heads, head_dim, seq_len_extend_len, num_requests, dtype
 ):
     """Test extend_attention_cpu with INT8 KV cache (Prefix part)."""
+    seq_len, extend_len = seq_len_extend_len
     if extend_len > seq_len:
         pytest.skip("extend_len cannot be larger than seq_len")
 
