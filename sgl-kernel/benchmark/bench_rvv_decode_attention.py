@@ -195,21 +195,23 @@ def create_mock_runner(num_heads, head_dim, v_head_dim, dtype=torch.float16):
     # Mock token_to_kv_pool
     mock_runner.token_to_kv_pool = Mock()
     # Return buffers large enough for testing
+
+    # NOTE: torch.randn for int8 is not supported directly.
+    # We must generate float first then convert.
+    def create_buffer(num_tokens, heads, hdim, dtype):
+        if dtype == torch.int8:
+            # Generate float, then quantize to int8 range
+            return (torch.randn(num_tokens, heads, hdim, dtype=torch.float32) * 50).to(
+                torch.int8
+            )
+        else:
+            return torch.randn(num_tokens, heads, hdim, dtype=dtype)
+
     mock_runner.token_to_kv_pool.get_key_buffer = Mock(
-        return_value=torch.randn(
-            10000,
-            num_heads,
-            head_dim,
-            dtype=dtype if dtype != torch.int8 else torch.int8,
-        )
+        return_value=create_buffer(10000, num_heads, head_dim, dtype)
     )
     mock_runner.token_to_kv_pool.get_value_buffer = Mock(
-        return_value=torch.randn(
-            10000,
-            num_heads,
-            v_head_dim,
-            dtype=dtype if dtype != torch.int8 else torch.int8,
-        )
+        return_value=create_buffer(10000, num_heads, v_head_dim, dtype)
     )
 
     return mock_runner
@@ -246,20 +248,23 @@ def create_mock_forward_batch(
 
     # Mock token_to_kv_pool
     mock_batch.token_to_kv_pool = Mock()
+
+    def create_buffer(num_tokens, heads, hdim, dtype):
+        if dtype == torch.int8:
+            return (torch.randn(num_tokens, heads, hdim, dtype=torch.float32) * 50).to(
+                torch.int8
+            )
+        else:
+            return torch.randn(num_tokens, heads, hdim, dtype=dtype)
+
     mock_batch.token_to_kv_pool.get_key_buffer = Mock(
-        return_value=torch.randn(
-            max_seq_len * num_requests + 100,
-            num_heads,
-            head_dim,
-            dtype=dtype if dtype != torch.int8 else torch.int8,
+        return_value=create_buffer(
+            max_seq_len * num_requests + 100, num_heads, head_dim, dtype
         )
     )
     mock_batch.token_to_kv_pool.get_value_buffer = Mock(
-        return_value=torch.randn(
-            max_seq_len * num_requests + 100,
-            num_heads,
-            v_head_dim,
-            dtype=dtype if dtype != torch.int8 else torch.int8,
+        return_value=create_buffer(
+            max_seq_len * num_requests + 100, num_heads, v_head_dim, dtype
         )
     )
     return mock_batch

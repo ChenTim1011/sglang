@@ -230,11 +230,11 @@ def test_decode_attention_cpu(num_heads, head_dim, seq_len, num_requests, dtype)
     not is_decode_attention_int8_available(),
     reason="decode_attention_int8_cpu not available",
 )
-@pytest.mark.parametrize("num_heads", [4])
-@pytest.mark.parametrize("head_dim", [64])
-@pytest.mark.parametrize("seq_len", [32])
-@pytest.mark.parametrize("num_requests", [1])
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("num_heads", [4, 8])
+@pytest.mark.parametrize("head_dim", [32, 64])
+@pytest.mark.parametrize("seq_len", [32, 128])
+@pytest.mark.parametrize("num_requests", [1, 2, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_decode_attention_cpu_int8(num_heads, head_dim, seq_len, num_requests, dtype):
     """Test decode_attention_cpu with INT8 KV cache."""
     device = "cpu"
