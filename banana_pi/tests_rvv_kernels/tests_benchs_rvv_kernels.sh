@@ -4,9 +4,10 @@
 # ==============================================================================
 #
 # This script runs all RVV kernel tests and benchmarks on Banana Pi.
+# It runs pytest tests and benchmarks from the sgl-kernel directory.
 #
 # Usage:
-#   ./run_rvv_tests.sh [options]
+#   ./tests_benchs_rvv_kernels.sh [options]
 #
 # Options:
 #   --test-only       Run only tests (skip benchmarks)

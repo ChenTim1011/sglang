@@ -332,20 +332,25 @@ def launch_server():
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Change to the script directory (where config_rvv.yaml should be)
+    # Change to the script directory
     os.chdir(script_dir)
     print(f"📁 Working directory: {script_dir}")
 
-    # Try config_rvv.yaml first, fallback to config.yaml
-    config_file = "config_rvv.yaml"
-    if not os.path.exists(config_file):
-        config_file = "config.yaml"
+    # Generate config file dynamically (same as benchmark_rvv_backends.py)
+    try:
+        from benchmark_rvv_backends import create_config_file
+
+        config_file = create_config_file("rvv", script_dir)
         if not os.path.exists(config_file):
             print(f"❌ Configuration file not found: {config_file}")
             print(f"   Expected in: {script_dir}")
             return False
+    except ImportError:
+        print("❌ Failed to import create_config_file from benchmark_rvv_backends")
+        print("   Please ensure benchmark_rvv_backends.py is in the same directory")
+        return False
 
-    print(f"📄 Using config file: {config_file}")
+    print(f"📄 Using config file: {os.path.basename(config_file)}")
 
     # Create log file for server output
     log_file = os.path.join(script_dir, "sglang_server.log")
@@ -376,9 +381,7 @@ def launch_server():
 
         # Ensure CPU binding is configured for TP workers
         if not env.get("SGLANG_CPU_OMP_THREADS_BIND"):
-            config_bind = get_cpu_threads_bind_from_config(
-                os.path.join(script_dir, config_file)
-            )
+            config_bind = get_cpu_threads_bind_from_config(config_file)
             if config_bind:
                 env["SGLANG_CPU_OMP_THREADS_BIND"] = config_bind
                 print(f"  ✓ Applying cpu-omp-threads-bind from config: {config_bind}")

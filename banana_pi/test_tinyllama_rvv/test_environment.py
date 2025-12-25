@@ -244,19 +244,27 @@ def test_imports():
 
 
 def test_config():
-    """Test configuration file"""
+    """Test configuration file generation"""
     print("\nTesting configuration...")
     try:
-        import yaml
+        import os
 
-        with open("config_rvv.yaml", "r") as f:
+        import yaml
+        from benchmark_rvv_backends import create_config_file
+
+        # Generate config file dynamically
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        config_file = create_config_file("rvv", script_dir)
+
+        with open(config_file, "r") as f:
             config = yaml.safe_load(f)
-        print("✓ config_rvv.yaml: valid")
+        print(f"✓ Generated config file: {os.path.basename(config_file)}")
         print(f"  Model: {config.get('model-path', 'N/A')}")
         print(f"  Device: {config.get('device', 'N/A')}")
+        print(f"  Backend: {config.get('attention-backend', 'N/A')}")
         return True
     except Exception as e:
-        print(f"✗ config_rvv.yaml: {e}")
+        print(f"✗ Config generation failed: {e}")
         return False
 
 

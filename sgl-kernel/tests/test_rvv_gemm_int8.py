@@ -80,7 +80,6 @@ def naive_int8_scaled_mm(
     # s2: [N] -> [1, N]
     out_scaled = out_f * scales1.unsqueeze(1) * scales2.unsqueeze(0)
 
-    # Add bias
     if bias is not None:
         out_scaled = out_scaled + bias.unsqueeze(0)
 
@@ -96,30 +95,21 @@ class TestGemmInt8Rvv:
     @pytest.mark.parametrize("K", [32, 128, 256])
     @pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32])
     def test_basic_correctness(self, M, N, K, out_dtype):
-        # Activation (uint8)
         mat1 = torch.randint(0, 255, (M, K), dtype=torch.uint8)
 
-        # Weight (int8)
         mat2 = torch.randint(-128, 127, (N, K), dtype=torch.int8)
 
-        # Scales
         scales1 = torch.rand(M, dtype=torch.float32) * 0.1
         scales2 = torch.rand(N, dtype=torch.float32) * 0.1
 
-        # Bias
         bias = torch.randn(N, dtype=torch.float32)
 
-        # Reference
         ref_out = naive_int8_scaled_mm(mat1, mat2, scales1, scales2, bias, out_dtype)
 
-        # RVV Kernel
-        # Signature: int8_scaled_mm_cpu(mat1, mat2, scales1, scales2, bias, out_dtype, is_vnni)
         rvv_out = torch.ops.sgl_kernel.int8_scaled_mm_cpu(
             mat1, mat2, scales1, scales2, bias, out_dtype, False
         )
 
-        # Allow some tolerance for float operations order
-        # But since logic is simple (int mul + float scale), should be quite close
         torch.testing.assert_close(rvv_out, ref_out, atol=1e-3, rtol=1e-3)
 
     @pytest.mark.parametrize("out_dtype", [torch.float16])
@@ -133,9 +123,7 @@ class TestGemmInt8Rvv:
         ]
 
         for M, N, K in configs:
-            mat1 = torch.randint(
-                0, 100, (M, K), dtype=torch.uint8
-            )  # Keep values smaller to avoid huge accumulators
+            mat1 = torch.randint(0, 100, (M, K), dtype=torch.uint8)
             mat2 = torch.randint(-50, 50, (N, K), dtype=torch.int8)
             scales1 = torch.rand(M, dtype=torch.float32) * 0.01
             scales2 = torch.rand(N, dtype=torch.float32) * 0.01

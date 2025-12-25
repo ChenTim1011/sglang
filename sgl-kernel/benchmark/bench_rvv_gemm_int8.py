@@ -6,6 +6,10 @@ used for W8A8 quantization against a PyTorch Float16 baseline (simulating dequan
 
 Usage:
     python benchmark/bench_rvv_gemm_int8.py
+
+Note:
+    - Packed format: weights are in [NB, K, BLOCK_N] layout for optimal memory access.
+      This provides better cache utilization compared to unpacked [N, K] format.
 """
 
 import argparse
@@ -68,7 +72,7 @@ ALL_CONFIGS = SMALL_CONFIGS if IS_CI else SMALL_CONFIGS + TINYLLAMA_CONFIGS
 
 
 def benchmark_function(
-    fn: Callable, warmup: int = 3, repeat: int = 10
+    fn: Callable, warmup: int = 5, repeat: int = 20
 ) -> tuple[float, float]:
     # Warmup
     for _ in range(warmup):
@@ -91,6 +95,19 @@ def benchmark_function(
 def run_benchmark(
     config: BenchmarkConfig, warmup: int = 5, repeat: int = 20
 ) -> BenchmarkResult:
+    """
+    Run benchmark for a single configuration.
+
+    Uses packed weight format (is_packed=True) which matches production use case.
+
+    Args:
+        config: Benchmark configuration
+        warmup: Number of warmup iterations
+        repeat: Number of timed iterations
+
+    Returns:
+        BenchmarkResult with timing data
+    """
     M, N, K = config.M, config.N, config.K
 
     # Inputs for INT8 Kernel
@@ -102,7 +119,6 @@ def run_benchmark(
     out_dtype = torch.float16
 
     # Inputs for PyTorch Baseline (Float16)
-    # We benchmark "dequantized" execution: inputs are FP16
     mat1_f16 = mat1.to(torch.float16)
     mat2_f16 = mat2.to(torch.float16)
     bias_f16 = bias.to(torch.float16)
@@ -119,18 +135,38 @@ def run_benchmark(
 
     if HAS_SGL_KERNEL and hasattr(torch.ops.sgl_kernel, "int8_scaled_mm_cpu"):
         try:
+            # Packed format: [NB, K, BLOCK_N] layout for optimal memory access
+            packed_mat2 = None
+            use_packed_format = False
+
+            if hasattr(torch.ops.sgl_kernel, "convert_weight_packed"):
+                try:
+                    # Pack the weight matrix for RVV optimized access pattern
+                    packed_mat2 = torch.ops.sgl_kernel.convert_weight_packed(mat2)
+                    use_packed_format = True
+                except Exception as e:
+                    print(
+                        f"Warning: Failed to pack weights: {e}, falling back to unpacked format"
+                    )
+                    use_packed_format = False
 
             def rvv_fn():
-                return torch.ops.sgl_kernel.int8_scaled_mm_cpu(
-                    mat1, mat2, scales1, scales2, bias, out_dtype, False
-                )
+                if use_packed_format and packed_mat2 is not None:
+                    # is_packed=True means weights are in packed format [NB, K, BLOCK_N]
+                    return torch.ops.sgl_kernel.int8_scaled_mm_cpu(
+                        mat1, packed_mat2, scales1, scales2, bias, out_dtype, True
+                    )
+                else:
+                    # is_packed=False means weights are in unpacked format [N, K] with strided access
+                    return torch.ops.sgl_kernel.int8_scaled_mm_cpu(
+                        mat1, mat2, scales1, scales2, bias, out_dtype, False
+                    )
 
             rvv_ms, rvv_std = benchmark_function(rvv_fn, warmup, repeat)
 
             # Simple correctness check
             # Note: Precision differences expected between INT8 and FP16
             rvv_out = rvv_fn()
-            # Just check shape and finite values
             correct = rvv_out.shape == (M, N) and torch.all(torch.isfinite(rvv_out))
 
             if rvv_ms > 0:
@@ -161,6 +197,7 @@ def main():
     print("=" * 60)
     print("RVV INT8 GEMM Benchmark (vs PyTorch FP16)")
     print("=" * 60)
+    print()
 
     results = []
     for config in ALL_CONFIGS:

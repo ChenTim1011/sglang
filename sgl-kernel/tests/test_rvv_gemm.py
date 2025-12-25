@@ -1,5 +1,5 @@
 """
-Unit Tests for RVV GEMM kernel (gemm_rvv.cpp).
+Unit Tests for RVV GEMM kernel.
 
 This module contains pytest-based tests for the RVV optimized GEMM
 implementation used in Linear layers (QKV projection, FFN).
@@ -8,9 +8,6 @@ Usage:
     # Run all tests
     pytest tests/test_rvv_gemm.py -v
 
-    # On RISC-V hardware (e.g., Banana Pi):
-    cd ~/.local_riscv_env/workspace/sglang/sgl-kernel
-    pytest tests/test_rvv_gemm.py -v
 """
 
 import platform

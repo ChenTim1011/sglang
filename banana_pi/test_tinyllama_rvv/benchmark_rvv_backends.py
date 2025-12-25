@@ -47,14 +47,29 @@ if _script_dir not in sys.path:
 # Try to import requests
 try:
     import requests
+
+    HAS_REQUESTS = True
 except ImportError:
+    HAS_REQUESTS = False
     print("Error: requests library not found. Please install it: pip install requests")
     sys.exit(1)
+
+# Try to import numpy for better statistics
+try:
+    import numpy as np
+
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    print("Warning: numpy not available, using basic statistics")
 
 # Try to import psutil for process management
 try:
     import psutil
+
+    HAS_PSUTIL = True
 except ImportError:
+    HAS_PSUTIL = False
     print("Error: psutil library not found. Please install it: pip install psutil")
     sys.exit(1)
 
@@ -84,9 +99,11 @@ class BenchmarkSummary:
     avg_ttft_ms: float
     min_ttft_ms: float
     max_ttft_ms: float
+    std_ttft_ms: float = 0.0
     avg_throughput_tps: float
     min_throughput_tps: float
     max_throughput_tps: float
+    std_throughput_tps: float = 0.0
     avg_total_time_ms: float
     avg_decode_latency_ms: float = 0.0
     avg_tokens_generated: float = 0.0
@@ -602,10 +619,28 @@ def run_benchmark_suite(
                 print(f"      Run {run_idx + 1}: FAILED - {result.error_msg}")
 
     # Calculate summary statistics
+    successful_results = [r for r in results if r.success]
+    if len(successful_results) == 0:
+        return BenchmarkSummary(
+            backend=backend,
+            num_runs=len(results),
+            avg_ttft_ms=0,
+            min_ttft_ms=0,
+            max_ttft_ms=0,
+            std_ttft_ms=0,
+            avg_throughput_tps=0,
+            min_throughput_tps=0,
+            max_throughput_tps=0,
+            std_throughput_tps=0,
+            avg_total_time_ms=0,
+            success_rate=0.0,
+            results=results,
+        )
+
     # User requested to exclude the first run from the average calculation if possible
-    stats_results = successful_results
-    if len(successful_results) > 1:
-        stats_results = successful_results[1:]
+    stats_results = (
+        successful_results[1:] if len(successful_results) > 1 else successful_results
+    )
 
     ttfts = [r.ttft_ms for r in stats_results]
     throughputs = [r.throughput_tps for r in stats_results if r.throughput_tps > 0]
@@ -615,20 +650,49 @@ def run_benchmark_suite(
     ]
     tokens_list = [r.tokens_generated for r in stats_results]
 
+    # Calculate statistics with numpy if available
+    if HAS_NUMPY:
+        avg_ttft = np.mean(ttfts) if ttfts else 0
+        min_ttft = np.min(ttfts) if ttfts else 0
+        max_ttft = np.max(ttfts) if ttfts else 0
+        std_ttft = np.std(ttfts) if len(ttfts) > 1 else 0
+        avg_throughput = np.mean(throughputs) if throughputs else 0
+        min_throughput = np.min(throughputs) if throughputs else 0
+        max_throughput = np.max(throughputs) if throughputs else 0
+        std_throughput = np.std(throughputs) if len(throughputs) > 1 else 0
+        avg_total_time = np.mean(total_times) if total_times else 0
+        avg_decode_latency = np.mean(decode_latencies) if decode_latencies else 0
+        avg_tokens = np.mean(tokens_list) if tokens_list else 0
+    else:
+        # Fallback to basic statistics
+        avg_ttft = sum(ttfts) / len(ttfts) if ttfts else 0
+        min_ttft = min(ttfts) if ttfts else 0
+        max_ttft = max(ttfts) if ttfts else 0
+        std_ttft = 0
+        avg_throughput = sum(throughputs) / len(throughputs) if throughputs else 0
+        min_throughput = min(throughputs) if throughputs else 0
+        max_throughput = max(throughputs) if throughputs else 0
+        std_throughput = 0
+        avg_total_time = sum(total_times) / len(total_times) if total_times else 0
+        avg_decode_latency = (
+            sum(decode_latencies) / len(decode_latencies) if decode_latencies else 0
+        )
+        avg_tokens = sum(tokens_list) / len(tokens_list) if tokens_list else 0
+
     return BenchmarkSummary(
         backend=backend,
         num_runs=len(results),
-        avg_ttft_ms=sum(ttfts) / len(ttfts) if ttfts else 0,
-        min_ttft_ms=min(ttfts) if ttfts else 0,
-        max_ttft_ms=max(ttfts) if ttfts else 0,
-        avg_throughput_tps=sum(throughputs) / len(throughputs) if throughputs else 0,
-        min_throughput_tps=min(throughputs) if throughputs else 0,
-        max_throughput_tps=max(throughputs) if throughputs else 0,
-        avg_total_time_ms=sum(total_times) / len(total_times) if total_times else 0,
-        avg_decode_latency_ms=(
-            sum(decode_latencies) / len(decode_latencies) if decode_latencies else 0
-        ),
-        avg_tokens_generated=sum(tokens_list) / len(tokens_list) if tokens_list else 0,
+        avg_ttft_ms=avg_ttft,
+        min_ttft_ms=min_ttft,
+        max_ttft_ms=max_ttft,
+        std_ttft_ms=std_ttft,
+        avg_throughput_tps=avg_throughput,
+        min_throughput_tps=min_throughput,
+        max_throughput_tps=max_throughput,
+        std_throughput_tps=std_throughput,
+        avg_total_time_ms=avg_total_time,
+        avg_decode_latency_ms=avg_decode_latency,
+        avg_tokens_generated=avg_tokens,
         success_rate=len(successful_results) / len(results) * 100,
         results=results,
     )

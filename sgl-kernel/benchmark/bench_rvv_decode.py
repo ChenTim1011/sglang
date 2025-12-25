@@ -204,7 +204,7 @@ def create_mock_forward_batch(
 # ============================================================================
 
 
-def run_single_backend(backend_name, config, num_iterations=100, warmup=10):
+def run_single_backend(backend_name, config, num_iterations=20, warmup=5):
     v_head_dim = config.head_dim
 
     mock_runner = create_mock_runner(

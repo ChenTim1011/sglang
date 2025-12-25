@@ -292,7 +292,7 @@ class RVVAttnBackendInt8(RVVAttnBackend):
             return super()._rvv_decode(q, k, v, layer, forward_batch, save_kv_cache)
 
 
-def run_single_backend(backend_name, config, num_iterations=100, warmup=10):
+def run_single_backend(backend_name, config, num_iterations=20, warmup=5):
     v_head_dim = config.head_dim
 
     # Use FP16 for torch native comparison even if benchmark is INT8

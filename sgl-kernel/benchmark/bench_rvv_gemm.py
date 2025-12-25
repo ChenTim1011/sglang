@@ -151,16 +151,12 @@ TINYLLAMA_CONFIGS = [
 # Batch decode configurations
 BATCH_DECODE_CONFIGS = [
     BenchmarkConfig(4, 2048, 2048, "TinyLlama QKV batch=4"),
-    BenchmarkConfig(8, 2048, 2048, "TinyLlama QKV batch=8"),
-    BenchmarkConfig(16, 2048, 2048, "TinyLlama QKV batch=16"),
     BenchmarkConfig(32, 2048, 2048, "TinyLlama QKV batch=32"),
 ]
 
 # Prefill configurations
 PREFILL_CONFIGS = [
-    BenchmarkConfig(32, 2048, 2048, "Prefill seq=32"),
     BenchmarkConfig(64, 2048, 2048, "Prefill seq=64"),
-    BenchmarkConfig(128, 2048, 2048, "Prefill seq=128"),
     BenchmarkConfig(256, 2048, 2048, "Prefill seq=256"),
 ]
 
@@ -186,7 +182,7 @@ else:
 
 
 def benchmark_function(
-    fn: Callable, warmup: int = 3, repeat: int = 10
+    fn: Callable, warmup: int = 5, repeat: int = 20
 ) -> tuple[float, float]:
     """
     Benchmark a function and return mean and std time in milliseconds.
@@ -219,7 +215,7 @@ def benchmark_function(
 
 
 def run_benchmark(
-    config: BenchmarkConfig, warmup: int = 3, repeat: int = 10
+    config: BenchmarkConfig, warmup: int = 5, repeat: int = 20
 ) -> BenchmarkResult:
     """
     Run benchmark for a single configuration.
@@ -341,8 +337,8 @@ def print_summary(results: list[BenchmarkResult]):
 def main():
     """Main benchmark entry point."""
     parser = argparse.ArgumentParser(description="Benchmark RVV GEMM kernel")
-    parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
-    parser.add_argument("--repeat", type=int, default=100, help="Timed iterations")
+    parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations")
+    parser.add_argument("--repeat", type=int, default=20, help="Timed iterations")
     parser.add_argument(
         "--quick", action="store_true", help="Run quick benchmark (CI mode)"
     )

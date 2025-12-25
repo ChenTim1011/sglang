@@ -1058,11 +1058,8 @@ fi
 log_step "Installing Python dependencies..."
 cd "$PROJECT_DIR"
 
-# Install from requirements.txt if exists
-if [ -f "banana_pi/test_tinyllama_rvv/requirements.txt" ]; then
-    log_info "Installing from requirements.txt..."
-    pip install -r "banana_pi/test_tinyllama_rvv/requirements.txt" --quiet || log_warn "Some packages failed to install"
-fi
+# Note: Dependencies are installed below via WHEEL_BUILDER_PACKAGES and OTHER_CORE_DEPS
+# The requirements.txt file is no longer needed as all dependencies are managed here
 
 # Install common packages that might be missing
 log_info "Installing common packages..."
@@ -1461,12 +1458,13 @@ else
     VERIFY_ERRORS=1
 fi
 
-# Check if config file exists
-CONFIG_FILE="banana_pi/test_tinyllama_rvv/config_rvv.yaml"
-if [ -f "$CONFIG_FILE" ]; then
-    log_info "✓ Config file found: $CONFIG_FILE"
+# Check if benchmark script exists (which generates config files dynamically)
+BENCHMARK_SCRIPT="banana_pi/test_tinyllama_rvv/benchmark_rvv_backends.py"
+if [ -f "$BENCHMARK_SCRIPT" ]; then
+    log_info "✓ Benchmark script found: $BENCHMARK_SCRIPT"
+    log_info "  (Config files are generated dynamically by the script)"
 else
-    log_warn "Config file not found: $CONFIG_FILE"
+    log_warn "Benchmark script not found: $BENCHMARK_SCRIPT"
     log_warn "  └─ Ensure repository includes banana_pi/test_tinyllama_rvv assets"
     VERIFY_ERRORS=1
 fi

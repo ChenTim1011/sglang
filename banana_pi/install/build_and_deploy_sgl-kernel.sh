@@ -13,6 +13,8 @@ set -euo pipefail
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Get banana_pi directory (parent of install/)
+BANANA_PI_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Load user-specific configuration if exists (for personal paths)
 # Users can create build_and_deploy_sgl-kernel.config.sh to set their own paths
@@ -607,7 +609,7 @@ download_pytorch_riscv_from_github() {
     local REPO_NAME="pllab-sglang"
     local RELEASE_TAG="${PYTORCH_RELEASE_TAG:-v1.1}"
     local ARCHIVE_FILE="pytorch-riscv.tar.gz"
-    local INSTALL_DIR="${SCRIPT_DIR}/riscv_pytorch"
+    local INSTALL_DIR="${BANANA_PI_DIR}/riscv_pytorch"
     local GITHUB_TOKEN_VAL="${GITHUB_TOKEN:-}"
     # Trim whitespace from token if provided
     GITHUB_TOKEN_VAL=$(echo "${GITHUB_TOKEN_VAL}" | tr -d '\n\r' | xargs)
@@ -960,7 +962,7 @@ detect_pytorch_cross_prefix() {
     local check_path
     # Priority: banana_pi/riscv_pytorch first, then environment variables, then other locations
     local candidates=(
-        "${SCRIPT_DIR}/riscv_pytorch"
+        "${BANANA_PI_DIR}/riscv_pytorch"
         "${TORCH_PY_PREFIX:-}"
         "${PYTORCH_CROSS_PREFIX:-}"
         "${HOME}/riscv_pytorch"
@@ -1051,7 +1053,7 @@ if [ -z "${SKIP_BUILD}" ]; then
     echo ""
 
     # Clear environment variables if they point to old locations (to prioritize banana_pi/riscv_pytorch)
-    if [ -n "${TORCH_PY_PREFIX:-}" ] && [ "${TORCH_PY_PREFIX}" != "${SCRIPT_DIR}/riscv_pytorch" ] && [ "${TORCH_PY_PREFIX}" != "${SCRIPT_DIR}/riscv_pytorch/torch" ]; then
+    if [ -n "${TORCH_PY_PREFIX:-}" ] && [ "${TORCH_PY_PREFIX}" != "${BANANA_PI_DIR}/riscv_pytorch" ] && [ "${TORCH_PY_PREFIX}" != "${BANANA_PI_DIR}/riscv_pytorch/torch" ]; then
         if [ ! -f "${TORCH_PY_PREFIX}/share/cmake/Torch/TorchConfig.cmake" ] && [ ! -f "${TORCH_PY_PREFIX}/torch/share/cmake/Torch/TorchConfig.cmake" ]; then
             # Old path doesn't exist, clear it to allow detection of banana_pi path
             unset TORCH_PY_PREFIX
@@ -1068,7 +1070,7 @@ if [ -z "${SKIP_BUILD}" ]; then
         echo "PyTorch RISC-V cross-compilation package is required for building sgl-kernel."
         echo ""
         echo "Searched locations:"
-        BANANA_PI_PYTORCH_DIR="$(cd "${SCRIPT_DIR}/riscv_pytorch" 2>/dev/null && pwd || echo "${SCRIPT_DIR}/riscv_pytorch")"
+        BANANA_PI_PYTORCH_DIR="$(cd "${BANANA_PI_DIR}/riscv_pytorch" 2>/dev/null && pwd || echo "${BANANA_PI_DIR}/riscv_pytorch")"
         echo "  - ${BANANA_PI_PYTORCH_DIR} (banana_pi directory, priority)"
         echo "  - ${HOME}/riscv_pytorch"
         echo "  - ${HOME}/pytorch-riscv-build/pytorch"
@@ -1085,8 +1087,8 @@ if [ -z "${SKIP_BUILD}" ]; then
         echo ""
         echo "Option 2: Manual installation"
         echo "  If you have a PyTorch RISC-V package archive locally:"
-        echo "    mkdir -p ${SCRIPT_DIR}/riscv_pytorch"
-        echo "    tar -xzf /path/to/pytorch-riscv.tar.gz -C ${SCRIPT_DIR}/riscv_pytorch"
+        echo "    mkdir -p ${BANANA_PI_DIR}/riscv_pytorch"
+        echo "    tar -xzf /path/to/pytorch-riscv.tar.gz -C ${BANANA_PI_DIR}/riscv_pytorch"
         echo "    # Then re-run this script"
         echo ""
         echo "Option 3: Set custom path"
@@ -1116,7 +1118,7 @@ if [ -z "${SKIP_BUILD}" ]; then
                             echo "✅ PyTorch RISC-V installed and detected: ${TORCH_PY_PREFIX}"
                         else
                             echo "❌ ERROR: PyTorch RISC-V was downloaded but not detected correctly."
-                            echo "   Please check the installation at ${SCRIPT_DIR}/riscv_pytorch"
+                            echo "   Please check the installation at ${BANANA_PI_DIR}/riscv_pytorch"
                             exit 1
                         fi
                     else
@@ -1152,7 +1154,7 @@ if [ -z "${SKIP_BUILD}" ]; then
                     echo "✅ PyTorch RISC-V installed and detected: ${TORCH_PY_PREFIX}"
                 else
                     echo "❌ ERROR: PyTorch RISC-V was downloaded but not detected correctly."
-                    echo "   Please check the installation at ${SCRIPT_DIR}/riscv_pytorch"
+                    echo "   Please check the installation at ${BANANA_PI_DIR}/riscv_pytorch"
                     exit 1
                 fi
             else
@@ -1317,21 +1319,24 @@ if [ -z "${SKIP_TRANSFER}" ]; then
     }
 
     echo "Syncing banana_pi tools to ${BANANA_PI_USER}@${BANANA_PI_HOST}:${REMOTE_BANANA_PI_DIR}..."
+    echo "Note: Excluding riscv_pytorch/ (only needed for cross-compilation on x86 host)"
     ssh_cmd "${BANANA_PI_USER}@${BANANA_PI_HOST}" "mkdir -p ${REMOTE_BANANA_PI_DIR}" || {
         echo "❌ ERROR: Failed to create remote directory ${REMOTE_BANANA_PI_DIR}"
         exit 1
     }
 
     if command -v rsync >/dev/null 2>&1; then
-        if ! rsync -a --delete -e "${SSH_BIN}" "${SCRIPT_DIR}/" "${BANANA_PI_USER}@${BANANA_PI_HOST}:${REMOTE_BANANA_PI_DIR}/"; then
-            rsync -a --delete -e "env LD_LIBRARY_PATH= ${SSH_BIN}" "${SCRIPT_DIR}/" "${BANANA_PI_USER}@${BANANA_PI_HOST}:${REMOTE_BANANA_PI_DIR}/" || {
+        # Exclude riscv_pytorch/ - it's only needed for cross-compilation, not on Banana Pi
+        if ! rsync -a --delete --exclude='riscv_pytorch' -e "${SSH_BIN}" "${BANANA_PI_DIR}/" "${BANANA_PI_USER}@${BANANA_PI_HOST}:${REMOTE_BANANA_PI_DIR}/"; then
+            rsync -a --delete --exclude='riscv_pytorch' -e "env LD_LIBRARY_PATH= ${SSH_BIN}" "${BANANA_PI_DIR}/" "${BANANA_PI_USER}@${BANANA_PI_HOST}:${REMOTE_BANANA_PI_DIR}/" || {
                 echo "❌ ERROR: Failed to sync banana_pi directory via rsync"
                 exit 1
             }
         fi
     else
-        if ! tar -C "${SCRIPT_DIR}" -cf - . | "${SSH_BIN}" "${BANANA_PI_USER}@${BANANA_PI_HOST}" "tar -C ${REMOTE_BANANA_PI_DIR} -xf -"; then
-            tar -C "${SCRIPT_DIR}" -cf - . | env LD_LIBRARY_PATH= "${SSH_BIN}" "${BANANA_PI_USER}@${BANANA_PI_HOST}" "tar -C ${REMOTE_BANANA_PI_DIR} -xf -" || {
+        # For tar, we need to exclude riscv_pytorch directory
+        if ! tar -C "${BANANA_PI_DIR}" --exclude='riscv_pytorch' -cf - . | "${SSH_BIN}" "${BANANA_PI_USER}@${BANANA_PI_HOST}" "tar -C ${REMOTE_BANANA_PI_DIR} -xf -"; then
+            tar -C "${BANANA_PI_DIR}" --exclude='riscv_pytorch' -cf - . | env LD_LIBRARY_PATH= "${SSH_BIN}" "${BANANA_PI_USER}@${BANANA_PI_HOST}" "tar -C ${REMOTE_BANANA_PI_DIR} -xf -" || {
                 echo "❌ ERROR: Failed to sync banana_pi directory via tar"
                 exit 1
             }
