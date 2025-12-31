@@ -1003,6 +1003,13 @@ void extend_attention_int8_cpu(
     double logit_cap,
     double k_scale,
     double v_scale) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_extend);
+  CHECK_INPUT(o_extend);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_extend);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_extend);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
+
   int num_seqs = seq_lens.size(0);
   int max_num_reqs = req_to_token.size(0);
   int max_context_len = req_to_token.size(1);
@@ -1025,10 +1032,45 @@ void extend_attention_int8_cpu(
   int v_strideN = v_buffer.stride(0);
   int v_strideH = v_buffer.stride(1);
 
+  CHECK_EQ(req_pool_indices.size(0), num_seqs);
+  CHECK_EQ(extend_seq_lens.size(0), num_seqs);
+  CHECK_EQ(extend_start_loc.size(0), num_seqs);
+  CHECK_EQ(v_extend.size(1), num_heads_kv);
+  CHECK_EQ(k_buffer.size(1), v_buffer.size(1));
+
   bool is_prefix_skipped = k_buffer.size(1) != num_heads_kv;
 
-  // We assume k_buffer is INT8 if this function is called
+  // check index data types
   const auto index_dtype = req_to_token.scalar_type();
+  TORCH_CHECK(
+      index_dtype == at::kInt || index_dtype == at::kLong,
+      "extend_int8: expect req_to_token to be int32 or int64, got ",
+      index_dtype);
+  TORCH_CHECK(
+      seq_lens.scalar_type() == at::kLong, "extend_int8: expect seq_lens to be int64, got ", seq_lens.scalar_type());
+  TORCH_CHECK(
+      req_pool_indices.scalar_type() == at::kLong,
+      "extend_int8: expect req_pool_indices to be int64, got ",
+      req_pool_indices.scalar_type());
+  TORCH_CHECK(
+      extend_seq_lens.scalar_type() == index_dtype && extend_start_loc.scalar_type() == index_dtype,
+      "extend_int8: expect extend_seq_lens and extend_start_loc to have same dtype as req_to_token.");
+
+  // Validate extend_len <= seq_len for each sequence
+  for (int i = 0; i < num_seqs; ++i) {
+    int64_t seq_len = seq_lens[i].item<int64_t>();
+    int64_t extend_len = extend_seq_lens[i].item<int64_t>();
+    TORCH_CHECK(
+        extend_len <= seq_len,
+        "extend_int8: extend_len (",
+        extend_len,
+        ") must be <= seq_len (",
+        seq_len,
+        ") for sequence ",
+        i);
+    TORCH_CHECK(extend_len >= 0, "extend_int8: extend_len (", extend_len, ") must be >= 0 for sequence ", i);
+    TORCH_CHECK(seq_len >= 0, "extend_int8: seq_len (", seq_len, ") must be >= 0 for sequence ", i);
+  }
 
   // Validate types for INT8 mode
   TORCH_CHECK(
