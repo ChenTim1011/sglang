@@ -40,6 +40,10 @@ class RVVAttnBackend(AttentionBackend):
         self.use_rvv_kernels = False
         self.decode_attention_fwd = None
         self.extend_attention_fwd = None
+        self.decode_attention_fwd_int8 = None
+        self.extend_attention_fwd_int8 = None
+        self.vlenb = None  # VLEN in bytes
+        self.vlen = None  # VLEN in bits
 
         # Create fallback backend (torch_native)
         self.fallback_backend = TorchNativeAttnBackend(model_runner)
@@ -63,6 +67,29 @@ class RVVAttnBackend(AttentionBackend):
                 # Try to load RVV optimized kernels
                 has_decode = hasattr(torch.ops.sgl_kernel, "decode_attention_cpu")
                 has_extend = hasattr(torch.ops.sgl_kernel, "extend_attention_cpu")
+                has_decode_int8 = hasattr(
+                    torch.ops.sgl_kernel, "decode_attention_int8_cpu"
+                )
+                has_extend_int8 = hasattr(
+                    torch.ops.sgl_kernel, "extend_attention_int8_cpu"
+                )
+
+                # Query VLEN if available
+                if hasattr(torch.ops.sgl_kernel, "get_rvv_vlenb"):
+                    try:
+                        self.vlenb = torch.ops.sgl_kernel.get_rvv_vlenb()
+                        self.vlen = torch.ops.sgl_kernel.get_rvv_vlen()
+                        print(
+                            f"[RVV Backend] ✓ VLEN detected: {self.vlen} bits ({self.vlenb} bytes)",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(
+                            f"[RVV Backend] ⚠ Failed to query VLEN: {e}, using default alignment (16 bytes)",
+                            flush=True,
+                        )
+                        self.vlenb = 16  # Default fallback
+                        self.vlen = 128  # Default fallback (128 bits = 16 bytes)
 
                 if has_decode:
                     self.decode_attention_fwd = (
@@ -80,6 +107,15 @@ class RVVAttnBackend(AttentionBackend):
                         0
                     ).shape[-1]
 
+                # Load INT8 kernels if available
+                if has_decode_int8:
+                    self.decode_attention_fwd_int8 = (
+                        torch.ops.sgl_kernel.decode_attention_int8_cpu
+                    )
+                    print("[RVV Backend] ✓ RVV decode INT8 kernel loaded", flush=True)
+                else:
+                    self.decode_attention_fwd_int8 = None
+
                 if has_extend:
                     self.extend_attention_fwd = (
                         torch.ops.sgl_kernel.extend_attention_cpu
@@ -90,6 +126,14 @@ class RVVAttnBackend(AttentionBackend):
                         "[RVV Backend] ⚠ Extend kernel not available, will use fallback",
                         flush=True,
                     )
+
+                if has_extend_int8:
+                    self.extend_attention_fwd_int8 = (
+                        torch.ops.sgl_kernel.extend_attention_int8_cpu
+                    )
+                    print("[RVV Backend] ✓ RVV extend INT8 kernel loaded", flush=True)
+                else:
+                    self.extend_attention_fwd_int8 = None
 
             except (ImportError, AttributeError) as e:
                 print(
@@ -104,8 +148,32 @@ class RVVAttnBackend(AttentionBackend):
             )
 
     def _check_head_dim_alignment(self, qk_head_dim: int, v_head_dim: int) -> bool:
-        """Check if head dimensions are aligned for RVV kernel."""
-        return qk_head_dim % 16 == 0 and v_head_dim % 16 == 0
+        """
+        Check if head dimensions are aligned for RVV kernel.
+
+        For FP16/BF16: Check alignment to VLEN (in bytes)
+        For INT8: Check alignment to VLEN (in bytes) as well
+
+        Args:
+            qk_head_dim: Query/Key head dimension (in elements)
+            v_head_dim: Value head dimension (in elements)
+
+        Returns:
+            True if both dimensions are aligned to VLEN
+        """
+        if not self.is_riscv or self.vlenb is None:
+            # Fallback to 16-byte alignment check if VLEN is not available
+            return qk_head_dim % 16 == 0 and v_head_dim % 16 == 0
+
+        # Check alignment for FP16/BF16 (2 bytes per element)
+        # For FP16/BF16: head_dim * 2 bytes should be aligned to vlenb
+        qk_head_dim_bytes = qk_head_dim * 2
+        v_head_dim_bytes = v_head_dim * 2
+
+        qk_aligned = (qk_head_dim_bytes % self.vlenb) == 0
+        v_aligned = (v_head_dim_bytes % self.vlenb) == 0
+
+        return qk_aligned and v_aligned
 
     def _supports_rvv_decode(
         self, layer: RadixAttention, forward_batch: ForwardBatch
@@ -166,6 +234,8 @@ class RVVAttnBackend(AttentionBackend):
             "use_rvv_kernels": self.use_rvv_kernels,
             "has_decode": self.decode_attention_fwd is not None,
             "has_extend": self.extend_attention_fwd is not None,
+            "has_decode_int8": self.decode_attention_fwd_int8 is not None,
+            "has_extend_int8": self.extend_attention_fwd_int8 is not None,
         }
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -232,7 +302,25 @@ class RVVAttnBackend(AttentionBackend):
         to float32 for computation. Tensors are converted to float16 if needed
         (e.g., when Linear outputs float32 on CPU).
         Only attn_logits must be Float32 (checked by kernel via CHECK_EQ).
+
+        For INT8 KV cache, automatically selects INT8 kernel if available.
         """
+        # Get KV buffers to check dtype
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        # Check if KV cache is INT8
+        is_int8_kv = (
+            k_buffer.dtype in (torch.int8, torch.uint8)
+            and v_buffer.dtype in (torch.int8, torch.uint8)
+            and self.decode_attention_fwd_int8 is not None
+        )
+
+        if is_int8_kv:
+            # Use INT8 kernel
+            return self._rvv_decode_int8(q, k, v, layer, forward_batch, save_kv_cache)
+
+        # Use standard FP16/BF16 kernel
         # Convert to float16 if needed - RVV kernel only supports Half/BFloat16
         # Note: Transformers Linear on CPU outputs Float32 even with Float16 weights
         if q.dtype not in (torch.float16, torch.bfloat16):
@@ -254,10 +342,6 @@ class RVVAttnBackend(AttentionBackend):
             )
         else:
             o = torch.empty_like(q_reshaped)
-
-        # Get KV buffers - convert to float16 if needed
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
         # Convert KV buffers to float16 if needed (matching q, k, v dtype)
         if k_buffer.dtype not in (torch.float16, torch.bfloat16):
@@ -281,6 +365,74 @@ class RVVAttnBackend(AttentionBackend):
             forward_batch.seq_lens,
             layer.scaling,
             layer.logit_cap,
+        )
+
+        return o
+
+    def _rvv_decode_int8(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+    ):
+        """RVV optimized decode using INT8 kernel for INT8 KV cache."""
+        # Convert to float16 if needed - RVV kernel only supports Half/BFloat16
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            q = q.half()
+            k = k.half()
+            v = v.half()
+
+        attn_logits, _ = self.forward_metadata
+
+        q_reshaped = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+
+        if layer.qk_head_dim != layer.v_head_dim:
+            o = torch.empty(
+                (q_reshaped.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                dtype=q.dtype,
+                device=q.device,
+            )
+        else:
+            o = torch.empty_like(q_reshaped)
+
+        # Get INT8 KV buffers
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        # Get scale factors from layer (default to 1.0 if not available)
+        k_scale = getattr(layer, "k_scale_float", None) or getattr(
+            layer, "k_scale", torch.tensor(1.0)
+        )
+        v_scale = getattr(layer, "v_scale_float", None) or getattr(
+            layer, "v_scale", torch.tensor(1.0)
+        )
+
+        # Convert to float if they are tensors
+        if isinstance(k_scale, torch.Tensor):
+            k_scale = k_scale.item()
+        if isinstance(v_scale, torch.Tensor):
+            v_scale = v_scale.item()
+
+        # Call RVV INT8 optimized kernel
+        self.decode_attention_fwd_int8(
+            q_reshaped.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k_buffer,
+            v_buffer,
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            k,
+            v,
+            forward_batch.out_cache_loc,
+            attn_logits,
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            layer.scaling,
+            layer.logit_cap,
+            float(k_scale),
+            float(v_scale),
         )
 
         return o
@@ -322,7 +474,25 @@ class RVVAttnBackend(AttentionBackend):
         Note: All kernels (decode, extend, gemm) use AT_DISPATCH_REDUCED_FLOATING_TYPES
         which only supports Half and BFloat16. The RVV Zvfh extension handles FP16 natively.
         Tensors are converted to float16 if needed (e.g., when Linear outputs float32 on CPU).
+
+        For INT8 KV cache, automatically selects INT8 kernel if available.
         """
+        # Get KV buffers to check dtype
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        # Check if KV cache is INT8
+        is_int8_kv = (
+            k_buffer.dtype in (torch.int8, torch.uint8)
+            and v_buffer.dtype in (torch.int8, torch.uint8)
+            and self.extend_attention_fwd_int8 is not None
+        )
+
+        if is_int8_kv:
+            # Use INT8 kernel
+            return self._rvv_extend_int8(q, k, v, layer, forward_batch, save_kv_cache)
+
+        # Use standard FP16/BF16 kernel
         # Convert to float16 if needed - RVV kernel only supports Half/BFloat16
         # Note: Transformers Linear on CPU outputs Float32 even with Float16 weights
         if q.dtype not in (torch.float16, torch.bfloat16):
@@ -359,10 +529,6 @@ class RVVAttnBackend(AttentionBackend):
         seq_lens = forward_batch.seq_lens.to(torch.int64)
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
 
-        # Get KV buffers - convert to float16 if needed
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-
         # Convert KV buffers to float16 if needed (matching q, k, v dtype)
         if k_buffer.dtype not in (torch.float16, torch.bfloat16):
             k_buffer = k_buffer.half()
@@ -387,33 +553,85 @@ class RVVAttnBackend(AttentionBackend):
 
         return o
 
-    def forward_prefill(
+    def _rvv_extend_int8(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        q,
+        k,
+        v,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
-        **kwargs,
+        save_kv_cache=True,
     ):
-        """Forward prefill with optimized KV cache writing.
+        """RVV optimized extend using INT8 kernel for INT8 KV cache."""
+        # Convert to float16 if needed - RVV kernel only supports Half/BFloat16
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            q = q.half()
+            k = k.half()
+            v = v.half()
 
-        Prefill phase:
-        1. Compute attention output (use extend kernel)
-        2. Write K/V to cache (use prefill_cache kernel if available)
-        """
-        # 1. Compute attention output using extend kernel
-        # (extend kernel handles both prefix + new tokens efficiently)
-        output = self.forward_extend(q, k, v, layer, forward_batch, save_kv_cache=False)
+        # Keep original dtype - kernel expects Half or BFloat16
+        if layer.qk_head_dim != layer.v_head_dim:
+            o = torch.empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                dtype=q.dtype,
+                device=q.device,
+            )
+        else:
+            o = torch.empty_like(q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim))
 
-        # 2. Write K/V to cache using standard set_kv_buffer
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        return output
+        _, max_extend_len = self.forward_metadata
+
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        index_dtype = req_to_token.dtype
+        extend_seq_lens = forward_batch.extend_seq_lens.to(index_dtype)
+        extend_start_loc = forward_batch.extend_start_loc.to(index_dtype)
+        seq_lens = forward_batch.seq_lens.to(torch.int64)
+        req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
+
+        # Get INT8 KV buffers
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        # Get scale factors from layer (default to 1.0 if not available)
+        k_scale = getattr(layer, "k_scale_float", None) or getattr(
+            layer, "k_scale", torch.tensor(1.0)
+        )
+        v_scale = getattr(layer, "v_scale_float", None) or getattr(
+            layer, "v_scale", torch.tensor(1.0)
+        )
+
+        # Convert to float if they are tensors
+        if isinstance(k_scale, torch.Tensor):
+            k_scale = k_scale.item()
+        if isinstance(v_scale, torch.Tensor):
+            v_scale = v_scale.item()
+
+        # Call RVV INT8 optimized kernel
+        self.extend_attention_fwd_int8(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k,
+            v,
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            k_buffer,
+            v_buffer,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
+            max_extend_len,
+            layer.scaling,
+            layer.logit_cap,
+            float(k_scale),
+            float(v_scale),
+        )
+
+        return o
 
     def support_triton(self):
         """RVV backend does not support Triton."""

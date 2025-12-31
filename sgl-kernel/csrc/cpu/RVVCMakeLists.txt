@@ -121,6 +121,7 @@ include_directories(
     ${TORCH_INSTALL_PREFIX}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../../csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For rvv/ subdirectory to find common.h, vec.h, etc.
 )
 
 # Python include directories for cross-compilation
@@ -175,11 +176,19 @@ endif()
 # =============================================================================
 # Source Files
 # =============================================================================
+# Get all cpp files in current directory
 file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 # Exclude shm.cpp - it contains x86-specific intrinsics (immintrin.h)
 list(FILTER SOURCES EXCLUDE REGEX ".*shm\\.cpp$")
 message(STATUS "Excluding shm.cpp (contains x86-specific intrinsics)")
+
+# Include RVV-specific source files from rvv/ subdirectory
+file(GLOB_RECURSE RVV_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/rvv/*.cpp")
+if(RVV_SOURCES)
+    list(APPEND SOURCES ${RVV_SOURCES})
+    message(STATUS "Including RVV-specific sources: ${RVV_SOURCES}")
+endif()
 
 # Define macro to indicate SHM collectives are not available on RISC-V
 add_compile_definitions(SGLANG_RISCV_NO_SHM_COLLECTIVES)

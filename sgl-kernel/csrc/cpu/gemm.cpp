@@ -4,7 +4,7 @@
 #include "vec.h"
 
 #if defined(CPU_CAPABILITY_RVV)
-#include "gemm_rvv.h"
+#include "rvv/gemm.h"
 #endif
 
 namespace {
@@ -421,6 +421,7 @@ void tinygemm_kernel(
   // TODO : add intrinsic path
 }
 
+#ifndef CPU_CAPABILITY_RVV
 template <typename scalar_t>
 void weight_packed_linear_kernel_impl(
     scalar_t* __restrict__ out,
@@ -604,9 +605,11 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   const int64_t OC = ndim == 3 ? weight.size(1) : weight.size(0);
   const int64_t IC = ndim == 3 ? weight.size(2) : weight.size(1);
 
+#if !defined(CPU_CAPABILITY_RVV)
   // we handle 2 TILE_N at a time.
   TORCH_CHECK(OC % TILE_N == 0, "invalid weight out features ", OC);
   TORCH_CHECK(IC % TILE_K == 0, "invalid weight input features ", IC);
+#endif
 
   constexpr int64_t BLOCK_N = block_size_n();
   const int64_t NB = div_up(OC, BLOCK_N);
@@ -620,6 +623,27 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
       "expect weight to be bfloat16, float16, int8 or fp8_e4m3.");
 
   CPU_DISPATCH_PACKED_TYPES(st, [&] {
+#if defined(CPU_CAPABILITY_RVV)
+    // RVV Packing: [NB, K, BLOCK_N]
+    // BLOCK_N_RVV must match the block size used in gemm_rvv.cpp (64)
+    constexpr int64_t BLOCK_N_RVV = 64;
+    const int64_t NB = div_up(OC, BLOCK_N_RVV);
+    const int64_t packed_size_per_expert = NB * IC * BLOCK_N_RVV;
+
+    // Resize packed_weight to ensure enough space for padded weights
+    packed_weight.resize_({E * packed_size_per_expert});
+
+    packed_t* packed_data = packed_weight.data_ptr<packed_t>();
+    const packed_t* w_data = weight.data_ptr<packed_t>();
+
+    // We iterate over Experts E
+    int64_t stride_input = OC * IC;
+    int64_t stride_packed = packed_size_per_expert;
+
+    for (int64_t e = 0; e < E; ++e) {
+      pack_weight_rvv<packed_t>(packed_data + e * stride_packed, w_data + e * stride_input, OC, IC);
+    }
+#else
     // adjust most inner dimension size
     const int packed_row_size = get_row_size<packed_t>(IC);
     auto sizes = weight.sizes().vec();
@@ -646,6 +670,7 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
         data_index_step(e, E, nb, NB);
       }
     });
+#endif
   });
   return packed_weight;
 }

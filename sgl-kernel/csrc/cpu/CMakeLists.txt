@@ -42,17 +42,60 @@ endif()
 # Add system Python include directories (fallback)
 include_directories(${Python_INCLUDE_DIRS})
 
-# Platform-specific library directory
+# Python include directories - handle cross-compilation
+if(CMAKE_SYSROOT)
+    # For cross-compilation, prefer sysroot Python headers
+    if(EXISTS "${CMAKE_SYSROOT}/usr/include/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}")
+        include_directories("${CMAKE_SYSROOT}/usr/include/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}")
+        message(STATUS "Using Python headers from sysroot: ${CMAKE_SYSROOT}/usr/include/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}")
+    endif()
+    # Also add sysroot usr/include for general headers
+    if(EXISTS "${CMAKE_SYSROOT}/usr/include")
+        include_directories("${CMAKE_SYSROOT}/usr/include")
+    endif()
+endif()
+
+# Add system Python include directories (fallback)
+include_directories(${Python_INCLUDE_DIRS})
+
+# Platform-specific source and library directory
+set(MY_ARCH_DIR "")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(PLAT_LIB_DIR "/usr/lib/x86_64-linux-gnu")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(MY_ARCH_DIR "x86_64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(PLAT_LIB_DIR "/usr/lib/aarch64-linux-gnu")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le|ppc64")
+    set(MY_ARCH_DIR "aarch64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le|ppc64")
     set(PLAT_LIB_DIR "/usr/lib/powerpc64le-linux-gnu")
+    set(MY_ARCH_DIR "ppc64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64|riscv32")
+    set(PLAT_LIB_DIR "/usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu")
+    # Check if RVV is supported (Clang 19+)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        execute_process(
+            COMMAND ${CMAKE_CXX_COMPILER} --version
+            OUTPUT_VARIABLE CLANG_VERSION_OUTPUT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        string(REGEX MATCH "clang version ([0-9]+)" _ "${CLANG_VERSION_OUTPUT}")
+        if(CMAKE_MATCH_1)
+            set(CLANG_MAJOR_VERSION "${CMAKE_MATCH_1}")
+            if(CLANG_MAJOR_VERSION GREATER_EQUAL 19)
+                add_compile_definitions(CPU_CAPABILITY_RVV)
+                set(MY_ARCH_DIR "rvv")
+            endif()
+        endif()
+    endif()
 else()
     set(PLAT_LIB_DIR "/usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu")
 endif()
 link_directories(${PLAT_LIB_DIR})
+if(MY_ARCH_DIR)
+    file(GLOB_RECURSE ARCH_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/${MY_ARCH_DIR}/*.cpp")
+    list(APPEND SOURCES ${ARCH_SOURCES})
+endif()
 
 # Conda library path support
 if(DEFINED ENV{CONDA_PREFIX})
@@ -98,15 +141,12 @@ else()
     endif()
 endif()
 
-file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
-# Exclude shm.cpp for RISC-V or when cross-compiling with --target flag
-# shm.cpp contains x86-specific intrinsics (immintrin.h) that are not available on RISC-V
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64|RISCV" OR CMAKE_CXX_FLAGS MATCHES "--target=riscv64")
-    list(FILTER SOURCES EXCLUDE REGEX ".*shm\\.cpp$")
-    message(STATUS "Excluding shm.cpp (contains x86-specific intrinsics)")
-    # Define macro to indicate SHM collectives are not available
-    add_compile_definitions(SGLANG_RISCV_NO_SHM_COLLECTIVES)
-endif()
+# Build all cpp files in current and sub dirs
+file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+
+# Exclude all arch dependent files, then add back only files for this arch
+set(ARCH_DIRS "x86_64|aarch64|ppc64|rvv")
+list(FILTER SOURCES EXCLUDE REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/(${ARCH_DIRS})/")
 
 if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
     set(ENV{SGLANG_CPU_FP8_CVT_FTZ} "1")

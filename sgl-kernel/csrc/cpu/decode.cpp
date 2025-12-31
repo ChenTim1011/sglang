@@ -2,12 +2,9 @@
 #include "gemm.h"
 #include "vec.h"
 
-// Include RVV specific helper functions
-#if defined(CPU_CAPABILITY_RVV)
-#include "decode_rvv.cpp"
-#define decode_attention_kernel_dispatch decode_attention_kernel_rvv
-#else
+#ifndef CPU_CAPABILITY_RVV
 #define decode_attention_kernel_dispatch decode_attention_kernel_impl
+#define decode_attention_grouped_kernel_dispatch decode_attention_grouped_kernel_impl
 #endif
 
 namespace {
@@ -1547,6 +1544,7 @@ void decode_attention_grouped_kernel_impl(
 // req_pool_indices: [num_seqs] int64
 // seq_lens:         [num_seqs] int64
 //
+#ifndef CPU_CAPABILITY_RVV
 void decode_attention_cpu(
     at::Tensor& query,
     at::Tensor& k_buffer,
@@ -1630,11 +1628,7 @@ void decode_attention_cpu(
   const bool is_mla = (k_buffer_data == v_buffer_data) && (num_heads_kv == 1) && (head_size == head_size_v + 64);
 
   // block length for k_buffer and v_buffer
-#ifdef CPU_CAPABILITY_RVV
-  constexpr int BLOCK_N = 64;
-#else
   constexpr int BLOCK_N = 256;
-#endif
 
   // buffer for packing k_cache and v_cache
   int num_threads = at::get_num_threads();
@@ -1667,6 +1661,7 @@ void decode_attention_cpu(
 
       if (num_heads == num_heads_kv) {
         // MHA
+        // Non-RVV path: Use explicit BLOCK_N
         decode_attention_kernel_dispatch<scalar_t, index_t, BLOCK_N>(
             output.data_ptr<scalar_t>(),
             attn_logits.data_ptr<float>(),
@@ -1723,7 +1718,8 @@ void decode_attention_cpu(
             size_per_thread);
       } else {
         // GQA/MQA
-        decode_attention_grouped_kernel_impl<scalar_t, index_t, BLOCK_N>(
+        // Non-RVV path: Use explicit BLOCK_N
+        decode_attention_grouped_kernel_dispatch<scalar_t, index_t, BLOCK_N>(
             output.data_ptr<scalar_t>(),
             attn_logits.data_ptr<float>(),
             query.data_ptr<scalar_t>(),
@@ -1753,3 +1749,4 @@ void decode_attention_cpu(
     });
   });
 }
+#endif  // #ifndef CPU_CAPABILITY_RVV

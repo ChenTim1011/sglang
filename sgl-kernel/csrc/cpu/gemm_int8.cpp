@@ -2,6 +2,10 @@
 #include "gemm.h"
 #include "vec.h"
 
+#if defined(CPU_CAPABILITY_RVV)
+#include "rvv/gemm.h"
+#endif
+
 namespace {
 
 template <typename scalar_t, bool has_bias, int BLOCK_N>
@@ -426,24 +430,47 @@ at::Tensor int8_scaled_mm_cpu(
     at::Tensor& scales2,
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
-    bool is_vnni) {
+    bool is_packed) {
   RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales1, scales2, bias}));
 
-  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
+#if defined(CPU_CAPABILITY_RVV)
+  // For RVV: is_packed=true means weights are in packed format [NB, K, BLOCK_N] (production use case)
+  //          is_packed=false means weights are in unpacked format [N, K] (strided access)
+  auto packed_w = is_packed ? mat2 : mat2;
+#else
+  // For Intel: is_packed=true means weights are already in VNNI format
+  //            is_packed=false means we need to pack them
+  auto packed_w = is_packed ? mat2 : convert_weight_packed(mat2);
+#endif
 
   CHECK_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scales1);
   CHECK_INPUT(scales2);
   CHECK_DIM(2, mat1);
+#if !defined(CPU_CAPABILITY_RVV)
   CHECK_DIM(2, mat2);
+#else
+  if (!is_packed) {
+    CHECK_DIM(2, mat2);
+  }
+#endif
 
   int64_t M = mat1.size(0);
   int64_t N = mat2.size(0);
   int64_t K = mat1.size(1);
 
+#if defined(CPU_CAPABILITY_RVV)
+  if (is_packed) {
+    // For RVV packed weights, mat2 is 1D. We derive N from scales2.
+    N = scales2.numel();
+  }
+#endif
+
+#if !defined(CPU_CAPABILITY_RVV)
   // see [NOTE]: s8s8 igemm compensation in avx512-vnni
-  CHECK_EQ(mat2.size(1), (int64_t)(is_vnni ? K + sizeof(int32_t) : K));
+  CHECK_EQ(mat2.size(1), (int64_t)(is_packed ? K + sizeof(int32_t) : K));
+#endif
   CHECK_EQ(scales1.numel(), M);
   CHECK_EQ(scales2.numel(), N);
 
@@ -462,9 +489,23 @@ at::Tensor int8_scaled_mm_cpu(
     bias_data = bias.value().data_ptr<float>();
   }
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "int8_scaled_mm_kernel_impl", [&] {
-    int8_scaled_mm_kernel_impl<scalar_t>(
-        out.data_ptr<scalar_t>(),
+  // Dispatch to RVV or generic implementation
+  if (out_dtype == at::ScalarType::Float) {
+#if defined(CPU_CAPABILITY_RVV)
+    int8_scaled_mm_kernel_rvv<float>(
+        out.data_ptr<float>(),
+        mat1.data_ptr<uint8_t>(),
+        packed_w.data_ptr<int8_t>(),
+        scales1.data_ptr<float>(),
+        scales2.data_ptr<float>(),
+        bias_data,
+        M,
+        N,
+        K,
+        is_packed);
+#else
+    int8_scaled_mm_kernel_impl<float>(
+        out.data_ptr<float>(),
         mat1.data_ptr<uint8_t>(),
         packed_w.data_ptr<int8_t>(),
         scales1.data_ptr<float>(),
@@ -473,21 +514,52 @@ at::Tensor int8_scaled_mm_cpu(
         M,
         N,
         K);
-  });
+#endif
+  } else {
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "int8_scaled_mm_kernel_impl", [&] {
+#if defined(CPU_CAPABILITY_RVV)
+      int8_scaled_mm_kernel_rvv<scalar_t>(
+          out.data_ptr<scalar_t>(),
+          mat1.data_ptr<uint8_t>(),
+          packed_w.data_ptr<int8_t>(),
+          scales1.data_ptr<float>(),
+          scales2.data_ptr<float>(),
+          bias_data,
+          M,
+          N,
+          K,
+          is_packed);
+#else
+      int8_scaled_mm_kernel_impl<scalar_t>(
+          out.data_ptr<scalar_t>(),
+          mat1.data_ptr<uint8_t>(),
+          packed_w.data_ptr<int8_t>(),
+          scales1.data_ptr<float>(),
+          scales2.data_ptr<float>(),
+          bias_data,
+          M,
+          N,
+          K);
+#endif
+    });
+  }
   return out;
 }
 
 // fused `per_token_quant_int8_cpu` and `int8_scaled_mm_cpu`
+#ifndef CPU_CAPABILITY_RVV
 at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& mat1,
     at::Tensor& mat2,
     at::Tensor& scales2,
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
-    bool is_vnni) {
+    bool is_packed) {
   RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales2, bias}));
 
-  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
+  // For Intel: is_packed=true means weights are already in VNNI format
+  //            is_packed=false means we need to pack them
+  auto packed_w = is_packed ? mat2 : convert_weight_packed(mat2);
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
@@ -496,12 +568,12 @@ at::Tensor int8_scaled_mm_with_quant(
   CHECK_DIM(2, mat2);
 
   int64_t M = mat1.size(0);
-  int64_t N = mat2.size(0);
   int64_t K = mat1.size(1);
+  int64_t N = mat2.size(0);
   int64_t lda = mat1.stride(0);
 
   // see [NOTE]: s8s8 igemm compensation in avx512-vnni
-  CHECK_EQ(mat2.size(1), (int64_t)(is_vnni ? K + sizeof(int32_t) : K));
+  CHECK_EQ(mat2.size(1), (int64_t)(is_packed ? K + sizeof(int32_t) : K));
   CHECK_EQ(scales2.numel(), N);
 
   const auto st = mat1.scalar_type();
@@ -521,19 +593,20 @@ at::Tensor int8_scaled_mm_with_quant(
     bias_data = bias.value().data_ptr<float>();
   }
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "int8_scaled_mm_with_quant_kernel_impl", [&] {
+  // Dispatch to RVV or generic implementation
+  if (out_dtype == at::ScalarType::Float) {
     uint8_t* __restrict__ Aq_data = buffer.data_ptr<uint8_t>();
     float* __restrict__ As_data = (float*)((void*)(Aq_data + M * K));
-    const scalar_t* __restrict__ A_data = mat1.data_ptr<scalar_t>();
+    const float* __restrict__ A_data = mat1.data_ptr<float>();
 
     at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
-        quantize_row_int8<scalar_t>(Aq_data + m * K, As_data[m], A_data + m * lda, K);
+        quantize_row_int8<float>(Aq_data + m * K, As_data[m], A_data + m * lda, K);
       }
     });
 
-    int8_scaled_mm_kernel_impl<scalar_t>(
-        out.data_ptr<scalar_t>(),
+    int8_scaled_mm_kernel_impl<float>(
+        out.data_ptr<float>(),
         Aq_data,
         packed_w.data_ptr<int8_t>(),
         As_data,
@@ -542,6 +615,30 @@ at::Tensor int8_scaled_mm_with_quant(
         M,
         N,
         K);
-  });
+  } else {
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "int8_scaled_mm_with_quant_kernel_impl", [&] {
+      uint8_t* __restrict__ Aq_data = buffer.data_ptr<uint8_t>();
+      float* __restrict__ As_data = (float*)((void*)(Aq_data + M * K));
+      const scalar_t* __restrict__ A_data = mat1.data_ptr<scalar_t>();
+
+      at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+        for (int64_t m = begin; m < end; ++m) {
+          quantize_row_int8<scalar_t>(Aq_data + m * K, As_data[m], A_data + m * lda, K);
+        }
+      });
+
+      int8_scaled_mm_kernel_impl<scalar_t>(
+          out.data_ptr<scalar_t>(),
+          Aq_data,
+          packed_w.data_ptr<int8_t>(),
+          As_data,
+          scales2.data_ptr<float>(),
+          bias_data,
+          M,
+          N,
+          K);
+    });
+  }
   return out;
 }
+#endif  // #ifndef CPU_CAPABILITY_RVV

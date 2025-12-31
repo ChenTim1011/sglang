@@ -19,6 +19,9 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 #include "shm.h"
+#if defined(CPU_CAPABILITY_RVV)
+#include "rvv/vlen_utils.h"
+#endif
 
 // silu_and_mul
 at::Tensor silu_and_mul_cpu(at::Tensor& input);
@@ -93,6 +96,7 @@ void decode_attention_cpu(
     double sm_scale,
     double logit_cap);
 
+#if defined(CPU_CAPABILITY_RVV)
 void decode_attention_int8_cpu(
     at::Tensor& query,
     at::Tensor& k_cache,
@@ -109,6 +113,7 @@ void decode_attention_int8_cpu(
     double logit_cap,
     double k_scale,
     double v_scale);
+#endif  // CPU_CAPABILITY_RVV
 
 void extend_attention_cpu(
     at::Tensor& q_extend,
@@ -126,6 +131,7 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap);
 
+#if defined(CPU_CAPABILITY_RVV)
 void extend_attention_int8_cpu(
     at::Tensor& q_extend,
     at::Tensor& k_extend,
@@ -143,6 +149,7 @@ void extend_attention_int8_cpu(
     double logit_cap,
     double k_scale,
     double v_scale);
+#endif  // CPU_CAPABILITY_RVV
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
@@ -396,13 +403,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float logit_cap) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
-  // decode_int8
+  // decode_int8 - RVV only
+#if defined(CPU_CAPABILITY_RVV)
   m.def(
       "decode_attention_int8_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor key, Tensor "
       "value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
       "float logit_cap, float k_scale, float v_scale) -> ()");
   m.impl("decode_attention_int8_cpu", torch::kCPU, &decode_attention_int8_cpu);
+#endif  // CPU_CAPABILITY_RVV
 
   // extend
   m.def(
@@ -411,7 +420,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
-  // extend_int8
+  // extend_int8 - RVV only
+#if defined(CPU_CAPABILITY_RVV)
   m.def(
       "extend_attention_int8_cpu(Tensor q_extend, Tensor k_extend, Tensor v_extend, Tensor(a!) o_extend, Tensor "
       "k_buffer, "
@@ -419,6 +429,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, float k_scale=1.0, float v_scale=1.0) -> "
       "()");
   m.impl("extend_attention_int8_cpu", torch::kCPU, &extend_attention_int8_cpu);
+#endif  // CPU_CAPABILITY_RVV
 
   // weight prepack
   m.def("convert_weight_packed(Tensor weight) -> Tensor");
@@ -440,7 +451,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // igemm
   m.def(
       "int8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales1, Tensor scales2, Tensor? bias, ScalarType "
-      "out_dtype, bool is_vnni) -> Tensor");
+      "out_dtype, bool is_packed) -> Tensor");
   m.impl("int8_scaled_mm_cpu", torch::kCPU, &int8_scaled_mm_cpu);
 
   // fp8 gemm
@@ -452,7 +463,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // quant + igemm
   m.def(
       "int8_scaled_mm_with_quant(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, ScalarType out_dtype, bool "
-      "is_vnni) -> Tensor");
+      "is_packed) -> Tensor");
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
 
   // bmm
@@ -536,11 +547,23 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_qkvzba_split_reshape_cat_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int num_heads_v, int "
       "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
   m.impl("fused_qkvzba_split_reshape_cat_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_cpu);
+
+  // RVV VLEN utilities
+#if defined(CPU_CAPABILITY_RVV)
+  m.def("get_rvv_vlenb() -> int");
+  m.def("get_rvv_vlen() -> int");
+  m.def("check_vlen_alignment(int size_bytes) -> bool");
+#endif
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
   m.impl("init_cpu_threads_env", init_cpu_threads_env);
   m.impl("initialize", &initialize);
+#if defined(CPU_CAPABILITY_RVV)
+  m.impl("get_rvv_vlenb", &get_rvv_vlenb);
+  m.impl("get_rvv_vlen", &get_rvv_vlen);
+  m.impl("check_vlen_alignment", &check_vlen_alignment);
+#endif
 }
 
 REGISTER_EXTENSION(common_ops)
