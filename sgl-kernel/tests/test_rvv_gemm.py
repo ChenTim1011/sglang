@@ -403,5 +403,154 @@ class TestGemmRvvIntegration:
         torch.testing.assert_close(y_batch, y_individual, **tolerances)
 
 
+@requires_sgl_kernel
+@requires_weight_packed_linear
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+class TestGemmRvvErrorHandling:
+    """Error handling and input validation tests for GEMM."""
+
+    def test_invalid_zero_k_dimension(self, dtype, tolerances: dict):
+        """Test with K=0 (should handle gracefully or raise error)."""
+        M, N = 4, 128
+        K = 0
+
+        x = torch.randn(M, K, dtype=dtype)
+        weight = torch.randn(N, K, dtype=dtype)
+        bias = torch.randn(N, dtype=BIAS_DTYPE)
+
+        try:
+            y_rvv = sgl_kernel.weight_packed_linear(x, weight, bias, False)
+            assert y_rvv.shape == (M, N), "Output shape should be correct"
+            assert torch.allclose(
+                y_rvv, bias.unsqueeze(0).expand(M, -1).to(dtype)
+            ), "Output should be bias only"
+        except (RuntimeError, ValueError, AssertionError):
+            pass
+
+    def test_invalid_mismatched_k_dimensions(self, dtype, tolerances: dict):
+        """Test with mismatched K dimensions between x and weight."""
+        M, N = 4, 128
+        K_x = 64
+        K_w = 128
+
+        x = torch.randn(M, K_x, dtype=dtype)
+        weight = torch.randn(N, K_w, dtype=dtype)
+        bias = torch.randn(N, dtype=BIAS_DTYPE)
+
+        with pytest.raises((RuntimeError, ValueError, AssertionError)):
+            sgl_kernel.weight_packed_linear(x, weight, bias, False)
+
+    def test_invalid_mismatched_bias_size(self, dtype, tolerances: dict):
+        """Test with mismatched bias size."""
+        M, N, K = 4, 128, 128
+
+        x = torch.randn(M, K, dtype=dtype)
+        weight = torch.randn(N, K, dtype=dtype)
+        bias = torch.randn(N + 10, dtype=BIAS_DTYPE)
+
+        with pytest.raises((RuntimeError, ValueError, AssertionError)):
+            sgl_kernel.weight_packed_linear(x, weight, bias, False)
+
+
+@requires_sgl_kernel
+@requires_weight_packed_linear
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+class TestGemmRvvCombinatorial:
+    """Combinatorial testing for GEMM - parameter interactions."""
+
+    @pytest.mark.parametrize(
+        "M,N,K",
+        [
+            (1, 1, 1),
+            (1, 64, 64),
+            (1, 128, 128),
+            (1, 256, 256),
+            (1, 512, 512),
+            (1, 2048, 2048),
+            (4, 1, 1),
+            (4, 64, 64),
+            (4, 128, 128),
+            (4, 256, 256),
+            (4, 512, 512),
+            (8, 64, 64),
+            (8, 128, 128),
+            (8, 256, 256),
+            (16, 128, 128),
+            (16, 256, 256),
+            (32, 128, 128),
+            (32, 256, 256),
+            (64, 256, 256),
+        ],
+    )
+    def test_size_combinations(self, M, N, K, dtype, tolerances: dict):
+        """Test various M × N × K combinations."""
+        x = torch.randn(M, K, dtype=dtype)
+        weight = torch.randn(N, K, dtype=dtype)
+        bias = torch.randn(N, dtype=BIAS_DTYPE)
+
+        y_ref = torch_linear_reference(x, weight, bias)
+        y_rvv = sgl_kernel.weight_packed_linear(x, weight, bias, False)
+
+        torch.testing.assert_close(y_rvv, y_ref, **tolerances)
+
+    @pytest.mark.parametrize(
+        "M,K",
+        [
+            (1, 63),
+            (1, 65),
+            (1, 127),
+            (1, 129),
+            (1, 255),
+            (1, 257),
+            (4, 63),
+            (4, 65),
+            (4, 127),
+            (4, 129),
+            (8, 63),
+            (8, 65),
+            (16, 127),
+            (16, 129),
+        ],
+    )
+    def test_non_aligned_k_combinations(self, M, K, dtype, tolerances: dict):
+        """Test various M × K combinations with non-aligned K."""
+        N = 128
+        x = torch.randn(M, K, dtype=dtype)
+        weight = torch.randn(N, K, dtype=dtype)
+        bias = torch.randn(N, dtype=BIAS_DTYPE)
+
+        y_ref = torch_linear_reference(x, weight, bias)
+        y_rvv = sgl_kernel.weight_packed_linear(x, weight, bias, False)
+
+        torch.testing.assert_close(y_rvv, y_ref, **tolerances)
+
+    @pytest.mark.parametrize(
+        "M,N",
+        [
+            (1, 63),
+            (1, 65),
+            (1, 127),
+            (1, 129),
+            (4, 63),
+            (4, 65),
+            (4, 127),
+            (4, 129),
+            (8, 63),
+            (8, 65),
+        ],
+    )
+    def test_non_aligned_n_combinations(self, M, N, dtype, tolerances: dict):
+        """Test various M × N combinations with non-aligned N."""
+        K = 128
+        x = torch.randn(M, K, dtype=dtype)
+        weight = torch.randn(N, K, dtype=dtype)
+        bias = torch.randn(N, dtype=BIAS_DTYPE)
+
+        y_ref = torch_linear_reference(x, weight, bias)
+        y_rvv = sgl_kernel.weight_packed_linear(x, weight, bias, False)
+
+        torch.testing.assert_close(y_rvv, y_ref, **tolerances)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

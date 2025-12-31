@@ -233,5 +233,732 @@ def test_decode_attention_cpu_int8(num_heads, head_dim, seq_len, num_requests, d
     torch.testing.assert_close(output, ref_output, atol=1e-1, rtol=1e-1)
 
 
+@pytest.mark.skipif(
+    not is_decode_attention_int8_available(),
+    reason="decode_attention_int8_cpu not available",
+)
+class TestDecodeAttentionInt8EdgeCases:
+    """Edge case tests for INT8 decode attention."""
+
+    def test_quantization_range_boundaries(self):
+        """Test with quantization range boundaries (-128, 127, 0)."""
+        device = "cpu"
+        dtype = torch.float16
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        max_seq_len = 64
+
+        query = torch.randn(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_scale = 0.01
+        v_scale = 0.01
+
+        max_tokens = num_requests * max_seq_len
+
+        k_buffer_int8 = torch.zeros(
+            max_tokens, num_heads, head_dim, dtype=torch.int8, device=device
+        )
+        v_buffer_int8 = torch.zeros(
+            max_tokens, num_heads, head_dim, dtype=torch.int8, device=device
+        )
+
+        k_buffer_int8[0, 0, 0] = -128
+        k_buffer_int8[0, 0, 1] = 127
+        k_buffer_int8[0, 0, 2] = 0
+        v_buffer_int8[0, 0, 0] = -128
+        v_buffer_int8[0, 0, 1] = 127
+        v_buffer_int8[0, 0, 2] = 0
+
+        req_to_token = torch.zeros(
+            num_requests, max_seq_len, dtype=torch.long, device=device
+        )
+        req_to_token[0, :seq_len] = torch.arange(seq_len, dtype=torch.long)
+        req_pool_indices = torch.arange(num_requests, dtype=torch.long, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.long, device=device)
+
+        output = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+        attn_logits = torch.zeros(
+            num_requests, num_heads, 1, head_dim + 1, dtype=torch.float32, device=device
+        )
+
+        key_int8 = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=torch.int8, device=device
+        )
+        value_int8 = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=torch.int8, device=device
+        )
+
+        loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        loc[0] = req_to_token[0, seq_len - 1]
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+
+        torch.ops.sgl_kernel.decode_attention_int8_cpu(
+            query,
+            k_buffer_int8,
+            v_buffer_int8,
+            output,
+            key_int8,
+            value_int8,
+            loc,
+            attn_logits,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            sm_scale,
+            logit_cap,
+            k_scale,
+            v_scale,
+        )
+
+        assert torch.isfinite(output).all(), "Output contains NaN or Inf"
+
+    def test_extreme_small_scale(self):
+        """Test with extremely small scale values."""
+        device = "cpu"
+        dtype = torch.float16
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        max_seq_len = 64
+
+        query = torch.randn(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_scale = 1e-6
+        v_scale = 1e-6
+
+        max_tokens = num_requests * max_seq_len
+        k_buffer_float = torch.randn(
+            max_tokens, num_heads, head_dim, dtype=torch.float32, device=device
+        )
+        v_buffer_float = torch.randn(
+            max_tokens, num_heads, head_dim, dtype=torch.float32, device=device
+        )
+
+        k_buffer_int8 = (
+            (k_buffer_float / k_scale).round().clamp(-128, 127).to(torch.int8)
+        )
+        v_buffer_int8 = (
+            (v_buffer_float / v_scale).round().clamp(-128, 127).to(torch.int8)
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_seq_len, dtype=torch.long, device=device
+        )
+        req_to_token[0, :seq_len] = torch.arange(seq_len, dtype=torch.long)
+        req_pool_indices = torch.arange(num_requests, dtype=torch.long, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.long, device=device)
+
+        output = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+        attn_logits = torch.zeros(
+            num_requests, num_heads, 1, head_dim + 1, dtype=torch.float32, device=device
+        )
+
+        key_float = torch.randn(
+            num_requests, num_heads, head_dim, dtype=torch.float32, device=device
+        )
+        value_float = torch.randn(
+            num_requests, num_heads, head_dim, dtype=torch.float32, device=device
+        )
+
+        key_int8 = (key_float / k_scale).round().clamp(-128, 127).to(torch.int8)
+        value_int8 = (value_float / v_scale).round().clamp(-128, 127).to(torch.int8)
+
+        loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        loc[0] = req_to_token[0, seq_len - 1]
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+
+        torch.ops.sgl_kernel.decode_attention_int8_cpu(
+            query,
+            k_buffer_int8,
+            v_buffer_int8,
+            output,
+            key_int8,
+            value_int8,
+            loc,
+            attn_logits,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            sm_scale,
+            logit_cap,
+            k_scale,
+            v_scale,
+        )
+
+        assert torch.isfinite(output).all(), "Output contains NaN or Inf"
+
+    def test_extreme_large_scale(self):
+        """Test with extremely large scale values."""
+        device = "cpu"
+        dtype = torch.float16
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        max_seq_len = 64
+
+        query = torch.randn(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_scale = 100.0
+        v_scale = 100.0
+
+        max_tokens = num_requests * max_seq_len
+        k_buffer_float = (
+            torch.randn(
+                max_tokens, num_heads, head_dim, dtype=torch.float32, device=device
+            )
+            * 0.1
+        )
+        v_buffer_float = (
+            torch.randn(
+                max_tokens, num_heads, head_dim, dtype=torch.float32, device=device
+            )
+            * 0.1
+        )
+
+        k_buffer_int8 = (
+            (k_buffer_float / k_scale).round().clamp(-128, 127).to(torch.int8)
+        )
+        v_buffer_int8 = (
+            (v_buffer_float / v_scale).round().clamp(-128, 127).to(torch.int8)
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_seq_len, dtype=torch.long, device=device
+        )
+        req_to_token[0, :seq_len] = torch.arange(seq_len, dtype=torch.long)
+        req_pool_indices = torch.arange(num_requests, dtype=torch.long, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.long, device=device)
+
+        output = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+        attn_logits = torch.zeros(
+            num_requests, num_heads, 1, head_dim + 1, dtype=torch.float32, device=device
+        )
+
+        key_float = (
+            torch.randn(
+                num_requests, num_heads, head_dim, dtype=torch.float32, device=device
+            )
+            * 0.1
+        )
+        value_float = (
+            torch.randn(
+                num_requests, num_heads, head_dim, dtype=torch.float32, device=device
+            )
+            * 0.1
+        )
+
+        key_int8 = (key_float / k_scale).round().clamp(-128, 127).to(torch.int8)
+        value_int8 = (value_float / v_scale).round().clamp(-128, 127).to(torch.int8)
+
+        loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        loc[0] = req_to_token[0, seq_len - 1]
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+
+        torch.ops.sgl_kernel.decode_attention_int8_cpu(
+            query,
+            k_buffer_int8,
+            v_buffer_int8,
+            output,
+            key_int8,
+            value_int8,
+            loc,
+            attn_logits,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            sm_scale,
+            logit_cap,
+            k_scale,
+            v_scale,
+        )
+
+        assert torch.isfinite(output).all(), "Output contains NaN or Inf"
+
+
+@pytest.mark.skipif(
+    not is_decode_attention_int8_available(),
+    reason="decode_attention_int8_cpu not available",
+)
+class TestDecodeAttentionInt8NumericalStability:
+    """Numerical stability tests for INT8 decode attention."""
+
+    def test_no_nan_inf(self):
+        """Test that output never contains NaN or Inf."""
+        device = "cpu"
+        dtype = torch.float16
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        max_seq_len = 64
+
+        query = torch.randn(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_scale = 0.01
+        v_scale = 0.01
+
+        max_tokens = num_requests * max_seq_len
+        k_buffer_float = (
+            torch.randn(
+                max_tokens, num_heads, head_dim, dtype=torch.float32, device=device
+            )
+            * 5.0
+        )
+        v_buffer_float = (
+            torch.randn(
+                max_tokens, num_heads, head_dim, dtype=torch.float32, device=device
+            )
+            * 5.0
+        )
+
+        k_buffer_int8 = (
+            (k_buffer_float / k_scale).round().clamp(-128, 127).to(torch.int8)
+        )
+        v_buffer_int8 = (
+            (v_buffer_float / v_scale).round().clamp(-128, 127).to(torch.int8)
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_seq_len, dtype=torch.long, device=device
+        )
+        req_to_token[0, :seq_len] = torch.arange(seq_len, dtype=torch.long)
+        req_pool_indices = torch.arange(num_requests, dtype=torch.long, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.long, device=device)
+
+        output = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+        attn_logits = torch.zeros(
+            num_requests, num_heads, 1, head_dim + 1, dtype=torch.float32, device=device
+        )
+
+        key_float = torch.randn(
+            num_requests, num_heads, head_dim, dtype=torch.float32, device=device
+        )
+        value_float = torch.randn(
+            num_requests, num_heads, head_dim, dtype=torch.float32, device=device
+        )
+
+        key_int8 = (key_float / k_scale).round().clamp(-128, 127).to(torch.int8)
+        value_int8 = (value_float / v_scale).round().clamp(-128, 127).to(torch.int8)
+
+        loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        loc[0] = req_to_token[0, seq_len - 1]
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+
+        torch.ops.sgl_kernel.decode_attention_int8_cpu(
+            query,
+            k_buffer_int8,
+            v_buffer_int8,
+            output,
+            key_int8,
+            value_int8,
+            loc,
+            attn_logits,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            sm_scale,
+            logit_cap,
+            k_scale,
+            v_scale,
+        )
+
+        assert torch.isfinite(output).all(), "Output contains NaN or Inf"
+
+
+@pytest.mark.skipif(
+    not is_decode_attention_int8_available(),
+    reason="decode_attention_int8_cpu not available",
+)
+class TestDecodeAttentionInt8ErrorHandling:
+    """Error handling and input validation tests for INT8 decode attention."""
+
+    def test_invalid_scale_zero(self):
+        """Test with zero scale (should handle gracefully or raise error)."""
+        device = "cpu"
+        dtype = torch.float16
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        max_seq_len = 64
+
+        query = torch.randn(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_scale = 0.0
+        v_scale = 0.0
+
+        max_tokens = num_requests * max_seq_len
+        k_buffer_int8 = torch.zeros(
+            max_tokens, num_heads, head_dim, dtype=torch.int8, device=device
+        )
+        v_buffer_int8 = torch.zeros(
+            max_tokens, num_heads, head_dim, dtype=torch.int8, device=device
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_seq_len, dtype=torch.long, device=device
+        )
+        req_to_token[0, :seq_len] = torch.arange(seq_len, dtype=torch.long)
+        req_pool_indices = torch.arange(num_requests, dtype=torch.long, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.long, device=device)
+
+        output = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+        attn_logits = torch.zeros(
+            num_requests, num_heads, 1, head_dim + 1, dtype=torch.float32, device=device
+        )
+
+        key_int8 = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=torch.int8, device=device
+        )
+        value_int8 = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=torch.int8, device=device
+        )
+
+        loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        loc[0] = req_to_token[0, seq_len - 1]
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+
+        try:
+            torch.ops.sgl_kernel.decode_attention_int8_cpu(
+                query,
+                k_buffer_int8,
+                v_buffer_int8,
+                output,
+                key_int8,
+                value_int8,
+                loc,
+                attn_logits,
+                req_to_token,
+                req_pool_indices,
+                seq_lens,
+                sm_scale,
+                logit_cap,
+                k_scale,
+                v_scale,
+            )
+            assert torch.isfinite(
+                output
+            ).all(), "Output should be finite even with zero scale"
+        except (RuntimeError, ValueError, ZeroDivisionError):
+            pass
+
+    def test_invalid_index_out_of_bounds(self):
+        """Test with out-of-bounds indices in req_to_token."""
+        device = "cpu"
+        dtype = torch.float16
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        max_seq_len = 64
+
+        query = torch.randn(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_scale = 0.01
+        v_scale = 0.01
+
+        max_tokens = num_requests * max_seq_len
+        k_buffer_int8 = torch.zeros(
+            max_tokens, num_heads, head_dim, dtype=torch.int8, device=device
+        )
+        v_buffer_int8 = torch.zeros(
+            max_tokens, num_heads, head_dim, dtype=torch.int8, device=device
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_seq_len, dtype=torch.long, device=device
+        )
+        req_to_token[0, :seq_len] = torch.arange(seq_len, dtype=torch.long)
+        req_to_token[0, 0] = max_tokens + 10
+        req_pool_indices = torch.arange(num_requests, dtype=torch.long, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.long, device=device)
+
+        output = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+        attn_logits = torch.zeros(
+            num_requests, num_heads, 1, head_dim + 1, dtype=torch.float32, device=device
+        )
+
+        key_int8 = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=torch.int8, device=device
+        )
+        value_int8 = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=torch.int8, device=device
+        )
+
+        loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        loc[0] = req_to_token[0, seq_len - 1]
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+
+        with pytest.raises((RuntimeError, IndexError, AssertionError)):
+            torch.ops.sgl_kernel.decode_attention_int8_cpu(
+                query,
+                k_buffer_int8,
+                v_buffer_int8,
+                output,
+                key_int8,
+                value_int8,
+                loc,
+                attn_logits,
+                req_to_token,
+                req_pool_indices,
+                seq_lens,
+                sm_scale,
+                logit_cap,
+                k_scale,
+                v_scale,
+            )
+
+
+@pytest.mark.skipif(
+    not is_decode_attention_int8_available(),
+    reason="decode_attention_int8_cpu not available",
+)
+class TestDecodeAttentionInt8Combinatorial:
+    """Combinatorial testing for INT8 decode attention - parameter interactions."""
+
+    @pytest.mark.parametrize(
+        "k_scale,v_scale",
+        [
+            (1e-6, 1e-6),
+            (1e-6, 0.01),
+            (1e-6, 100.0),
+            (0.01, 1e-6),
+            (0.01, 0.01),
+            (0.01, 100.0),
+            (100.0, 1e-6),
+            (100.0, 0.01),
+            (100.0, 100.0),
+        ],
+    )
+    def test_scale_combinations(self, k_scale, v_scale):
+        """Test various k_scale × v_scale combinations."""
+        device = "cpu"
+        dtype = torch.float16
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        max_seq_len = 64
+
+        query = torch.randn(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        max_tokens = num_requests * max_seq_len
+        k_buffer_float = (
+            torch.randn(
+                max_tokens, num_heads, head_dim, dtype=torch.float32, device=device
+            )
+            * 5.0
+        )
+        v_buffer_float = (
+            torch.randn(
+                max_tokens, num_heads, head_dim, dtype=torch.float32, device=device
+            )
+            * 5.0
+        )
+
+        k_buffer_int8 = (
+            (k_buffer_float / k_scale).round().clamp(-128, 127).to(torch.int8)
+        )
+        v_buffer_int8 = (
+            (v_buffer_float / v_scale).round().clamp(-128, 127).to(torch.int8)
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_seq_len, dtype=torch.long, device=device
+        )
+        req_to_token[0, :seq_len] = torch.arange(seq_len, dtype=torch.long)
+        req_pool_indices = torch.arange(num_requests, dtype=torch.long, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.long, device=device)
+
+        output = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+        attn_logits = torch.zeros(
+            num_requests, num_heads, 1, head_dim + 1, dtype=torch.float32, device=device
+        )
+
+        key_float = torch.randn(
+            num_requests, num_heads, head_dim, dtype=torch.float32, device=device
+        )
+        value_float = torch.randn(
+            num_requests, num_heads, head_dim, dtype=torch.float32, device=device
+        )
+
+        key_int8 = (key_float / k_scale).round().clamp(-128, 127).to(torch.int8)
+        value_int8 = (value_float / v_scale).round().clamp(-128, 127).to(torch.int8)
+
+        loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        loc[0] = req_to_token[0, seq_len - 1]
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+
+        torch.ops.sgl_kernel.decode_attention_int8_cpu(
+            query,
+            k_buffer_int8,
+            v_buffer_int8,
+            output,
+            key_int8,
+            value_int8,
+            loc,
+            attn_logits,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            sm_scale,
+            logit_cap,
+            k_scale,
+            v_scale,
+        )
+
+        assert torch.isfinite(
+            output
+        ).all(), f"Output contains NaN or Inf with k_scale={k_scale}, v_scale={v_scale}"
+
+    @pytest.mark.parametrize(
+        "num_heads,head_dim,seq_len",
+        [
+            (1, 32, 32),
+            (1, 64, 32),
+            (2, 32, 32),
+            (2, 64, 32),
+            (4, 32, 32),
+            (4, 64, 32),
+            (4, 128, 32),
+            (8, 32, 32),
+            (8, 64, 32),
+            (8, 128, 32),
+            (16, 64, 32),
+            (16, 128, 32),
+        ],
+    )
+    def test_parameter_combinations(self, num_heads, head_dim, seq_len):
+        """Test various num_heads × head_dim × seq_len combinations."""
+        device = "cpu"
+        dtype = torch.float16
+        num_requests = 1
+        max_seq_len = seq_len + 16
+
+        query = torch.randn(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_scale = 0.01
+        v_scale = 0.01
+
+        max_tokens = num_requests * max_seq_len
+        k_buffer_float = (
+            torch.randn(
+                max_tokens, num_heads, head_dim, dtype=torch.float32, device=device
+            )
+            * 5.0
+        )
+        v_buffer_float = (
+            torch.randn(
+                max_tokens, num_heads, head_dim, dtype=torch.float32, device=device
+            )
+            * 5.0
+        )
+
+        k_buffer_int8 = (
+            (k_buffer_float / k_scale).round().clamp(-128, 127).to(torch.int8)
+        )
+        v_buffer_int8 = (
+            (v_buffer_float / v_scale).round().clamp(-128, 127).to(torch.int8)
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_seq_len, dtype=torch.long, device=device
+        )
+        req_to_token[0, :seq_len] = torch.arange(seq_len, dtype=torch.long)
+        req_pool_indices = torch.arange(num_requests, dtype=torch.long, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.long, device=device)
+
+        output = torch.zeros(
+            num_requests, num_heads, head_dim, dtype=dtype, device=device
+        )
+        attn_logits = torch.zeros(
+            num_requests, num_heads, 1, head_dim + 1, dtype=torch.float32, device=device
+        )
+
+        key_float = torch.randn(
+            num_requests, num_heads, head_dim, dtype=torch.float32, device=device
+        )
+        value_float = torch.randn(
+            num_requests, num_heads, head_dim, dtype=torch.float32, device=device
+        )
+
+        key_int8 = (key_float / k_scale).round().clamp(-128, 127).to(torch.int8)
+        value_int8 = (value_float / v_scale).round().clamp(-128, 127).to(torch.int8)
+
+        loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        loc[0] = req_to_token[0, seq_len - 1]
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+
+        torch.ops.sgl_kernel.decode_attention_int8_cpu(
+            query,
+            k_buffer_int8,
+            v_buffer_int8,
+            output,
+            key_int8,
+            value_int8,
+            loc,
+            attn_logits,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            sm_scale,
+            logit_cap,
+            k_scale,
+            v_scale,
+        )
+
+        assert torch.isfinite(output).all(), "Output contains NaN or Inf"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

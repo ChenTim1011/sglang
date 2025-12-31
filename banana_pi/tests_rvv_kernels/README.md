@@ -21,10 +21,27 @@ The `tests_benchs_rvv_kernels.sh` script runs pytest-based unit tests and perfor
    - Navigates to `sgl-kernel/` directory
 
 2. **Runs unit tests** (pytest)
-   - Decode attention tests (FP16/BF16, INT8)
-   - Extend attention tests (FP16/BF16, INT8)
-   - GEMM tests (FP16/BF16, INT8)
-   - Backend integration tests
+   - **Decode attention tests** (FP16/BF16, INT8)
+     - Basic correctness tests
+     - Edge cases: zero input, zero KV cache, single token, single head/dim, non-aligned sizes
+     - Numerical stability: extreme values, softmax stability
+     - INT8 quantization boundaries: range limits (-128, 127, 0), extreme scales
+     - **Error handling**: invalid seq_len, out-of-bounds indices, negative indices, zero scales
+     - **Combinatorial testing**: parameter combinations (num_heads×head_dim, seq_len×num_requests, sm_scale×logit_cap, k_scale×v_scale)
+   - **Extend attention tests** (FP16/BF16, INT8)
+     - Basic correctness tests
+     - Edge cases: zero input, zero prefix, single extend token
+     - Numerical stability: extreme values
+     - INT8 quantization boundaries: range limits, extreme scales
+     - **Error handling**: invalid extend_len, out-of-bounds indices, zero scales
+     - **Combinatorial testing**: parameter combinations (seq_len×extend_len, num_heads×head_dim, k_scale×v_scale)
+   - **GEMM tests** (FP16/BF16, INT8)
+     - Basic correctness tests
+     - Edge cases: zero input/weight, identity weight, large/small values, non-aligned sizes
+     - Integration tests: sequential layers, QKV projection, batch consistency
+     - INT8 quantization boundaries: range limits, extreme scales
+     - **Error handling**: zero K dimension, mismatched dimensions, mismatched bias/scale sizes, zero scales
+     - **Combinatorial testing**: parameter combinations (M×N×K, non-aligned sizes, scales1×scales2, M×out_dtype)
 
 3. **Runs benchmarks**
    - Performance benchmarks for each kernel
@@ -34,6 +51,12 @@ The `tests_benchs_rvv_kernels.sh` script runs pytest-based unit tests and perfor
 
 **Test Files**:
 - Unit tests: `sgl-kernel/tests/test_rvv_*.py`
+  - `test_rvv_decode.py` - Decode attention (FP16/BF16)
+  - `test_rvv_decode_int8.py` - Decode attention (INT8)
+  - `test_rvv_extend.py` - Extend attention (FP16/BF16)
+  - `test_rvv_extend_int8.py` - Extend attention (INT8)
+  - `test_rvv_gemm.py` - GEMM (FP16/BF16)
+  - `test_rvv_gemm_int8.py` - GEMM (INT8)
 - Benchmarks: `sgl-kernel/benchmark/bench_rvv_*.py`
 
 ## Usage
@@ -112,7 +135,7 @@ source ~/.local_riscv_env/workspace/venv_sglang/bin/activate
 ```
 
 **Note**: The script automatically sets up these environment variables, but you may need to ensure:
-- `~/.local_riscv_env/env.sh` exists (created by `setup_banana_pi.sh`)
+- `~/.local_riscv_env/env.sh` exists (created by `banana_pi/install/setup_banana_pi.sh`)
 - Virtual environment is set up at `~/.local_riscv_env/workspace/venv_sglang/`
 - `sgl-kernel` directory exists at `~/.local_riscv_env/workspace/sglang/sgl-kernel/`
 

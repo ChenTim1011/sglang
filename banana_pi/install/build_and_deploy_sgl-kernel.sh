@@ -1388,7 +1388,36 @@ fi
     fi
 
     echo "Installing wheel: ${WHEEL_FILE}"
-    pip install --force-reinstall --no-deps "${WHEEL_FILE}" || {
+
+    # Clean up any broken installation
+    echo "Cleaning up old installation..."
+
+    # Try to uninstall old version first (ignore errors)
+    pip uninstall -y sgl-kernel 2>/dev/null || true
+
+    # Manually remove package directories to avoid version parsing issues
+    PYTHON_SITE=$(python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || echo "")
+    if [ -n "${PYTHON_SITE}" ] && [ -d "${PYTHON_SITE}/sgl_kernel" ]; then
+        echo "Removing ${PYTHON_SITE}/sgl_kernel..."
+        rm -rf "${PYTHON_SITE}/sgl_kernel" 2>/dev/null || true
+    fi
+
+    # Also check in user site-packages
+    PYTHON_USER_SITE=$(python3 -c 'import site; print(site.getusersitepackages())' 2>/dev/null || echo "")
+    if [ -n "${PYTHON_USER_SITE}" ] && [ -d "${PYTHON_USER_SITE}/sgl_kernel" ]; then
+        echo "Removing ${PYTHON_USER_SITE}/sgl_kernel..."
+        rm -rf "${PYTHON_USER_SITE}/sgl_kernel" 2>/dev/null || true
+    fi
+
+    # Remove any .dist-info directories for sgl-kernel
+    find "${PYTHON_SITE}" "${PYTHON_USER_SITE}" -name "sgl_kernel*.dist-info" -type d 2>/dev/null | while read dist_info; do
+        echo "Removing ${dist_info}..."
+        rm -rf "${dist_info}" 2>/dev/null || true
+    done
+
+    # Install new wheel with --ignore-installed to skip all checks
+    echo "Installing new wheel..."
+    pip install --ignore-installed --no-deps "${WHEEL_FILE}" || {
     echo "❌ ERROR: Failed to install wheel"
     exit 1
 }

@@ -264,5 +264,658 @@ def test_extend_attention_cpu(
     torch.testing.assert_close(o_extend, ref_output, atol=atol, rtol=rtol)
 
 
+@pytest.mark.skipif(
+    not _has_extend_attention_cpu(), reason="extend_attention_cpu not available"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+class TestExtendAttentionEdgeCases:
+    """Edge case tests for extend attention."""
+
+    def test_zero_input(self, dtype):
+        """Test with zero query input."""
+        device = "cpu"
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        extend_len = 16
+        max_context_len = seq_len + 16
+
+        q_extend = torch.zeros(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        k_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        o_extend = torch.zeros(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_context_len, dtype=torch.int64, device=device
+        )
+        req_to_token[0, : seq_len - extend_len] = torch.arange(
+            seq_len - extend_len, dtype=torch.int64
+        )
+
+        req_pool_indices = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
+        extend_seq_lens = torch.tensor([extend_len], dtype=torch.int64, device=device)
+        extend_start_loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+        max_len_extend = extend_len
+
+        torch.ops.sgl_kernel.extend_attention_cpu(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
+            max_len_extend,
+            sm_scale,
+            logit_cap,
+        )
+
+        assert torch.isfinite(o_extend).all(), "Output contains NaN or Inf"
+
+    def test_zero_prefix(self, dtype):
+        """Test with zero prefix (extend_len == seq_len)."""
+        device = "cpu"
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 16
+        extend_len = 16
+        max_context_len = seq_len + 16
+
+        q_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        k_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        o_extend = torch.zeros(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_context_len, dtype=torch.int64, device=device
+        )
+
+        req_pool_indices = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
+        extend_seq_lens = torch.tensor([extend_len], dtype=torch.int64, device=device)
+        extend_start_loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+        max_len_extend = extend_len
+
+        torch.ops.sgl_kernel.extend_attention_cpu(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
+            max_len_extend,
+            sm_scale,
+            logit_cap,
+        )
+
+        assert torch.isfinite(o_extend).all(), "Output contains NaN or Inf"
+
+    def test_single_extend_token(self, dtype):
+        """Test with extend_len=1 (single token)."""
+        device = "cpu"
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        extend_len = 1
+        max_context_len = seq_len + 16
+
+        q_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        k_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        o_extend = torch.zeros(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_context_len, dtype=torch.int64, device=device
+        )
+        req_to_token[0, : seq_len - extend_len] = torch.arange(
+            seq_len - extend_len, dtype=torch.int64
+        )
+
+        req_pool_indices = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
+        extend_seq_lens = torch.tensor([extend_len], dtype=torch.int64, device=device)
+        extend_start_loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+        max_len_extend = extend_len
+
+        torch.ops.sgl_kernel.extend_attention_cpu(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
+            max_len_extend,
+            sm_scale,
+            logit_cap,
+        )
+
+        assert torch.isfinite(o_extend).all(), "Output contains NaN or Inf"
+
+
+@pytest.mark.skipif(
+    not _has_extend_attention_cpu(), reason="extend_attention_cpu not available"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+class TestExtendAttentionNumericalStability:
+    """Numerical stability tests for extend attention."""
+
+    def test_extreme_large_values(self, dtype):
+        """Test with extreme large values."""
+        device = "cpu"
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        extend_len = 16
+        max_context_len = seq_len + 16
+
+        if dtype == torch.float16:
+            max_val = 65504.0
+        else:
+            max_val = 3.4e38
+
+        q_extend = torch.full(
+            (extend_len, num_heads, head_dim), max_val * 0.1, dtype=dtype, device=device
+        )
+        k_extend = torch.full(
+            (extend_len, num_heads, head_dim), max_val * 0.1, dtype=dtype, device=device
+        )
+        v_extend = torch.full(
+            (extend_len, num_heads, head_dim), max_val * 0.1, dtype=dtype, device=device
+        )
+        o_extend = torch.zeros(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_buffer = torch.full(
+            (max_context_len, num_heads, head_dim),
+            max_val * 0.1,
+            dtype=dtype,
+            device=device,
+        )
+        v_buffer = torch.full(
+            (max_context_len, num_heads, head_dim),
+            max_val * 0.1,
+            dtype=dtype,
+            device=device,
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_context_len, dtype=torch.int64, device=device
+        )
+        req_to_token[0, : seq_len - extend_len] = torch.arange(
+            seq_len - extend_len, dtype=torch.int64
+        )
+
+        req_pool_indices = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
+        extend_seq_lens = torch.tensor([extend_len], dtype=torch.int64, device=device)
+        extend_start_loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+        max_len_extend = extend_len
+
+        torch.ops.sgl_kernel.extend_attention_cpu(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
+            max_len_extend,
+            sm_scale,
+            logit_cap,
+        )
+
+        assert torch.isfinite(o_extend).all(), "Output contains NaN or Inf"
+
+    def test_extreme_small_values(self, dtype):
+        """Test with extreme small values."""
+        device = "cpu"
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        extend_len = 16
+        max_context_len = seq_len + 16
+
+        if dtype == torch.float16:
+            min_val = 6e-8
+        else:
+            min_val = 1e-38
+
+        q_extend = torch.full(
+            (extend_len, num_heads, head_dim), min_val, dtype=dtype, device=device
+        )
+        k_extend = torch.full(
+            (extend_len, num_heads, head_dim), min_val, dtype=dtype, device=device
+        )
+        v_extend = torch.full(
+            (extend_len, num_heads, head_dim), min_val, dtype=dtype, device=device
+        )
+        o_extend = torch.zeros(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_buffer = torch.full(
+            (max_context_len, num_heads, head_dim), min_val, dtype=dtype, device=device
+        )
+        v_buffer = torch.full(
+            (max_context_len, num_heads, head_dim), min_val, dtype=dtype, device=device
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_context_len, dtype=torch.int64, device=device
+        )
+        req_to_token[0, : seq_len - extend_len] = torch.arange(
+            seq_len - extend_len, dtype=torch.int64
+        )
+
+        req_pool_indices = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
+        extend_seq_lens = torch.tensor([extend_len], dtype=torch.int64, device=device)
+        extend_start_loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+        max_len_extend = extend_len
+
+        torch.ops.sgl_kernel.extend_attention_cpu(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
+            max_len_extend,
+            sm_scale,
+            logit_cap,
+        )
+
+        assert torch.isfinite(o_extend).all(), "Output contains NaN or Inf"
+
+
+@pytest.mark.skipif(
+    not _has_extend_attention_cpu(), reason="extend_attention_cpu not available"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+class TestExtendAttentionErrorHandling:
+    """Error handling and input validation tests for extend attention."""
+
+    def test_invalid_extend_len_exceeds_seq_len(self, dtype):
+        """Test with extend_len > seq_len (should handle gracefully or raise error)."""
+        device = "cpu"
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        extend_len = 64
+        max_context_len = seq_len + 16
+
+        q_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        k_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        o_extend = torch.zeros(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_context_len, dtype=torch.int64, device=device
+        )
+
+        req_pool_indices = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
+        extend_seq_lens = torch.tensor([extend_len], dtype=torch.int64, device=device)
+        extend_start_loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+        max_len_extend = extend_len
+
+        with pytest.raises((RuntimeError, IndexError, AssertionError)):
+            torch.ops.sgl_kernel.extend_attention_cpu(
+                q_extend,
+                k_extend,
+                v_extend,
+                o_extend,
+                k_buffer,
+                v_buffer,
+                req_to_token,
+                req_pool_indices,
+                seq_lens,
+                extend_seq_lens,
+                extend_start_loc,
+                max_len_extend,
+                sm_scale,
+                logit_cap,
+            )
+
+    def test_invalid_index_out_of_bounds(self, dtype):
+        """Test with out-of-bounds indices in req_to_token."""
+        device = "cpu"
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        seq_len = 32
+        extend_len = 16
+        max_context_len = seq_len + 16
+
+        q_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        k_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        o_extend = torch.zeros(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_context_len, dtype=torch.int64, device=device
+        )
+        req_to_token[0, 0] = max_context_len + 10
+
+        req_pool_indices = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
+        extend_seq_lens = torch.tensor([extend_len], dtype=torch.int64, device=device)
+        extend_start_loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+        max_len_extend = extend_len
+
+        with pytest.raises((RuntimeError, IndexError, AssertionError)):
+            torch.ops.sgl_kernel.extend_attention_cpu(
+                q_extend,
+                k_extend,
+                v_extend,
+                o_extend,
+                k_buffer,
+                v_buffer,
+                req_to_token,
+                req_pool_indices,
+                seq_lens,
+                extend_seq_lens,
+                extend_start_loc,
+                max_len_extend,
+                sm_scale,
+                logit_cap,
+            )
+
+
+@pytest.mark.skipif(
+    not _has_extend_attention_cpu(), reason="extend_attention_cpu not available"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+class TestExtendAttentionCombinatorial:
+    """Combinatorial testing for extend attention - parameter interactions."""
+
+    @pytest.mark.parametrize(
+        "seq_len,extend_len",
+        [
+            (16, 1),
+            (16, 8),
+            (16, 16),
+            (32, 1),
+            (32, 16),
+            (32, 32),
+            (64, 1),
+            (64, 32),
+            (64, 64),
+            (128, 32),
+            (128, 64),
+            (128, 128),
+        ],
+    )
+    def test_seq_len_extend_len_combinations(self, seq_len, extend_len, dtype):
+        """Test various seq_len × extend_len combinations."""
+        if extend_len > seq_len:
+            pytest.skip("extend_len cannot be larger than seq_len")
+
+        device = "cpu"
+        num_requests = 1
+        num_heads = 4
+        head_dim = 64
+        max_context_len = seq_len + 16
+
+        q_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        k_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        o_extend = torch.zeros(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_context_len, dtype=torch.int64, device=device
+        )
+        prefix_len = seq_len - extend_len
+        if prefix_len > 0:
+            req_to_token[0, :prefix_len] = torch.arange(prefix_len, dtype=torch.int64)
+
+        req_pool_indices = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
+        extend_seq_lens = torch.tensor([extend_len], dtype=torch.int64, device=device)
+        extend_start_loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+        max_len_extend = extend_len
+
+        torch.ops.sgl_kernel.extend_attention_cpu(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
+            max_len_extend,
+            sm_scale,
+            logit_cap,
+        )
+
+        assert torch.isfinite(o_extend).all(), "Output contains NaN or Inf"
+
+    @pytest.mark.parametrize(
+        "num_heads,head_dim",
+        [
+            (1, 32),
+            (1, 64),
+            (2, 32),
+            (2, 64),
+            (4, 32),
+            (4, 64),
+            (8, 32),
+            (8, 64),
+            (16, 64),
+        ],
+    )
+    def test_head_dim_head_combinations(self, num_heads, head_dim, dtype):
+        """Test various num_heads × head_dim combinations."""
+        device = "cpu"
+        num_requests = 1
+        seq_len = 32
+        extend_len = 16
+        max_context_len = seq_len + 16
+
+        q_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        k_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_extend = torch.randn(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        o_extend = torch.zeros(
+            extend_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        k_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+        v_buffer = torch.randn(
+            max_context_len, num_heads, head_dim, dtype=dtype, device=device
+        )
+
+        req_to_token = torch.zeros(
+            num_requests, max_context_len, dtype=torch.int64, device=device
+        )
+        prefix_len = seq_len - extend_len
+        if prefix_len > 0:
+            req_to_token[0, :prefix_len] = torch.arange(prefix_len, dtype=torch.int64)
+
+        req_pool_indices = torch.zeros(num_requests, dtype=torch.int64, device=device)
+        seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
+        extend_seq_lens = torch.tensor([extend_len], dtype=torch.int64, device=device)
+        extend_start_loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
+
+        sm_scale = 1.0 / (head_dim**0.5)
+        logit_cap = 50.0
+        max_len_extend = extend_len
+
+        torch.ops.sgl_kernel.extend_attention_cpu(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
+            max_len_extend,
+            sm_scale,
+            logit_cap,
+        )
+
+        assert torch.isfinite(o_extend).all(), "Output contains NaN or Inf"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
