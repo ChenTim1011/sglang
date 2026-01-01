@@ -22,30 +22,36 @@ python test_end_to_end_int8.py --num-requests 4 --seq-len 256
 ---
 
 ### `test_model_accuracy_int8.py`
-**Purpose**: Model-level accuracy validation for INT8 quantization
+**Purpose**: Model-level accuracy validation for INT8 quantization (Perplexity Simulation)
 
 **What it tests**:
-- Attention kernel accuracy (FP16 vs INT8 output comparison)
 - Simulated model perplexity and token prediction accuracy
-- Quantization impact on model quality
+- Quantization impact on model quality at the model level
+
+**Note**: This test focuses on model-level metrics (perplexity simulation).
+      For kernel-level accuracy testing (decode attention accuracy), use `test_parametrized_int8.py` instead.
 
 **Usage**:
 ```bash
 python test_model_accuracy_int8.py
-python test_model_accuracy_int8.py --num-heads 32 --head-dim 64
+python test_model_accuracy_int8.py --vocab-size 32000 --num-sequences 10
 ```
 
 ---
 
 ### `test_parametrized_int8.py`
-**Purpose**: Parameterized testing across multiple configurations
+**Purpose**: Parameterized testing for decode attention accuracy across multiple configurations
 
 **What it tests**:
-- Decode attention accuracy across various configurations:
+- Decode attention accuracy (FP16 vs INT8) across various configurations:
   - Sequence lengths: 32, 64, 128, 256, 512, 1024
   - Batch sizes: 1, 2, 4, 8
   - Head dimensions: 32, 64, 128
   - Number of heads: 8, 16, 32
+- Output comparison metrics: cosine similarity, MSE, max error
+
+**Note**: This is the primary test for kernel-level accuracy validation.
+      Use this instead of `test_model_accuracy_int8.py` for attention kernel accuracy testing.
 
 **Usage**:
 ```bash
@@ -214,7 +220,34 @@ Some tests may require:
 
 ## Notes
 
+- **All tests require `test_utils.py`** - No fallback logic is provided. If `test_utils` is not available, tests will fail immediately.
 - All tests use `test_utils.py` for consistent statistical analysis and fair comparisons
 - Tests are designed to be run on RISC-V hardware (Banana Pi K1)
 - INT8 tests ensure symmetric quantization (signed int8, no +128 offset) for KV cache
 - Performance tests include warmup iterations and statistical analysis for reliable results
+
+## Test Organization and Differences
+
+### Kernel-Level vs Model-Level Accuracy Tests
+
+- **`test_parametrized_int8.py`**: Kernel-level accuracy testing
+  - Tests decode attention kernel accuracy across multiple configurations
+  - Compares FP16 vs INT8 outputs directly from the kernel
+  - Primary test for validating INT8 quantization correctness
+
+- **`test_model_accuracy_int8.py`**: Model-level accuracy testing
+  - Tests model-level metrics (perplexity, token prediction accuracy)
+  - Simulates quantization impact on model quality
+  - Focuses on end-to-end model behavior, not kernel-level accuracy
+
+### End-to-End vs Component Tests
+
+- **`test_end_to_end_int8.py`**: Complete workflow testing
+  - Tests both prefill (extend) and decode phases
+  - Validates accuracy and performance for the full pipeline
+  - Only test that covers prefill/extend phase
+
+- **`test_parametrized_int8.py`**: Component-level testing
+  - Tests only decode attention (not prefill)
+  - More comprehensive configuration coverage
+  - Faster execution for quick validation
