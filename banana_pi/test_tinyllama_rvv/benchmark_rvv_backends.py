@@ -91,6 +91,18 @@ class BenchmarkResult:
 
 
 @dataclass
+class AccuracyResult:
+    """Holds accuracy test results"""
+
+    backend: str
+    kv_cache_dtype: str
+    perplexity: float
+    avg_latency_ms: float
+    success: bool = True
+    error_msg: Optional[str] = None
+
+
+@dataclass
 class BenchmarkSummary:
     """Holds aggregated benchmark results"""
 
@@ -109,6 +121,7 @@ class BenchmarkSummary:
     avg_tokens_generated: float = 0.0
     success_rate: float = 0.0
     results: List[BenchmarkResult] = field(default_factory=list)
+    accuracy_result: Optional[AccuracyResult] = None
 
 
 def find_sglang_processes():
@@ -166,7 +179,12 @@ def check_server_running(host="127.0.0.1", port=30000, timeout=10):
         return False
 
 
-def create_config_file(backend: str, config_dir: str) -> str:
+def create_config_file(
+    backend: str,
+    config_dir: str,
+    kv_cache_dtype: str = "auto",
+    disable_radix: bool = False,
+) -> str:
     """Create a config file for the specified backend.
 
     This function writes a reduced-resource benchmark config (optimized to
@@ -176,12 +194,16 @@ def create_config_file(backend: str, config_dir: str) -> str:
     # Reduced-resource settings for Banana Pi (16GB RAM)
     model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     mem_fraction_static = 0.5
-    max_prefill = 32
-    max_total = 64
-    chunked_prefill = 32
+    max_prefill = 512
+    max_total = 1024
+    chunked_prefill = 256
     cpu_offload = 0
     stream_interval = 1
     enable_metrics = False
+
+    disable_radix_line = (
+        "disable-radix-cache: true" if disable_radix else "# disable-radix-cache: false"
+    )
 
     config_content = f"""# SGLang Benchmark Configuration - {backend.upper()} Backend
 model-path: {model_path}
@@ -198,7 +220,7 @@ decode-attention-backend: {backend}
 
 model-impl: transformers
 dtype: float16
-kv-cache-dtype: auto
+kv-cache-dtype: {kv_cache_dtype}
 
 # Memory Management
 mem-fraction-static: {mem_fraction_static}
@@ -207,6 +229,7 @@ max-prefill-tokens: {max_prefill}
 max-total-tokens: {max_total}
 chunked-prefill-size: {chunked_prefill}
 cpu-offload-gb: {cpu_offload}
+{disable_radix_line}
 
 stream-interval: {stream_interval}
 num-continuous-decode-steps: 1
@@ -569,18 +592,125 @@ def run_single_benchmark(
         )
 
 
+def run_accuracy_test(
+    backend: str,
+    kv_cache_dtype: str,
+    host: str = "127.0.0.1",
+    port: int = 30000,
+    timeout: int = 1800,
+) -> AccuracyResult:
+    """
+    Run Perplexity (PPL) test using a sliding window approach with a known text.
+    Uses wikitext-2 like approach with a single long prompt.
+    """
+    print(f"\n🧪 Running Accuracy Test (PPL) for {backend} ({kv_cache_dtype})...")
+
+    # Use a longer text for PPL calculation
+    # Taken from Wikitext-2 validation set (first few lines)
+    text = (
+        "The game began development in 2010 , carrying over a large portion of the work done on Valkyria Chronicles II . "
+        "The development team wanted to clear up potential ambiguities with the numbering of the series , so the game was "
+        "original conceived as a spin-off . While the game retained the standard turn-based tactical role-playing battle system , "
+        "it also introduced new additions to the series ' gameplay ."
+    )
+
+    url = f"http://{host}:{port}/v1/completions"  # Use completions endpoint for PPL
+
+    # We can't easily get true PPL from the API without logprobs support which might be limited
+    # Instead, we'll measure the time to process this prompt (prefill) and
+    # check if we can get logprobs to calculate perplexity.
+
+    # SGLang local server supports echo=True and logprobs=1
+    data = {
+        "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "prompt": text,
+        "max_tokens": 0,  # Only prefill
+        "temperature": 0.0,
+        "echo": True,
+        "logprobs": 1,
+    }
+
+    try:
+        start_time = time.perf_counter()
+        response = requests.post(url, json=data, timeout=timeout)
+        latency = (time.perf_counter() - start_time) * 1000
+
+        if response.status_code != 200:
+            return AccuracyResult(
+                backend=backend,
+                kv_cache_dtype=kv_cache_dtype,
+                perplexity=0.0,
+                avg_latency_ms=0.0,
+                success=False,
+                error_msg=f"HTTP {response.status_code}: {response.text[:200]}",
+            )
+
+        result = response.json()
+
+        # Calculate Perplexity from logprobs
+        # PPL = exp(-1/N * sum(log_prob))
+        if "choices" in result and len(result["choices"]) > 0:
+            choice = result["choices"][0]
+            if "logprobs" in choice and choice["logprobs"]:
+                token_logprobs = choice["logprobs"].get("token_logprobs", [])
+                # Filter out None values (first token usually has None logprob)
+                valid_logprobs = [lp for lp in token_logprobs if lp is not None]
+
+                if valid_logprobs:
+                    avg_logprob = sum(valid_logprobs) / len(valid_logprobs)
+                    ppl = (
+                        np.exp(-avg_logprob) if HAS_NUMPY else 2.71828 ** (-avg_logprob)
+                    )
+                else:
+                    ppl = 0.0
+            else:
+                ppl = 0.0  # Logprobs not returned
+        else:
+            ppl = 0.0
+
+        print(f"   Perplexity: {ppl:.4f}")
+        print(f"   Latency: {latency:.2f} ms")
+
+        return AccuracyResult(
+            backend=backend,
+            kv_cache_dtype=kv_cache_dtype,
+            perplexity=ppl,
+            avg_latency_ms=latency,
+            success=True,
+        )
+
+    except Exception as e:
+        return AccuracyResult(
+            backend=backend,
+            kv_cache_dtype=kv_cache_dtype,
+            perplexity=0.0,
+            avg_latency_ms=0.0,
+            success=False,
+            error_msg=str(e),
+        )
+
+
 def run_benchmark_suite(
     backend: str,
     prompts: List[str],
     warmup_runs: int = 2,
     num_runs: int = 5,
     max_tokens: int = 50,
+    test_accuracy: bool = False,
+    kv_cache_dtype: str = "auto",
 ) -> BenchmarkSummary:
     """Run a complete benchmark suite for a backend"""
 
     print(f"\n{'='*60}")
     print(f"📊 Benchmarking {backend.upper()} Backend")
     print(f"{'='*60}")
+
+    # Run Accuracy Test first if requested
+    accuracy_res = None
+    if test_accuracy:
+        accuracy_res = run_accuracy_test(backend, kv_cache_dtype)
+        if not accuracy_res.success:
+            print(f"⚠️ Accuracy test failed: {accuracy_res.error_msg}")
 
     results = []
 
@@ -695,6 +825,7 @@ def run_benchmark_suite(
         avg_tokens_generated=avg_tokens,
         success_rate=len(successful_results) / len(results) * 100,
         results=results,
+        accuracy_result=accuracy_res,
     )
 
 
@@ -704,6 +835,27 @@ def print_summary_table(summaries: List[BenchmarkSummary]):
     print("\n" + "=" * 100)
     print("📊 BENCHMARK RESULTS SUMMARY")
     print("=" * 100)
+
+    # Accuracy / PPL Table
+    print(
+        f"\n{'Backend':<15} {'KV Type':<15} {'Perplexity':<12} {'PPL Latency':<12} {'Success':<10}"
+    )
+    print("-" * 100)
+    for summary in summaries:
+        if summary.accuracy_result:
+            print(
+                f"{summary.backend:<15} "
+                f"{summary.accuracy_result.kv_cache_dtype:<15} "
+                f"{summary.accuracy_result.perplexity:>10.4f}   "
+                f"{summary.accuracy_result.avg_latency_ms:>9.1f} ms  "
+                f"{str(summary.accuracy_result.success):<10}"
+            )
+        else:
+            print(
+                f"{summary.backend:<15} {'N/A':<15} {'N/A':<12} {'N/A':<12} {'N/A':<10}"
+            )
+
+    print("-" * 100)
 
     # Header - more metrics
     print(
@@ -745,43 +897,68 @@ def print_summary_table(summaries: List[BenchmarkSummary]):
     if len(summaries) == 2:
         s1, s2 = summaries[0], summaries[1]
 
-        print("\n📈 COMPARISON (RISC-V vs torch_native):")
+        # Only compare if both are successful enough
+        if s1.success_rate > 0 and s2.success_rate > 0:
+            print("\n📈 COMPARISON (RISC-V vs torch_native):")
 
-        # Determine which is which
-        if s1.backend == "rvv":
-            riscv, torch = s1, s2
-        else:
-            riscv, torch = s2, s1
+            # Determine which is which
+            if s1.backend == "rvv":
+                riscv, torch = s1, s2
+            else:
+                riscv, torch = s2, s1
 
-        if torch.avg_ttft_ms > 0:
-            ttft_speedup = (
-                torch.avg_ttft_ms / riscv.avg_ttft_ms if riscv.avg_ttft_ms > 0 else 0
-            )
-            print(
-                f"   TTFT Speedup: {ttft_speedup:.2f}x {'(RISC-V faster)' if ttft_speedup > 1 else '(torch_native faster)'}"
-            )
+            if torch.avg_ttft_ms > 0:
+                ttft_speedup = (
+                    torch.avg_ttft_ms / riscv.avg_ttft_ms
+                    if riscv.avg_ttft_ms > 0
+                    else 0
+                )
+                print(
+                    f"   TTFT Speedup: {ttft_speedup:.2f}x {'(RISC-V faster)' if ttft_speedup > 1 else '(torch_native faster)'}"
+                )
 
-        if torch.avg_throughput_tps > 0:
-            tps_speedup = (
-                riscv.avg_throughput_tps / torch.avg_throughput_tps
-                if torch.avg_throughput_tps > 0
-                else 0
-            )
-            print(
-                f"   Throughput Speedup: {tps_speedup:.2f}x {'(RISC-V faster)' if tps_speedup > 1 else '(torch_native faster)'}"
-            )
+            if torch.avg_throughput_tps > 0:
+                tps_speedup = (
+                    riscv.avg_throughput_tps / torch.avg_throughput_tps
+                    if torch.avg_throughput_tps > 0
+                    else 0
+                )
+                print(
+                    f"   Throughput Speedup: {tps_speedup:.2f}x {'(RISC-V faster)' if tps_speedup > 1 else '(torch_native faster)'}"
+                )
 
-        if torch.avg_decode_latency_ms > 0 and riscv.avg_decode_latency_ms > 0:
-            decode_speedup = torch.avg_decode_latency_ms / riscv.avg_decode_latency_ms
-            print(
-                f"   Decode Latency Speedup: {decode_speedup:.2f}x {'(RISC-V faster)' if decode_speedup > 1 else '(torch_native faster)'}"
-            )
+            if torch.avg_decode_latency_ms > 0 and riscv.avg_decode_latency_ms > 0:
+                decode_speedup = (
+                    torch.avg_decode_latency_ms / riscv.avg_decode_latency_ms
+                )
+                print(
+                    f"   Decode Latency Speedup: {decode_speedup:.2f}x {'(RISC-V faster)' if decode_speedup > 1 else '(torch_native faster)'}"
+                )
+
+            # PPL Comparison
+            if riscv.accuracy_result and torch.accuracy_result:
+                ppl_diff = (
+                    riscv.accuracy_result.perplexity - torch.accuracy_result.perplexity
+                )
+                print(
+                    f"   Perplexity Diff: {ppl_diff:.4f} (RISC-V: {riscv.accuracy_result.perplexity:.4f}, Torch: {torch.accuracy_result.perplexity:.4f})"
+                )
 
 
 def save_results_json(summaries: List[BenchmarkSummary], output_file: str):
     """Save benchmark results to JSON file"""
     results = []
     for summary in summaries:
+        acc_res = None
+        if summary.accuracy_result:
+            acc_res = {
+                "kv_cache_dtype": summary.accuracy_result.kv_cache_dtype,
+                "perplexity": summary.accuracy_result.perplexity,
+                "latency_ms": summary.accuracy_result.avg_latency_ms,
+                "success": summary.accuracy_result.success,
+                "error": summary.accuracy_result.error_msg,
+            }
+
         results.append(
             {
                 "backend": summary.backend,
@@ -794,6 +971,7 @@ def save_results_json(summaries: List[BenchmarkSummary], output_file: str):
                 "max_throughput_tps": summary.max_throughput_tps,
                 "avg_total_time_ms": summary.avg_total_time_ms,
                 "success_rate": summary.success_rate,
+                "accuracy": acc_res,
                 "individual_results": [
                     {
                         "prompt": r.prompt[:50],
@@ -863,6 +1041,17 @@ Examples:
     parser.add_argument(
         "--output", type=str, default=None, help="Output JSON file for results"
     )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default="auto",
+        help="KV cache dtype (auto, float16, int8)",
+    )
+    parser.add_argument(
+        "--test-accuracy",
+        action="store_true",
+        help="Run accuracy (perplexity) test in addition to latency benchmarks",
+    )
 
     args = parser.parse_args()
 
@@ -890,6 +1079,8 @@ Examples:
     print(f"   Measurement runs: {args.num_runs}")
     print(f"   Max tokens: {args.max_tokens}")
     print(f"   Prompts: {len(prompts)}")
+    print(f"   KV Cache: {args.kv_cache_dtype}")
+    print(f"   Test Accuracy: {args.test_accuracy}")
     print("=" * 60)
 
     for backend in backends_to_test:
@@ -901,7 +1092,9 @@ Examples:
         time.sleep(3)
 
         # Create config and launch server
-        config_path = create_config_file(backend, script_dir)
+        config_path = create_config_file(
+            backend, script_dir, kv_cache_dtype=args.kv_cache_dtype
+        )
         log_file = os.path.join(script_dir, f"benchmark_{backend}.log")
 
         if not launch_server(
@@ -920,6 +1113,8 @@ Examples:
             warmup_runs=args.warmup,
             num_runs=args.num_runs,
             max_tokens=args.max_tokens,
+            test_accuracy=args.test_accuracy,
+            kv_cache_dtype=args.kv_cache_dtype,
         )
         summaries.append(summary)
 

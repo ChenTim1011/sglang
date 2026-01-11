@@ -7,6 +7,7 @@ This module provides utilities for:
 3. Fair data generation for FP16/INT8 comparison
 """
 
+import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple
 
@@ -43,13 +44,24 @@ def measure_with_statistics(
         StatisticalResult with mean, std, min, max, median, CI
     """
     results = []
+    results = []
+    # Warmup
+    func()
+
     for _ in range(num_runs):
-        result = func()
-        results.append(result)
+        start = time.perf_counter()
+        func()
+        end = time.perf_counter()
+        results.append((end - start) * 1000.0)  # ms
 
     results_array = np.array(results)
     mean = np.mean(results_array)
-    std = np.std(results_array, ddof=1)  # Sample standard deviation
+
+    if num_runs > 1:
+        std = np.std(results_array, ddof=1)  # Sample standard deviation
+    else:
+        std = 0.0
+
     min_val = np.min(results_array)
     max_val = np.max(results_array)
     median = np.median(results_array)
@@ -57,7 +69,10 @@ def measure_with_statistics(
     # Confidence interval
     # For 95% CI: z = 1.96, for 90% CI: z = 1.645
     z_score = 1.96 if confidence_level == 0.95 else 1.645
-    se = std / np.sqrt(num_runs)  # Standard error
+    if num_runs > 1:
+        se = std / np.sqrt(num_runs)  # Standard error
+    else:
+        se = 0.0
     ci_lower = mean - z_score * se
     ci_upper = mean + z_score * se
 

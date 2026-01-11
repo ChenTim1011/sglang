@@ -21,6 +21,10 @@ limitations under the License.
 #include "shm.h"
 #if defined(CPU_CAPABILITY_RVV)
 #include "rvv/vlen_utils.h"
+// Check if we're using ablation_rvv and include its config
+#if __has_include("ablation_rvv/ablation_config.h")
+#include "ablation_rvv/ablation_config.h"
+#endif
 #endif
 
 // silu_and_mul
@@ -94,8 +98,13 @@ void decode_attention_cpu(
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
     double sm_scale,
-    double logit_cap);
+    double logit_cap,
+    double k_scale = 1.0,
+    double v_scale = 1.0);
 
+// Only declare if INT8 is enabled (for ablation study) or if not using ablation_rvv
+// When using ablation_rvv, only declare if RVV_ABL_INT8 is defined and enabled
+#if !defined(CPU_CAPABILITY_RVV) || (defined(RVV_ABL_INT8) && RVV_ABL_INT8)
 #if defined(CPU_CAPABILITY_RVV)
 void decode_attention_int8_cpu(
     at::Tensor& query,
@@ -114,6 +123,7 @@ void decode_attention_int8_cpu(
     double k_scale,
     double v_scale);
 #endif  // CPU_CAPABILITY_RVV
+#endif  // !defined(CPU_CAPABILITY_RVV) || (defined(RVV_ABL_INT8) && RVV_ABL_INT8)
 
 void extend_attention_cpu(
     at::Tensor& q_extend,
@@ -131,6 +141,9 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap);
 
+// Only declare if INT8 is enabled (for ablation study) or if not using ablation_rvv
+// When using ablation_rvv, only declare if RVV_ABL_INT8 is defined and enabled
+#if !defined(CPU_CAPABILITY_RVV) || (defined(RVV_ABL_INT8) && RVV_ABL_INT8)
 #if defined(CPU_CAPABILITY_RVV)
 void extend_attention_int8_cpu(
     at::Tensor& q_extend,
@@ -150,6 +163,7 @@ void extend_attention_int8_cpu(
     double k_scale,
     double v_scale);
 #endif  // CPU_CAPABILITY_RVV
+#endif  // !defined(CPU_CAPABILITY_RVV) || (defined(RVV_ABL_INT8) && RVV_ABL_INT8)
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
@@ -190,6 +204,9 @@ at::Tensor fp8_scaled_mm_cpu(
     bool is_vnni);
 
 // quant + igemm
+// Only declare if INT8 is enabled (for ablation study) or if not using ablation_rvv
+// When using ablation_rvv, only declare if RVV_ABL_INT8 is defined and enabled
+#if !defined(CPU_CAPABILITY_RVV) || (defined(RVV_ABL_INT8) && RVV_ABL_INT8)
 at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& mat1,
     at::Tensor& mat2,
@@ -197,6 +214,7 @@ at::Tensor int8_scaled_mm_with_quant(
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni);
+#endif
 
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
@@ -400,18 +418,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor key, Tensor value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
-      "float logit_cap) -> ()");
+      "float logit_cap, float k_scale=1.0, float v_scale=1.0) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
-  // decode_int8 - RVV only
-#if defined(CPU_CAPABILITY_RVV)
+  // decode_int8 - RVV only, and only if INT8 is enabled (for ablation study)
+  // When using ablation_rvv, only register if RVV_ABL_INT8 is defined and enabled
+#if defined(CPU_CAPABILITY_RVV) && (!defined(RVV_ABL_INT8) || RVV_ABL_INT8)
   m.def(
       "decode_attention_int8_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor key, Tensor "
       "value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
       "float logit_cap, float k_scale, float v_scale) -> ()");
   m.impl("decode_attention_int8_cpu", torch::kCPU, &decode_attention_int8_cpu);
-#endif  // CPU_CAPABILITY_RVV
+#endif  // CPU_CAPABILITY_RVV && (!defined(RVV_ABL_INT8) || RVV_ABL_INT8)
 
   // extend
   m.def(
@@ -420,8 +439,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
-  // extend_int8 - RVV only
-#if defined(CPU_CAPABILITY_RVV)
+  // extend_int8 - RVV only, and only if INT8 is enabled (for ablation study)
+  // When using ablation_rvv, only register if RVV_ABL_INT8 is defined and enabled
+#if defined(CPU_CAPABILITY_RVV) && (!defined(RVV_ABL_INT8) || RVV_ABL_INT8)
   m.def(
       "extend_attention_int8_cpu(Tensor q_extend, Tensor k_extend, Tensor v_extend, Tensor(a!) o_extend, Tensor "
       "k_buffer, "
@@ -429,7 +449,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, float k_scale=1.0, float v_scale=1.0) -> "
       "()");
   m.impl("extend_attention_int8_cpu", torch::kCPU, &extend_attention_int8_cpu);
-#endif  // CPU_CAPABILITY_RVV
+#endif  // CPU_CAPABILITY_RVV && (!defined(RVV_ABL_INT8) || RVV_ABL_INT8)
 
   // weight prepack
   m.def("convert_weight_packed(Tensor weight) -> Tensor");
@@ -461,10 +481,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fp8_scaled_mm_cpu", torch::kCPU, &fp8_scaled_mm_cpu);
 
   // quant + igemm
+  // Only register if INT8 is enabled (for ablation study) or if not using ablation_rvv
+  // When using ablation_rvv, only register if RVV_ABL_INT8 is defined and enabled
+#if !defined(CPU_CAPABILITY_RVV) || (defined(RVV_ABL_INT8) && RVV_ABL_INT8)
   m.def(
       "int8_scaled_mm_with_quant(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, ScalarType out_dtype, bool "
       "is_packed) -> Tensor");
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
+#endif
 
   // bmm
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");

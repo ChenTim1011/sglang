@@ -1,10 +1,8 @@
 #if defined(CPU_CAPABILITY_RVV) && defined(__clang__)
 #pragma clang riscv intrinsic vector
 #endif
-#if defined(CPU_CAPABILITY_RVV) && defined(__clang__)
-#pragma clang riscv intrinsic vector
-#endif
 
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -687,7 +685,7 @@ inline float exp_rvv(const float* __restrict__ scores, float* __restrict__ outpu
     v_sum_acc = __riscv_vfadd_vv_f32m8(v_sum_acc, vex, vl);
   }
 
-  // Use helper function for reduction (v_sum_scalar is already initialized to 0.0f)
+  // Use helper function for reduction
   return reduce_sum_f32m8(v_sum_acc, vl_max);
 }
 
@@ -1618,208 +1616,197 @@ void decode_attention_grouped_kernel_rvv(
       v_scale);
 }
 
-// RVV-specific decode_attention_cpu entry point
-void decode_attention_cpu(
-    at::Tensor& query,
-    at::Tensor& k_buffer,
-    at::Tensor& v_buffer,
-    at::Tensor& output,
-    at::Tensor& key,
-    at::Tensor& value,
-    at::Tensor& loc,
-    at::Tensor& attn_logits,
-    at::Tensor& req_to_token,
-    at::Tensor& req_pool_indices,
-    at::Tensor& seq_lens,
-    double sm_scale,
-    double logit_cap) {
-  RECORD_FUNCTION(
-      "sgl-kernel::decode_attention_cpu_rvv",
-      std::vector<c10::IValue>(
-          {query, output, k_buffer, v_buffer, attn_logits, req_to_token, req_pool_indices, seq_lens}));
+// Wrapper for upstream dispatch (MHA)
+// Ignores BLOCK_N template parameter because RVV implementation selects it automatically
+namespace sgl_kernel {
+namespace rvv {
 
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(value);
-  CHECK_DIM(3, query);
-  CHECK_DIM(3, k_buffer);
-  CHECK_DIM(3, v_buffer);
-  CHECK_DIM(3, key);
-  CHECK_DIM(3, value);
-  CHECK_DIM(1, loc);
-
-  int64_t num_seqs = seq_lens.size(0);
-  int64_t max_num_reqs = req_to_token.size(0);
-  int64_t max_context_len = req_to_token.size(1);
-  int64_t max_total_num_tokens = k_buffer.size(0);
-
-  int64_t num_heads = query.size(1);
-  int64_t num_heads_kv = k_buffer.size(1);
-  int64_t head_size = query.size(2);
-  int64_t head_size_v = v_buffer.size(2);
-
-  int64_t num_kv_splits = attn_logits.size(2);
-
-  CHECK_EQ(loc.numel(), num_seqs);
-  CHECK_EQ(attn_logits.size(0), num_seqs);
-  CHECK_EQ(attn_logits.size(1), num_heads);
-  CHECK_EQ(attn_logits.size(3), head_size_v + 1);
-  CHECK_EQ(attn_logits.scalar_type(), at::kFloat);
-
-  // strides for query
-  int64_t q_strideM = query.stride(0);
-  int64_t q_strideH = query.stride(1);
-
-  // strides for k_buffer and v_buffer
-  int64_t k_strideN = k_buffer.stride(0);
-  int64_t k_strideH = k_buffer.stride(1);
-  int64_t v_strideN = v_buffer.stride(0);
-  int64_t v_strideH = v_buffer.stride(1);
-  // strides for new key and value
-  int64_t nk_strideN = key.stride(0);
-  int64_t nk_strideH = key.stride(1);
-  int64_t nv_strideN = value.stride(0);
-  int64_t nv_strideH = value.stride(1);
-
-  // check index data types
-  const auto index_dtype = req_to_token.scalar_type();
-  TORCH_CHECK(
-      index_dtype == at::kInt || index_dtype == at::kLong,
-      "decode: expect req_to_token to be int32 or int64, got ",
-      index_dtype);
-  TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "decode: expect req_lens to be int64, got ", seq_lens.scalar_type());
-  TORCH_CHECK(
-      req_pool_indices.scalar_type() == at::kLong,
-      "decode: expect req_pool_indices to be int64, got ",
-      req_pool_indices.scalar_type());
-
-  // check if we have MLA here
-  void* k_buffer_data = k_buffer.data_ptr();
-  void* v_buffer_data = v_buffer.data_ptr();
-  const bool is_mla = (k_buffer_data == v_buffer_data) && (num_heads_kv == 1) && (head_size == head_size_v + 64);
-
-  // buffer for packing k_cache and v_cache
-  int num_threads = at::get_num_threads();
-  // MLA is not yet implemented for RVV, so size_per_thread is 0
-  int64_t size_per_thread = 0;
-  auto buffer = at::empty({num_threads, size_per_thread}, k_buffer.options());
-
-  // Use AT_DISPATCH_REDUCED_FLOATING_TYPES for Half and BFloat16 only
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "decode_attention_kernel", [&] {
-    AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
-      // update the kv buffer
-      decode_set_kv_buffer(
-          (scalar_t*)k_buffer_data,
-          (scalar_t*)v_buffer_data,
-          key.data_ptr<scalar_t>(),
-          value.data_ptr<scalar_t>(),
-          loc.data_ptr<int64_t>(),
-          num_seqs,
-          num_heads_kv,
-          head_size,
-          head_size_v,
-          k_strideN,
-          k_strideH,
-          v_strideN,
-          v_strideH,
-          nk_strideN,
-          nk_strideH,
-          nv_strideN,
-          nv_strideH,
-          is_mla);
-
-      if (num_heads == num_heads_kv) {
-        // MHA
-        // RVV path: Use auto block size selection (no BLOCK_N template parameter)
-        decode_attention_kernel_rvv_auto<scalar_t, index_t>(
-            output.data_ptr<scalar_t>(),
-            attn_logits.data_ptr<float>(),
-            query.data_ptr<scalar_t>(),
-            (const void*)k_buffer_data,
-            (const void*)v_buffer_data,
-            req_to_token.data_ptr<index_t>(),
-            req_pool_indices.data_ptr<int64_t>(),
-            seq_lens.data_ptr<int64_t>(),
-            num_seqs,
-            num_heads,
-            head_size,
-            head_size_v,
-            num_kv_splits,
-            q_strideM,
-            q_strideH,
-            k_strideN,
-            k_strideH,
-            v_strideN,
-            v_strideH,
-            sm_scale,
-            logit_cap,
-            max_num_reqs,
-            max_context_len,
-            max_total_num_tokens);
-      } else if (is_mla) {
-        // MLA - Currently, RVV MLA is not implemented. Fallback to GQA/MQA for now.
-        // TODO: Implement MLA specific kernel for RVV
-        decode_attention_grouped_kernel_rvv_auto<scalar_t, index_t>(
-            output.data_ptr<scalar_t>(),
-            attn_logits.data_ptr<float>(),
-            query.data_ptr<scalar_t>(),
-            (const void*)k_buffer_data,
-            (const void*)v_buffer_data,
-            req_to_token.data_ptr<index_t>(),
-            req_pool_indices.data_ptr<int64_t>(),
-            seq_lens.data_ptr<int64_t>(),
-            num_seqs,
-            num_heads,
-            num_heads_kv,
-            head_size,
-            head_size_v,
-            num_kv_splits,
-            q_strideM,
-            q_strideH,
-            k_strideN,
-            k_strideH,
-            v_strideN,
-            v_strideH,
-            sm_scale,
-            logit_cap,
-            max_num_reqs,
-            max_context_len,
-            max_total_num_tokens);
-      } else {
-        // GQA/MQA
-        // RVV path: Use auto block size selection (no BLOCK_N template parameter)
-        decode_attention_grouped_kernel_rvv_auto<scalar_t, index_t>(
-            output.data_ptr<scalar_t>(),
-            attn_logits.data_ptr<float>(),
-            query.data_ptr<scalar_t>(),
-            (const void*)k_buffer_data,
-            (const void*)v_buffer_data,
-            req_to_token.data_ptr<index_t>(),
-            req_pool_indices.data_ptr<int64_t>(),
-            seq_lens.data_ptr<int64_t>(),
-            num_seqs,
-            num_heads,
-            num_heads_kv,
-            head_size,
-            head_size_v,
-            num_kv_splits,
-            q_strideM,
-            q_strideH,
-            k_strideN,
-            k_strideH,
-            v_strideN,
-            v_strideH,
-            sm_scale,
-            logit_cap,
-            max_num_reqs,
-            max_context_len,
-            max_total_num_tokens);
-      }
-    });
-  });
+template <typename scalar_t, typename index_t, int64_t BLOCK_N_IGNORED>
+void decode_attention_kernel_rvv_adapter(
+    scalar_t* __restrict__ output,
+    float* __restrict__ attn_logits,
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ k_buffer,
+    const scalar_t* __restrict__ v_buffer,
+    const index_t* __restrict__ req_to_token,
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ seq_lens,
+    int64_t batches,
+    int64_t num_heads,
+    int64_t head_size,
+    int64_t head_size_v,
+    int64_t num_kv_splits,
+    int64_t q_strideM,
+    int64_t q_strideH,
+    int64_t k_strideN,
+    int64_t k_strideH,
+    int64_t v_strideN,
+    int64_t v_strideH,
+    float scaling,
+    float logit_cap,
+    int64_t max_num_reqs,
+    int64_t max_context_len,
+    int64_t max_total_num_tokens,
+    float k_scale = 1.0f,
+    float v_scale = 1.0f) {
+  // Forward to auto-tuned kernel with default scales (1.0f)
+  ::decode_attention_kernel_rvv_auto<scalar_t, index_t>(
+      output,
+      attn_logits,
+      query,
+      k_buffer,
+      v_buffer,
+      req_to_token,
+      req_pool_indices,
+      seq_lens,
+      batches,
+      num_heads,
+      head_size,
+      head_size_v,
+      num_kv_splits,
+      q_strideM,
+      q_strideH,
+      k_strideN,
+      k_strideH,
+      v_strideN,
+      v_strideH,
+      scaling,
+      logit_cap,
+      max_num_reqs,
+      max_context_len,
+      max_total_num_tokens,
+      k_scale,
+      v_scale);
 }
+
+// Wrapper for upstream dispatch (GQA)
+// Ignores BLOCK_N template parameter because RVV implementation selects it automatically
+template <typename scalar_t, typename index_t, int64_t BLOCK_N_IGNORED>
+void decode_attention_grouped_kernel_rvv_adapter(
+    scalar_t* __restrict__ output,
+    float* __restrict__ attn_logits,
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ k_buffer,
+    const scalar_t* __restrict__ v_buffer,
+    const index_t* __restrict__ req_to_token,
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ seq_lens,
+    int64_t batches,
+    int64_t num_heads,
+    int64_t num_heads_kv,
+    int64_t head_size,
+    int64_t head_size_v,
+    int64_t num_kv_splits,
+    int64_t q_strideM,
+    int64_t q_strideH,
+    int64_t k_strideN,
+    int64_t k_strideH,
+    int64_t v_strideN,
+    int64_t v_strideH,
+    float scaling,
+    float logit_cap,
+    int64_t max_num_reqs,
+    int64_t max_context_len,
+    int64_t max_total_num_tokens,
+    float k_scale = 1.0f,
+    float v_scale = 1.0f) {
+  // Forward to auto-tuned kernel with default scales (1.0f)
+  ::decode_attention_grouped_kernel_rvv_auto<scalar_t, index_t>(
+      output,
+      attn_logits,
+      query,
+      k_buffer,
+      v_buffer,
+      req_to_token,
+      req_pool_indices,
+      seq_lens,
+      batches,
+      num_heads,
+      num_heads_kv,
+      head_size,
+      head_size_v,
+      num_kv_splits,
+      q_strideM,
+      q_strideH,
+      k_strideN,
+      k_strideH,
+      v_strideN,
+      v_strideH,
+      scaling,
+      logit_cap,
+      max_num_reqs,
+      max_context_len,
+      max_total_num_tokens,
+      k_scale,
+      v_scale);
+}
+
+#define INSTANTIATE_RVV_ADAPTER(scalar_t, index_t)                                   \
+  template void decode_attention_kernel_rvv_adapter<scalar_t, index_t, 256>(         \
+      scalar_t* __restrict__ output,                                                 \
+      float* __restrict__ attn_logits,                                               \
+      const scalar_t* __restrict__ query,                                            \
+      const scalar_t* __restrict__ k_buffer,                                         \
+      const scalar_t* __restrict__ v_buffer,                                         \
+      const index_t* __restrict__ req_to_token,                                      \
+      const int64_t* __restrict__ req_pool_indices,                                  \
+      const int64_t* __restrict__ seq_lens,                                          \
+      int64_t batches,                                                               \
+      int64_t num_heads,                                                             \
+      int64_t head_size,                                                             \
+      int64_t head_size_v,                                                           \
+      int64_t num_kv_splits,                                                         \
+      int64_t q_strideM,                                                             \
+      int64_t q_strideH,                                                             \
+      int64_t k_strideN,                                                             \
+      int64_t k_strideH,                                                             \
+      int64_t v_strideN,                                                             \
+      int64_t v_strideH,                                                             \
+      float scaling,                                                                 \
+      float logit_cap,                                                               \
+      int64_t max_num_reqs,                                                          \
+      int64_t max_context_len,                                                       \
+      int64_t max_total_num_tokens,                                                  \
+      float k_scale,                                                                 \
+      float v_scale);                                                                \
+  template void decode_attention_grouped_kernel_rvv_adapter<scalar_t, index_t, 256>( \
+      scalar_t* __restrict__ output,                                                 \
+      float* __restrict__ attn_logits,                                               \
+      const scalar_t* __restrict__ query,                                            \
+      const scalar_t* __restrict__ k_buffer,                                         \
+      const scalar_t* __restrict__ v_buffer,                                         \
+      const index_t* __restrict__ req_to_token,                                      \
+      const int64_t* __restrict__ req_pool_indices,                                  \
+      const int64_t* __restrict__ seq_lens,                                          \
+      int64_t batches,                                                               \
+      int64_t num_heads,                                                             \
+      int64_t num_heads_kv,                                                          \
+      int64_t head_size,                                                             \
+      int64_t head_size_v,                                                           \
+      int64_t num_kv_splits,                                                         \
+      int64_t q_strideM,                                                             \
+      int64_t q_strideH,                                                             \
+      int64_t k_strideN,                                                             \
+      int64_t k_strideH,                                                             \
+      int64_t v_strideN,                                                             \
+      int64_t v_strideH,                                                             \
+      float scaling,                                                                 \
+      float logit_cap,                                                               \
+      int64_t max_num_reqs,                                                          \
+      int64_t max_context_len,                                                       \
+      int64_t max_total_num_tokens,                                                  \
+      float k_scale,                                                                 \
+      float v_scale)
+
+INSTANTIATE_RVV_ADAPTER(at::Half, int32_t);
+INSTANTIATE_RVV_ADAPTER(at::Half, int64_t);
+INSTANTIATE_RVV_ADAPTER(at::BFloat16, int32_t);
+INSTANTIATE_RVV_ADAPTER(at::BFloat16, int64_t);
+
+#undef INSTANTIATE_RVV_ADAPTER
+
+}  // namespace rvv
+}  // namespace sgl_kernel
 
 template void decode_attention_kernel_rvv_auto<at::Half, int32_t>(
     at::Half* __restrict__ output,

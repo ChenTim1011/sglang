@@ -178,13 +178,67 @@ endif()
 # =============================================================================
 # Get all cpp files in current directory
 file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+file(GLOB MAMBA_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/mamba/*.cpp")
+file(GLOB MODEL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/model/*.cpp")
+list(APPEND SOURCES ${MAMBA_SOURCES} ${MODEL_SOURCES})
 
 # Exclude shm.cpp - it contains x86-specific intrinsics (immintrin.h)
 list(FILTER SOURCES EXCLUDE REGEX ".*shm\\.cpp$")
 message(STATUS "Excluding shm.cpp (contains x86-specific intrinsics)")
 
-# Include RVV-specific source files from rvv/ subdirectory
-file(GLOB_RECURSE RVV_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/rvv/*.cpp")
+# Check if using ablation_rvv or regular rvv
+option(USE_ABLATION_RVV "Use ablation_rvv directory instead of rvv" OFF)
+
+if(USE_ABLATION_RVV)
+    message(STATUS "Using ablation_rvv directory for ablation study")
+    file(GLOB_RECURSE RVV_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/ablation_rvv/*.cpp")
+    # Always include vlen_utils.cpp from rvv/ directory (required for get_rvv_vlenb functions)
+    file(GLOB VLEN_UTILS_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/rvv/vlen_utils.cpp")
+    if(VLEN_UTILS_SOURCES)
+        list(APPEND RVV_SOURCES ${VLEN_UTILS_SOURCES})
+        message(STATUS "Including vlen_utils.cpp from rvv/ directory")
+    endif()
+    # If INT8 is enabled, include INT8-related source files from rvv/ directory
+    # (ablation_rvv doesn't have INT8 implementations, but we add the kernel functions to ablation_rvv/decode.cpp)
+    if(RVV_ABL_INT8)
+        # Include decode_int8.cpp (for decode_attention_int8_cpu wrapper)
+        file(GLOB DECODE_INT8_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/rvv/decode_int8.cpp")
+        if(DECODE_INT8_SOURCES)
+            list(APPEND RVV_SOURCES ${DECODE_INT8_SOURCES})
+            message(STATUS "Including decode_int8.cpp from rvv/ directory (INT8 enabled)")
+        else()
+            message(WARNING "RVV_ABL_INT8 is enabled but decode_int8.cpp not found in rvv/ directory")
+        endif()
+        # Include extend_int8.cpp (for extend_attention_int8_cpu wrapper)
+        file(GLOB EXTEND_INT8_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/rvv/extend_int8.cpp")
+        if(EXTEND_INT8_SOURCES)
+            list(APPEND RVV_SOURCES ${EXTEND_INT8_SOURCES})
+            message(STATUS "Including extend_int8.cpp from rvv/ directory (INT8 enabled)")
+        else()
+            message(WARNING "RVV_ABL_INT8 is enabled but extend_int8.cpp not found in rvv/ directory")
+        endif()
+        # Include gemm_int8.cpp (for int8_scaled_mm_with_quant)
+        # Check if ablation_rvv/gemm_int8.cpp exists
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ablation_rvv/gemm_int8.cpp")
+            message(STATUS "Using gemm_int8.cpp from ablation_rvv/ directory")
+        else()
+            file(GLOB GEMM_INT8_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/rvv/gemm_int8.cpp")
+            if(GEMM_INT8_SOURCES)
+                list(APPEND RVV_SOURCES ${GEMM_INT8_SOURCES})
+                message(STATUS "Including gemm_int8.cpp from rvv/ directory (INT8 enabled)")
+            else()
+                message(WARNING "RVV_ABL_INT8 is enabled but gemm_int8.cpp not found in rvv/ directory")
+            endif()
+        endif()
+        # Note: decode_attention_kernel_rvv_int8 and extend_attention_kernel_rvv_int8 are now
+        # implemented in ablation_rvv/decode.cpp and ablation_rvv/extend.cpp (added via conditional compilation)
+        # So we don't need to include rvv/decode.cpp or rvv/extend.cpp to avoid duplicate definitions
+    endif()
+else()
+    message(STATUS "Using regular rvv directory")
+    file(GLOB_RECURSE RVV_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/rvv/*.cpp")
+endif()
+
 if(RVV_SOURCES)
     list(APPEND SOURCES ${RVV_SOURCES})
     message(STATUS "Including RVV-specific sources: ${RVV_SOURCES}")
@@ -242,6 +296,10 @@ endif()
 
 # --- RVV Compile Options ---
 # Note: Spacemit X60 supports zvfh (vector half-precision floating-point)
+# All configurations use -O3 for fair comparison
+# Baseline = scalar code with -O3 (compiler can optimize scalar code)
+# Other configs = RVV optimized code with -O3
+# This ensures we're comparing RVV optimizations, not compiler optimization levels
 add_compile_options(
     -O3
     -Wno-unknown-pragmas
@@ -254,6 +312,41 @@ add_compile_options(
 
 # Define CPU_CAPABILITY_RVV for RISC-V Vector Extension
 add_compile_definitions(CPU_CAPABILITY_RVV)
+
+# Convert ablation study CMake variables to compile definitions
+# CRITICAL: These variables MUST be converted to compile definitions so C++ preprocessor can see them
+# Use option() to define them as cache variables, which allows them to be overridden via -D
+# This ensures variables passed via SKBUILD_CMAKE_ARGS are accessible
+option(RVV_ABL_VECTORIZATION "Enable vectorization optimization" ON)
+option(RVV_ABL_FP16_NATIVE "Enable native FP16 support" ON)
+option(RVV_ABL_BF16_MANUAL "Enable manual BF16 conversion" ON)
+option(RVV_ABL_M1_SPECIALIZED "Enable M=1 specialized kernel" ON)
+option(RVV_ABL_DYNAMIC_BLOCK "Enable dynamic block size selection" ON)
+option(RVV_ABL_VECTOR_MATH "Enable vectorized math functions" ON)
+option(RVV_ABL_CACHE_AWARE "Enable cache-aware tiling" ON)
+option(RVV_ABL_OPENMP "Enable OpenMP parallelization" ON)
+option(RVV_ABL_INT8 "Enable INT8 quantization" ON)
+option(RVV_ABL_LMUL "LMUL configuration (1, 2, 4, or 8)" 4)
+
+# Convert boolean flags to compile definitions (use 0/1 for boolean values)
+foreach(VAR IN ITEMS RVV_ABL_VECTORIZATION RVV_ABL_FP16_NATIVE RVV_ABL_BF16_MANUAL RVV_ABL_M1_SPECIALIZED RVV_ABL_DYNAMIC_BLOCK RVV_ABL_VECTOR_MATH RVV_ABL_CACHE_AWARE RVV_ABL_OPENMP RVV_ABL_INT8)
+    if(${VAR})
+        add_compile_definitions(${VAR}=1)
+        message(STATUS "Ablation flag: ${VAR}=1")
+    else()
+        add_compile_definitions(${VAR}=0)
+        message(STATUS "Ablation flag: ${VAR}=0")
+    endif()
+endforeach()
+
+# Handle LMUL as integer value
+if(RVV_ABL_LMUL)
+    add_compile_definitions(RVV_ABL_LMUL=${RVV_ABL_LMUL})
+    message(STATUS "Ablation flag: RVV_ABL_LMUL=${RVV_ABL_LMUL}")
+else()
+    add_compile_definitions(RVV_ABL_LMUL=4)
+    message(STATUS "Ablation flag: RVV_ABL_LMUL=4 (default)")
+endif()
 
 # --- Find riscv_vector.h ---
 get_filename_component(CLANG_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)

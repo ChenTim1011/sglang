@@ -641,6 +641,11 @@ class RVVAttnBackend(AttentionBackend):
         """Get the fill value for padded seq lens."""
         return self.fallback_backend.get_graph_seq_len_fill_value()
 
+    def get_cuda_graph_seq_len_fill_value(self):
+        """Get the fill value for padded seq lens in CUDA graph. For CPU backend, same as get_graph_seq_len_fill_value."""
+        # For CPU backend, CUDA graph is not applicable, but we return the same value for compatibility
+        return self.get_graph_seq_len_fill_value()
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init CUDA graph state - not applicable for CPU backend."""
         pass

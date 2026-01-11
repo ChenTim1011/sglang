@@ -142,7 +142,6 @@ void decode_set_kv_buffer_int8_copy(
       buffer_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
       const buffer_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
       copy_stub_rvv<buffer_t>(v_buffer_ptr, new_value_ptr, head_size_v);
-
       data_index_step(bs, batches, head_kv_id, num_heads_kv);
     }
   });

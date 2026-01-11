@@ -151,8 +151,10 @@ from sglang.srt.utils import (
     get_cpu_ids_by_node,
     get_local_ip_auto,
     init_custom_process_group,
+    is_cuda,
     is_hip,
     is_host_cpu_arm64,
+    is_host_cpu_riscv,
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
@@ -162,6 +164,7 @@ from sglang.srt.utils import (
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
+    xpu_has_xmx_support,
 )
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
@@ -180,10 +183,13 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
+_is_cpu_riscv_available = is_host_cpu_riscv()
+_is_xpu_xmx_available = xpu_has_xmx_support()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -226,6 +232,9 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
             f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
         )
 
+
+# Use a small KV cache pool size for tests in CI
+SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
@@ -747,7 +756,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not self.is_draft_worker:
             if self.device == "cpu":
-                if _is_cpu_amx_available or _is_cpu_arm64:
+                if _is_cpu_amx_available or _is_cpu_arm64 or _is_cpu_riscv_available:
                     # Bind OpenMP threads to CPU cores
                     torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
@@ -761,7 +770,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 else:
                     logger.warning(
-                        "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
+                        "init_cpu_threads_env and shared memory based AllReduce is disabled since intel amx backend is not available"
                     )
 
             # Only initialize the distributed environment on the target model worker.

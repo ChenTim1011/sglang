@@ -172,57 +172,160 @@ void int8_scaled_mm_rvv_impl(
       int32_t acc[BLOCK_M_INT8][BLOCK_N];
       constexpr int64_t N_CHUNK = rvv_constants::INT8_N_CHUNK_GENERAL;
 
-      for (int i = 0; i < m_size; ++i) {
-        size_t vl_max_chunk = __riscv_vsetvlmax_e32m4();
-        for (int64_t n_chunk_start = 0; n_chunk_start < n_size; n_chunk_start += N_CHUNK) {
-          int64_t n_chunk_size = std::min(N_CHUNK, n_size - n_chunk_start);
-          size_t vl = (n_chunk_size >= vl_max_chunk) ? vl_max_chunk : __riscv_vsetvl_e32m4(n_chunk_size);
+      size_t vl_max_chunk = __riscv_vsetvlmax_e32m4();
+      for (int64_t n_chunk_start = 0; n_chunk_start < n_size; n_chunk_start += N_CHUNK) {
+        int64_t n_chunk_size = std::min(N_CHUNK, n_size - n_chunk_start);
+        size_t vl = (n_chunk_size >= vl_max_chunk) ? vl_max_chunk : __riscv_vsetvl_e32m4(n_chunk_size);
 
-          vint32m4_t v_acc = __riscv_vmv_v_x_i32m4(0, vl);
+        // Manual unrolling for BLOCK_M_INT8 = 4
+        // Vectors cannot be in arrays
+        vint32m4_t v_acc0 = __riscv_vmv_v_x_i32m4(0, vl);
+        vint32m4_t v_acc1 = __riscv_vmv_v_x_i32m4(0, vl);
+        vint32m4_t v_acc2 = __riscv_vmv_v_x_i32m4(0, vl);
+        vint32m4_t v_acc3 = __riscv_vmv_v_x_i32m4(0, vl);
 
-          for (int64_t k = 0; k < K; ++k) {
-            uint8_t a_val = mat1[(m_start + i) * K + k];
-            if (a_val == 0) continue;
+        // Unroll K loop by 4
+        int64_t k = 0;
+        for (; k <= K - 4; k += 4) {
+          uint8_t a_val0 = mat1[(m_start + 0) * K + k];
+          uint8_t a_val1 = mat1[(m_start + 0) * K + k + 1];
+          uint8_t a_val2 = mat1[(m_start + 0) * K + k + 2];
+          uint8_t a_val3 = mat1[(m_start + 0) * K + k + 3];
 
-            const int8_t* b_ptr;
-            ptrdiff_t b_stride;
+          uint8_t a_vals[4][4];  // [m][k_offset]
+          if (m_size > 0)
+            a_vals[0][0] = mat1[(m_start + 0) * K + k], a_vals[0][1] = mat1[(m_start + 0) * K + k + 1],
+            a_vals[0][2] = mat1[(m_start + 0) * K + k + 2], a_vals[0][3] = mat1[(m_start + 0) * K + k + 3];
+          if (m_size > 1)
+            a_vals[1][0] = mat1[(m_start + 1) * K + k], a_vals[1][1] = mat1[(m_start + 1) * K + k + 1],
+            a_vals[1][2] = mat1[(m_start + 1) * K + k + 2], a_vals[1][3] = mat1[(m_start + 1) * K + k + 3];
+          if (m_size > 2)
+            a_vals[2][0] = mat1[(m_start + 2) * K + k], a_vals[2][1] = mat1[(m_start + 2) * K + k + 1],
+            a_vals[2][2] = mat1[(m_start + 2) * K + k + 2], a_vals[2][3] = mat1[(m_start + 2) * K + k + 3];
+          if (m_size > 3)
+            a_vals[3][0] = mat1[(m_start + 3) * K + k], a_vals[3][1] = mat1[(m_start + 3) * K + k + 1],
+            a_vals[3][2] = mat1[(m_start + 3) * K + k + 2], a_vals[3][3] = mat1[(m_start + 3) * K + k + 3];
 
-            if (is_packed) {
-              b_ptr = mat2 + nb * K * BLOCK_N + k * BLOCK_N + n_chunk_start;
-              b_stride = 1;
+          const int8_t* b_ptr0;
+          const int8_t* b_ptr1;
+          const int8_t* b_ptr2;
+          const int8_t* b_ptr3;
+          ptrdiff_t b_stride;
 
-              if (k + rvv_constants::PREFETCH_DISTANCE < K) {
-                __builtin_prefetch(
-                    mat2 + nb * K * BLOCK_N + (k + rvv_constants::PREFETCH_DISTANCE) * BLOCK_N + n_chunk_start,
-                    0,
-                    rvv_constants::PREFETCH_LOCALITY);
-              }
-            } else {
-              b_ptr = mat2 + (n_start + n_chunk_start) * K + k;
-              b_stride = K;
-
-              if (k + rvv_constants::PREFETCH_DISTANCE < K) {
-                __builtin_prefetch(
-                    mat2 + (n_start + n_chunk_start) * K + (k + rvv_constants::PREFETCH_DISTANCE),
-                    0,
-                    rvv_constants::PREFETCH_LOCALITY);
-              }
+          if (is_packed) {
+            int64_t b_offset_base = nb * K * BLOCK_N + n_chunk_start;
+            b_ptr0 = mat2 + b_offset_base + k * BLOCK_N;
+            b_ptr1 = mat2 + b_offset_base + (k + 1) * BLOCK_N;
+            b_ptr2 = mat2 + b_offset_base + (k + 2) * BLOCK_N;
+            b_ptr3 = mat2 + b_offset_base + (k + 3) * BLOCK_N;
+            b_stride = 1;
+            if (k + rvv_constants::PREFETCH_DISTANCE < K) {
+              __builtin_prefetch(
+                  mat2 + b_offset_base + (k + rvv_constants::PREFETCH_DISTANCE) * BLOCK_N,
+                  0,
+                  rvv_constants::PREFETCH_LOCALITY);
             }
-
-            vint8m1_t v_b;
-            if (is_packed) {
-              v_b = __riscv_vle8_v_i8m1(b_ptr, vl);
-            } else {
-              v_b = __riscv_vlse8_v_i8m1(b_ptr, b_stride, vl);
+          } else {
+            int64_t b_offset_base = (n_start + n_chunk_start) * K;
+            b_ptr0 = mat2 + b_offset_base + k;
+            b_ptr1 = mat2 + b_offset_base + k + 1;
+            b_ptr2 = mat2 + b_offset_base + k + 2;
+            b_ptr3 = mat2 + b_offset_base + k + 3;
+            b_stride = K;
+            if (k + rvv_constants::PREFETCH_DISTANCE < K) {
+              __builtin_prefetch(
+                  mat2 + b_offset_base + (k + rvv_constants::PREFETCH_DISTANCE), 0, rvv_constants::PREFETCH_LOCALITY);
             }
-
-            vint16m2_t v_b16 = __riscv_vsext_vf2_i16m2(v_b, vl);
-            int16_t a_val_16 = static_cast<int16_t>(static_cast<uint16_t>(a_val));
-            v_acc = __riscv_vwmacc_vx_i32m4(v_acc, a_val_16, v_b16, vl);
           }
 
-          __riscv_vse32_v_i32m4(acc[i] + n_chunk_start, v_acc, vl);
+          vint8m1_t v_b0, v_b1, v_b2, v_b3;
+          if (is_packed) {
+            v_b0 = __riscv_vle8_v_i8m1(b_ptr0, vl);
+            v_b1 = __riscv_vle8_v_i8m1(b_ptr1, vl);
+            v_b2 = __riscv_vle8_v_i8m1(b_ptr2, vl);
+            v_b3 = __riscv_vle8_v_i8m1(b_ptr3, vl);
+          } else {
+            v_b0 = __riscv_vlse8_v_i8m1(b_ptr0, b_stride, vl);
+            v_b1 = __riscv_vlse8_v_i8m1(b_ptr1, b_stride, vl);
+            v_b2 = __riscv_vlse8_v_i8m1(b_ptr2, b_stride, vl);
+            v_b3 = __riscv_vlse8_v_i8m1(b_ptr3, b_stride, vl);
+          }
+
+          vint16m2_t v_b16_0 = __riscv_vsext_vf2_i16m2(v_b0, vl);
+          vint16m2_t v_b16_1 = __riscv_vsext_vf2_i16m2(v_b1, vl);
+          vint16m2_t v_b16_2 = __riscv_vsext_vf2_i16m2(v_b2, vl);
+          vint16m2_t v_b16_3 = __riscv_vsext_vf2_i16m2(v_b3, vl);
+
+          if (m_size > 0) {
+            if (a_vals[0][0]) v_acc0 = __riscv_vwmacc_vx_i32m4(v_acc0, (int16_t)a_vals[0][0], v_b16_0, vl);
+            if (a_vals[0][1]) v_acc0 = __riscv_vwmacc_vx_i32m4(v_acc0, (int16_t)a_vals[0][1], v_b16_1, vl);
+            if (a_vals[0][2]) v_acc0 = __riscv_vwmacc_vx_i32m4(v_acc0, (int16_t)a_vals[0][2], v_b16_2, vl);
+            if (a_vals[0][3]) v_acc0 = __riscv_vwmacc_vx_i32m4(v_acc0, (int16_t)a_vals[0][3], v_b16_3, vl);
+          }
+          if (m_size > 1) {
+            if (a_vals[1][0]) v_acc1 = __riscv_vwmacc_vx_i32m4(v_acc1, (int16_t)a_vals[1][0], v_b16_0, vl);
+            if (a_vals[1][1]) v_acc1 = __riscv_vwmacc_vx_i32m4(v_acc1, (int16_t)a_vals[1][1], v_b16_1, vl);
+            if (a_vals[1][2]) v_acc1 = __riscv_vwmacc_vx_i32m4(v_acc1, (int16_t)a_vals[1][2], v_b16_2, vl);
+            if (a_vals[1][3]) v_acc1 = __riscv_vwmacc_vx_i32m4(v_acc1, (int16_t)a_vals[1][3], v_b16_3, vl);
+          }
+          if (m_size > 2) {
+            if (a_vals[2][0]) v_acc2 = __riscv_vwmacc_vx_i32m4(v_acc2, (int16_t)a_vals[2][0], v_b16_0, vl);
+            if (a_vals[2][1]) v_acc2 = __riscv_vwmacc_vx_i32m4(v_acc2, (int16_t)a_vals[2][1], v_b16_1, vl);
+            if (a_vals[2][2]) v_acc2 = __riscv_vwmacc_vx_i32m4(v_acc2, (int16_t)a_vals[2][2], v_b16_2, vl);
+            if (a_vals[2][3]) v_acc2 = __riscv_vwmacc_vx_i32m4(v_acc2, (int16_t)a_vals[2][3], v_b16_3, vl);
+          }
+          if (m_size > 3) {
+            if (a_vals[3][0]) v_acc3 = __riscv_vwmacc_vx_i32m4(v_acc3, (int16_t)a_vals[3][0], v_b16_0, vl);
+            if (a_vals[3][1]) v_acc3 = __riscv_vwmacc_vx_i32m4(v_acc3, (int16_t)a_vals[3][1], v_b16_1, vl);
+            if (a_vals[3][2]) v_acc3 = __riscv_vwmacc_vx_i32m4(v_acc3, (int16_t)a_vals[3][2], v_b16_2, vl);
+            if (a_vals[3][3]) v_acc3 = __riscv_vwmacc_vx_i32m4(v_acc3, (int16_t)a_vals[3][3], v_b16_3, vl);
+          }
         }
+
+        // Tail loop for remaining K
+        for (; k < K; ++k) {
+          const int8_t* b_ptr;
+          ptrdiff_t b_stride;
+
+          if (is_packed) {
+            b_ptr = mat2 + nb * K * BLOCK_N + k * BLOCK_N + n_chunk_start;
+            b_stride = 1;
+          } else {
+            b_ptr = mat2 + (n_start + n_chunk_start) * K + k;
+            b_stride = K;
+          }
+
+          vint8m1_t v_b;
+          if (is_packed) {
+            v_b = __riscv_vle8_v_i8m1(b_ptr, vl);
+          } else {
+            v_b = __riscv_vlse8_v_i8m1(b_ptr, b_stride, vl);
+          }
+
+          vint16m2_t v_b16 = __riscv_vsext_vf2_i16m2(v_b, vl);
+
+          if (m_size > 0) {
+            uint8_t a = mat1[(m_start + 0) * K + k];
+            if (a != 0) v_acc0 = __riscv_vwmacc_vx_i32m4(v_acc0, (int16_t)a, v_b16, vl);
+          }
+          if (m_size > 1) {
+            uint8_t a = mat1[(m_start + 1) * K + k];
+            if (a != 0) v_acc1 = __riscv_vwmacc_vx_i32m4(v_acc1, (int16_t)a, v_b16, vl);
+          }
+          if (m_size > 2) {
+            uint8_t a = mat1[(m_start + 2) * K + k];
+            if (a != 0) v_acc2 = __riscv_vwmacc_vx_i32m4(v_acc2, (int16_t)a, v_b16, vl);
+          }
+          if (m_size > 3) {
+            uint8_t a = mat1[(m_start + 3) * K + k];
+            if (a != 0) v_acc3 = __riscv_vwmacc_vx_i32m4(v_acc3, (int16_t)a, v_b16, vl);
+          }
+        }
+
+        if (m_size > 0) __riscv_vse32_v_i32m4(acc[0] + n_chunk_start, v_acc0, vl);
+        if (m_size > 1) __riscv_vse32_v_i32m4(acc[1] + n_chunk_start, v_acc1, vl);
+        if (m_size > 2) __riscv_vse32_v_i32m4(acc[2] + n_chunk_start, v_acc2, vl);
+        if (m_size > 3) __riscv_vse32_v_i32m4(acc[3] + n_chunk_start, v_acc3, vl);
       }
 
       for (int i = 0; i < m_size; ++i) {

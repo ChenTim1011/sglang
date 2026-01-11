@@ -548,10 +548,73 @@ void weight_packed_linear_kernel_impl(
     });
   });
 }
+#else
+template <typename scalar_t>
+void weight_packed_linear_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ mat1,
+    const scalar_t* __restrict__ mat2,
+    const float* __restrict__ bias,
+    const scalar_t* __restrict__ post_mul_mat,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t mat1_strideM,
+    int64_t out_strideM) {
+  if (post_mul_mat == nullptr) {
+    weight_packed_linear_kernel_impl_rvv(out, mat1, mat2, bias, M, N, K, mat1_strideM, out_strideM);
+  } else {
+    TORCH_CHECK(false, "RVV fused linear sigmoid mul not supported");
+  }
+}
+
+template <typename scalar_t>
+void weight_packed_linear_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ mat1,
+    const scalar_t* __restrict__ mat2,
+    const float* __restrict__ bias,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t mat1_strideM,
+    int64_t out_strideM) {
+  weight_packed_linear_kernel_impl_rvv(out, mat1, mat2, bias, M, N, K, mat1_strideM, out_strideM);
+}
+
+template <typename scalar_t>
+void weight_packed_linear_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ mat1,
+    const float* __restrict__ mat2,
+    const float* __restrict__ bias,
+    const scalar_t* __restrict__ post_mul_mat,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t mat1_strideM,
+    int64_t out_strideM) {
+  TORCH_CHECK(false, "RVV does not support FMA path (float weights) for packed linear yet.");
+}
+#endif
 
 }  // anonymous namespace
 
-// tinygemm interface
+#define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE) \
+  template void tinygemm_kernel<TYPE>(      \
+      const TYPE* __restrict__ A,           \
+      const TYPE* __restrict__ B,           \
+      TYPE* __restrict__ C,                 \
+      float* __restrict__ Ctmp,             \
+      int64_t M,                            \
+      int64_t N,                            \
+      int64_t K,                            \
+      int64_t lda,                          \
+      int64_t ldb,                          \
+      int64_t ldc,                          \
+      bool brg)
+
+#ifndef CPU_CAPABILITY_RVV
 template <typename scalar_t>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A,
@@ -567,20 +630,23 @@ void tinygemm_kernel(
     bool brg) {
   tinygemm_kernel<scalar_t, false>(A, B, C, Ctmp, nullptr, M, N, K, lda, ldb, ldc, brg);
 }
-
-#define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE) \
-  template void tinygemm_kernel<TYPE>(      \
-      const TYPE* __restrict__ A,           \
-      const TYPE* __restrict__ B,           \
-      TYPE* __restrict__ C,                 \
-      float* __restrict__ Ctmp,             \
-      int64_t M,                            \
-      int64_t N,                            \
-      int64_t K,                            \
-      int64_t lda,                          \
-      int64_t ldb,                          \
-      int64_t ldc,                          \
-      bool brg)
+#else
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    float* __restrict__ Ctmp,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg) {
+  TORCH_CHECK(false, "tinygemm_kernel not implemented for RVV (called from bmm)");
+}
+#endif
 
 INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
 INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
@@ -690,6 +756,13 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
   CHECK_INPUT(mat2);
   CHECK_DIM(2, mat1);
   CHECK_DIM(2, mat2);
+
+  int64_t M = mat1.size(0);
+  int64_t K = mat1.size(1);
+  bool use_fma_gemm = (packed_w.scalar_type() == at::kFloat);
+  int64_t N = use_fma_gemm ? packed_w.size(1) : (is_vnni ? 0 : mat2.size(0));
+  if (N == 0 && bias.has_value()) N = bias.value().size(0);
+
   if (!use_fma_gemm) {
     CHECK_EQ(mat1.size(1), K);
   }
@@ -792,7 +865,6 @@ at::Tensor fused_linear_sigmoid_mul(
         mat1_strideM,
         out_strideM);
   });
-#endif
 
   return out;
 }

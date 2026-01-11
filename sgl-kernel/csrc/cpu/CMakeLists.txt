@@ -42,22 +42,6 @@ endif()
 # Add system Python include directories (fallback)
 include_directories(${Python_INCLUDE_DIRS})
 
-# Python include directories - handle cross-compilation
-if(CMAKE_SYSROOT)
-    # For cross-compilation, prefer sysroot Python headers
-    if(EXISTS "${CMAKE_SYSROOT}/usr/include/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}")
-        include_directories("${CMAKE_SYSROOT}/usr/include/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}")
-        message(STATUS "Using Python headers from sysroot: ${CMAKE_SYSROOT}/usr/include/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}")
-    endif()
-    # Also add sysroot usr/include for general headers
-    if(EXISTS "${CMAKE_SYSROOT}/usr/include")
-        include_directories("${CMAKE_SYSROOT}/usr/include")
-    endif()
-endif()
-
-# Add system Python include directories (fallback)
-include_directories(${Python_INCLUDE_DIRS})
-
 # Platform-specific source and library directory
 set(MY_ARCH_DIR "")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
@@ -92,10 +76,6 @@ else()
     set(PLAT_LIB_DIR "/usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu")
 endif()
 link_directories(${PLAT_LIB_DIR})
-if(MY_ARCH_DIR)
-    file(GLOB_RECURSE ARCH_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/${MY_ARCH_DIR}/*.cpp")
-    list(APPEND SOURCES ${ARCH_SOURCES})
-endif()
 
 # Conda library path support
 if(DEFINED ENV{CONDA_PREFIX})
@@ -120,8 +100,8 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64|RISCV" OR CMAKE_CXX_FLAGS MATCHES
 elseif(CMAKE_SYSROOT)
     # Cross-compilation: search in sysroot
     message(STATUS "Cross-compilation: Searching libraries in ${CMAKE_SYSROOT}")
-    find_library(NUMA_LIB numa 
-        HINTS 
+    find_library(NUMA_LIB numa
+        HINTS
         "${CMAKE_SYSROOT}/usr/lib/riscv64-linux-gnu"
         "${CMAKE_SYSROOT}/usr/lib64"
         "${CMAKE_SYSROOT}/usr/lib"
@@ -147,6 +127,12 @@ file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 # Exclude all arch dependent files, then add back only files for this arch
 set(ARCH_DIRS "x86_64|aarch64|ppc64|rvv")
 list(FILTER SOURCES EXCLUDE REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/(${ARCH_DIRS})/")
+
+if(MY_ARCH_DIR)
+    file(GLOB_RECURSE ARCH_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/${MY_ARCH_DIR}/*.cpp")
+    list(APPEND SOURCES ${ARCH_SOURCES})
+endif()
+
 
 if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
     set(ENV{SGLANG_CPU_FP8_CVT_FTZ} "1")
