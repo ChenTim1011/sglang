@@ -511,7 +511,7 @@ setup_clang19_env() {
     fi
 
     # Compiler and linker flags
-    COMMON_FLAGS=(--target="${TARGET_TRIPLE}" -march=rv64gcv -mabi=lp64d)
+    COMMON_FLAGS=(--target="${TARGET_TRIPLE}" -march=rv64gcv_zvfh -mabi=lp64d)
     if [ -n "${RISCV_SYSROOT:-}" ]; then
         COMMON_FLAGS+=(--sysroot="${RISCV_SYSROOT}")
     fi
