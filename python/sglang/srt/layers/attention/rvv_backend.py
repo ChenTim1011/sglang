@@ -213,91 +213,98 @@ class RVVAttnBackend(AttentionBackend):
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
 
-        if k_buffer.dtype in (torch.int8, torch.uint8):
-            return self._rvv_decode_int8(
-                q, k, v, layer, forward_batch, k_buffer, v_buffer
-            )
+        target_dtype = k_buffer.dtype
+        is_int8 = target_dtype in (torch.int8, torch.uint8)
 
-        return self._rvv_decode(q, k, v, layer, forward_batch, k_buffer, v_buffer)
+        # 1. Type Casting
+        if not is_int8 and target_dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            if q.dtype != target_dtype:
+                q = q.to(target_dtype)
+            if k.dtype != target_dtype:
+                k = k.to(target_dtype)
+            if v.dtype != target_dtype:
+                v = v.to(target_dtype)
 
-    def _rvv_decode(self, q, k, v, layer, forward_batch, k_buffer, v_buffer):
-        # Convert Q/K/V to match supported types if needed (e.g. float64 -> float32)
         if q.dtype == torch.float64:
             q = q.float()
             k = k.float()
             v = v.float()
 
-        attn_logits, _ = self.forward_metadata
+        # 2. KV Cache Management
+        if save_kv_cache and not is_int8:
+            if (
+                layer.is_cross_attention
+                and forward_batch.encoder_out_cache_loc is not None
+            ):
+                cache_loc = forward_batch.encoder_out_cache_loc
+            else:
+                cache_loc = forward_batch.out_cache_loc
 
-        # Output Setup
-        q_reshaped = q.view(-1, layer.tp_q_head_num * layer.qk_head_dim)
+            pool.set_kv_buffer(layer, cache_loc, k, v)
+
+        # 3. Output Setup
+        attn_logits, _ = self.forward_metadata
+        q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
         if layer.qk_head_dim != layer.v_head_dim:
             o = torch.empty(
-                (q_reshaped.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
                 dtype=q.dtype,
                 device=q.device,
             )
         else:
-            o = torch.empty_like(q_reshaped)
+            o = torch.empty_like(q).view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-        # Note: k_buffer/v_buffer type casting removed for performance.
-        # _supports_rvv_decode ensures they are FP16/BF16/FP32.
+        o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        self.decode_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k_buffer,
-            v_buffer,
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            k,
-            v,
-            forward_batch.out_cache_loc,
-            attn_logits,
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            layer.scaling,
-            layer.logit_cap,
-        )
-        return o
+        # 4. Dispatch
+        if is_int8:
+            k_scale = getattr(layer, "k_scale_float", 1.0)
+            v_scale = getattr(layer, "v_scale_float", 1.0)
+            if hasattr(layer, "k_scale") and isinstance(layer.k_scale, torch.Tensor):
+                k_scale = layer.k_scale.item()
+            if hasattr(layer, "v_scale") and isinstance(layer.v_scale, torch.Tensor):
+                v_scale = layer.v_scale.item()
 
-    def _rvv_decode_int8(self, q, k, v, layer, forward_batch, k_buffer, v_buffer):
-        if q.dtype == torch.float64:
-            q = q.float()
+            self.decode_attention_fwd_int8(
+                q_view,
+                k_buffer,
+                v_buffer,
+                o_view,
+                k,
+                v,
+                forward_batch.out_cache_loc,
+                attn_logits,
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                layer.scaling,
+                layer.logit_cap,
+                float(k_scale),
+                float(v_scale),
+            )
+        else:
+            self.decode_attention_fwd(
+                q_view,
+                k_buffer,
+                v_buffer,
+                o_view,
+                k,
+                v,
+                forward_batch.out_cache_loc,
+                attn_logits,
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                layer.scaling,
+                layer.logit_cap,
+            )
 
-        attn_logits, _ = self.forward_metadata
-
-        q_reshaped = q.view(-1, layer.tp_q_head_num * layer.qk_head_dim)
-        o = torch.empty(
-            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
-            dtype=q.dtype,
-            device=q.device,
-        )
-
-        k_scale = getattr(layer, "k_scale_float", 1.0)
-        v_scale = getattr(layer, "v_scale_float", 1.0)
-        if isinstance(layer.k_scale, torch.Tensor):
-            k_scale = layer.k_scale.item()
-        if isinstance(layer.v_scale, torch.Tensor):
-            v_scale = layer.v_scale.item()
-
-        self.decode_attention_fwd_int8(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k_buffer,
-            v_buffer,
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            k,
-            v,
-            forward_batch.out_cache_loc,
-            attn_logits,
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            layer.scaling,
-            layer.logit_cap,
-            float(k_scale),
-            float(v_scale),
-        )
-        return o
+        return o.view_as(q)
 
     def forward_extend(
         self,
@@ -313,90 +320,96 @@ class RVVAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, save_kv_cache
             )
 
-        if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
-
         pool = forward_batch.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
 
-        if k_buffer.dtype in (torch.int8, torch.uint8):
-            return self._rvv_extend_int8(
-                q, k, v, layer, forward_batch, k_buffer, v_buffer
+        target_dtype = k_buffer.dtype
+        is_int8 = target_dtype in (torch.int8, torch.uint8)
+
+        # 1. Type Casting
+        if not is_int8 and target_dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            if q.dtype != target_dtype:
+                q = q.to(target_dtype)
+            if k.dtype != target_dtype:
+                k = k.to(target_dtype)
+            if v.dtype != target_dtype:
+                v = v.to(target_dtype)
+
+        if q.dtype == torch.float64:
+            q = q.float()
+            k = k.float()
+            v = v.float()
+
+        # 2. KV Cache Management
+        if save_kv_cache and not is_int8:
+            if (
+                layer.is_cross_attention
+                and forward_batch.encoder_out_cache_loc is not None
+            ):
+                cache_loc = forward_batch.encoder_out_cache_loc
+            else:
+                cache_loc = forward_batch.out_cache_loc
+
+            pool.set_kv_buffer(layer, cache_loc, k, v)
+
+        # 3. Output Setup
+        _, max_extend_len = self.forward_metadata
+        out_dim = layer.tp_q_head_num * layer.v_head_dim
+        o = torch.empty((q.shape[0], out_dim), dtype=q.dtype, device=q.device)
+
+        q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+        # 4. Dispatch
+        if is_int8:
+            k_scale = getattr(layer, "k_scale_float", 1.0)
+            v_scale = getattr(layer, "v_scale_float", 1.0)
+            if hasattr(layer, "k_scale") and isinstance(layer.k_scale, torch.Tensor):
+                k_scale = layer.k_scale.item()
+            if hasattr(layer, "v_scale") and isinstance(layer.v_scale, torch.Tensor):
+                v_scale = layer.v_scale.item()
+
+            self.extend_attention_fwd_int8(
+                q_view,
+                k,
+                v,
+                o_view,
+                k_buffer,
+                v_buffer,
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_start_loc,
+                max_extend_len,
+                layer.scaling,
+                layer.logit_cap,
+                float(k_scale),
+                float(v_scale),
+            )
+        else:
+            self.extend_attention_fwd(
+                q_view,
+                k,
+                v,
+                o_view,
+                k_buffer,
+                v_buffer,
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_start_loc,
+                max_extend_len,
+                layer.scaling,
+                layer.logit_cap,
             )
 
-        return self._rvv_extend(q, k, v, layer, forward_batch, k_buffer, v_buffer)
-
-    def _rvv_extend(self, q, k, v, layer, forward_batch, k_buffer, v_buffer):
-        if q.dtype == torch.float64:
-            q = q.float()
-
-        out_dim = layer.tp_q_head_num * layer.v_head_dim
-        o = torch.empty((q.shape[0], out_dim), dtype=q.dtype, device=q.device)
-
-        _, max_extend_len = self.forward_metadata
-
-        # Prepare Indices (Must be int64/long for C++ compatibility)
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
-        seq_lens = forward_batch.seq_lens.long()
-        req_pool_indices = forward_batch.req_pool_indices.long()
-
-        # Note: k_buffer/v_buffer type casting removed.
-
-        self.extend_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k,
-            v,
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            k_buffer,
-            v_buffer,
-            req_to_token,
-            req_pool_indices,
-            seq_lens,
-            forward_batch.extend_seq_lens,
-            forward_batch.extend_start_loc,
-            max_extend_len,
-            layer.scaling,
-            layer.logit_cap,
-        )
-        return o
-
-    def _rvv_extend_int8(self, q, k, v, layer, forward_batch, k_buffer, v_buffer):
-        if q.dtype == torch.float64:
-            q = q.float()
-
-        out_dim = layer.tp_q_head_num * layer.v_head_dim
-        o = torch.empty((q.shape[0], out_dim), dtype=q.dtype, device=q.device)
-
-        _, max_extend_len = self.forward_metadata
-
-        k_scale = getattr(layer, "k_scale_float", 1.0)
-        v_scale = getattr(layer, "v_scale_float", 1.0)
-        if isinstance(layer.k_scale, torch.Tensor):
-            k_scale = layer.k_scale.item()
-        if isinstance(layer.v_scale, torch.Tensor):
-            v_scale = layer.v_scale.item()
-
-        self.extend_attention_fwd_int8(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k,
-            v,
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            k_buffer,
-            v_buffer,
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices.long(),
-            forward_batch.seq_lens.long(),
-            forward_batch.extend_seq_lens,
-            forward_batch.extend_start_loc,
-            max_extend_len,
-            layer.scaling,
-            layer.logit_cap,
-            float(k_scale),
-            float(v_scale),
-        )
         return o
 
     def support_triton(self):

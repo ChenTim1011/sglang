@@ -154,7 +154,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_host_cpu_arm64,
-    is_host_cpu_riscv,
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
@@ -188,7 +187,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
-_is_cpu_riscv_available = is_host_cpu_riscv()
 _is_xpu_xmx_available = xpu_has_xmx_support()
 
 if _is_npu:
@@ -756,7 +754,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not self.is_draft_worker:
             if self.device == "cpu":
-                if _is_cpu_amx_available or _is_cpu_arm64 or _is_cpu_riscv_available:
+                if _is_cpu_amx_available or _is_cpu_arm64:
                     # Bind OpenMP threads to CPU cores
                     torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
@@ -1599,6 +1597,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
+        elif self.server_args.kv_cache_dtype == "int8":
+            self.kv_cache_dtype = torch.int8
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."

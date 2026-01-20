@@ -316,7 +316,6 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             if _is_cpu_amx_available:
                 _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             elif _is_cpu_rvv_available:
-                # RVV 特定的權重預處理（如果需要）
                 layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
                 layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
             else:
