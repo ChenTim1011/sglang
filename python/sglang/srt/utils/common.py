@@ -170,36 +170,6 @@ def is_host_cpu_x86() -> bool:
     )
 
 
-def is_host_cpu_riscv() -> bool:
-    """Check if the host CPU is RISC-V architecture."""
-    machine = platform.machine().lower()
-    is_riscv = machine in ("riscv64", "riscv32", "riscv")
-
-    if not is_riscv:
-        return False
-
-    # Check if PyTorch CPU is available
-    if not (hasattr(torch, "cpu") and torch.cpu.is_available()):
-        return False
-
-    return True
-
-
-def is_host_cpu_riscv() -> bool:
-    """Check if the host CPU is RISC-V architecture."""
-    machine = platform.machine().lower()
-    is_riscv = machine in ("riscv64", "riscv32", "riscv")
-
-    if not is_riscv:
-        return False
-
-    # Check if PyTorch CPU is available
-    if not (hasattr(torch, "cpu") and torch.cpu.is_available()):
-        return False
-
-    return True
-
-
 def is_host_cpu_arm64() -> bool:
     machine = platform.machine().lower()
     return (
@@ -209,9 +179,20 @@ def is_host_cpu_arm64() -> bool:
     )
 
 
+def is_host_cpu_riscv() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("riscv64", "riscv32", "riscv")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
+
+
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64() or is_host_cpu_riscv()
+    is_host_cpu_supported = (
+        is_host_cpu_x86() or is_host_cpu_arm64() or is_host_cpu_riscv()
+    )
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
@@ -250,21 +231,6 @@ def device_context(device: torch.device):
             raise ValueError(f"Unknown device module: {device}")
 
 
-is_ampere_with_cuda_12_3 = lambda: _check(8)
-is_hopper_with_cuda_12_3 = lambda: _check(9)
-
-
-def is_cpu_only_runtime() -> bool:
-    """Return True when we explicitly run in CPU-only mode."""
-    if os.getenv("SGLANG_CPU_ONLY", "0") == "1":
-        return True
-    if os.getenv("SGLANG_DISABLE_GPU_MODULES", "0") == "1":
-        return True
-    return is_host_cpu_riscv()
-
-
-@lru_cache(maxsize=1)
-def is_blackwell():
 def _check_cuda_device_version(
     device_capability_majors: List[int], cuda_version: Tuple[int, int]
 ):
@@ -309,62 +275,6 @@ is_sm90_supported = lru_cache(maxsize=1)(
     )
 )
 
-_warned_bool_env_var_keys = set()
-
-
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name, default)
-    value = value.lower()
-
-    truthy_values = ("true", "1")
-    falsy_values = ("false", "0")
-
-    if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
-            logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
-            )
-        _warned_bool_env_var_keys.add(value)
-
-    return value in truthy_values
-
-
-def get_int_env_var(name: str, default: int = 0) -> int:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-def support_triton(backend: str) -> bool:
-    """Check if triton is supported for the given backend.
-
-    Returns False if:
-    - backend is in ["torch_native", "intel_amx", "ascend"]
-    - triton is a stub (RISC-V CPU-only environments)
-    """
-    if backend in ["torch_native", "intel_amx", "ascend"]:
-        return False
-
-    # Check if triton is a stub (RISC-V CPU-only environments)
-    try:
-        import triton
-
-        version = getattr(triton, "__version__", "")
-        is_stub = "stub" in str(version).lower() or getattr(triton, "_is_stub", False)
-        if is_stub:
-            return False
-    except ImportError:
-        # triton not available
-        return False
-
-    return True
-
 
 try:
     import sgl_kernel  # noqa: F401
@@ -383,40 +293,33 @@ except:
     is_amx_tile_supported = False
 
 
-# RISC-V RVV support detection
-def is_riscv_platform():
-    """Check if running on RISC-V platform."""
-    machine = platform.machine().lower()
-    return machine in ("riscv64", "riscv32", "riscv")
-
-
-try:
-    # Check if RVV kernel is available in sgl_kernel
-    _is_rvv_kernel_available = (
-        is_riscv_platform()
-        and hasattr(torch.ops, "sgl_kernel")
-        and hasattr(torch.ops.sgl_kernel, "weight_packed_linear")
-    )
-except:
-    _is_rvv_kernel_available = False
-
-
-def cpu_has_rvv_support():
-    """Check if RISC-V RVV backend is available."""
-    return _is_rvv_kernel_available
-
-
-def use_riscv_rvv_backend(layer):
-    """Check if a layer should use RISC-V RVV backend."""
-    return getattr(layer, "use_riscv_rvv_backend", False)
-
-
 def cpu_has_amx_support():
     return is_amx_tile_supported and is_intel_amx_backend_available
 
 
 def use_intel_amx_backend(layer):
     return getattr(layer, "use_intel_amx_backend", False)
+
+
+try:
+    # Check if RVV kernel is available in sgl_kernel
+    _is_riscv = is_host_cpu_riscv()
+    _has_sgl = hasattr(torch.ops, "sgl_kernel")
+    _has_linear = (
+        hasattr(torch.ops.sgl_kernel, "weight_packed_linear") if _has_sgl else False
+    )
+
+    _is_rvv_kernel_available = _is_riscv and _has_sgl and _has_linear
+except Exception:
+    _is_rvv_kernel_available = False
+
+
+def cpu_has_rvv_support():
+    return _is_rvv_kernel_available
+
+
+def use_riscv_rvv_backend(layer):
+    return getattr(layer, "use_riscv_rvv_backend", False)
 
 
 def xpu_has_xmx_support():
@@ -499,7 +402,7 @@ def get_float_env_var(name: str, default: float = 0.0) -> float:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "rvv"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -2147,20 +2050,6 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     return major, minor
 
 
-def get_npu_compiler_config():
-    config = {
-        "frozen_parameter": True,
-        "tiling_schedule_optimize": True,
-        "topology_sorting_strategy": "StableRDFS",
-    }
-    return config
-
-
-def get_compiler_backend() -> str:
-    # Disable torch.compile on RISC-V (Inductor C++ compilation fails with -march=native)
-    if is_host_cpu_riscv():
-        return "eager"  # Use eager mode instead of compilation
-
 def get_compiler_backend(mode=None) -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
@@ -3413,20 +3302,9 @@ def parse_lscpu_topology():
     # Parse only data lines (skip comments)
     cpu_info = []
     for line in output.splitlines():
-        if not line.startswith("#") and line.strip():
-            # Split and handle empty fields (Node may be empty on some systems)
-            parts = line.strip().split(",")
-            if len(parts) >= 3:
-                try:
-                    cpu = int(parts[0]) if parts[0] else 0
-                    core = int(parts[1]) if parts[1] else 0
-                    socket = int(parts[2]) if parts[2] else 0
-                    # Node may be empty, default to 0 if not provided
-                    node = int(parts[3]) if len(parts) > 3 and parts[3] else 0
-                    cpu_info.append((cpu, core, socket, node))
-                except (ValueError, IndexError) as e:
-                    # Skip malformed lines
-                    continue
+        if not line.startswith("#"):
+            cpu, core, socket, node = map(int, line.strip().split(","))
+            cpu_info.append((cpu, core, socket, node))
 
     # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
     return cpu_info
