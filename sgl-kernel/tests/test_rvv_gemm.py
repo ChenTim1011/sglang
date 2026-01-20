@@ -97,7 +97,7 @@ def tolerances(dtype):
 
 @requires_sgl_kernel
 @requires_weight_packed_linear
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 class TestGemmRvvBasic:
     """Basic correctness tests for RVV GEMM kernel."""
 

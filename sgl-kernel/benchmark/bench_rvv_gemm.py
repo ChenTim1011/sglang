@@ -257,8 +257,14 @@ def run_benchmark(
     if HAS_SGL_KERNEL:
         try:
 
+            # Pre-pack weights for RVV
+            # Note: weight_packed_linear expects packed weights if is_vnni=True
+            weight_rvv_packed = torch.ops.sgl_kernel.convert_weight_packed(weight_rvv)
+
             def rvv_fn():
-                return sgl_kernel.weight_packed_linear(x_rvv, weight_rvv, bias, False)
+                return sgl_kernel.weight_packed_linear(
+                    x_rvv, weight_rvv_packed, bias, True
+                )
 
             rvv_ms, rvv_std = benchmark_function(rvv_fn, warmup, repeat)
             y_rvv = rvv_fn()
@@ -342,10 +348,14 @@ def main():
     parser.add_argument(
         "--quick", action="store_true", help="Run quick benchmark (CI mode)"
     )
+    parser.add_argument("--filter", type=str, help="Filter benchmarks by description")
     args = parser.parse_args()
 
     # Override configs for quick mode
     configs = SMALL_CONFIGS if args.quick else ALL_CONFIGS
+
+    if args.filter:
+        configs = [c for c in configs if args.filter.lower() in c.description.lower()]
 
     if args.quick:
         args.warmup = 2

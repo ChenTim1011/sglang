@@ -2242,6 +2242,36 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
     return decorator
 
 
+def rvv_benchmark(extra_args=None, min_throughput=None):
+    def decorator(test_func):
+        @wraps(test_func)
+        def wrapper(self):
+            common_args = [
+                "--attention-backend",
+                "rvv",
+                "--disable-radix",
+                "--trust-remote-code",
+            ]
+            full_args = common_args + (extra_args or [])
+
+            model = test_func(self)
+            prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
+                model, full_args
+            )
+
+            print(f"{model=}")
+            print(f"{prefill_latency=}")
+            print(f"{decode_throughput=}")
+            print(f"{decode_latency=}")
+
+            if is_in_ci() and min_throughput is not None:
+                self.assertGreater(decode_throughput, min_throughput)
+
+        return wrapper
+
+    return decorator
+
+
 def run_doctests(obj: Callable[..., Any] | ModuleType):
     mod = inspect.getmodule(obj)
     globals = dict(mod.__dict__)

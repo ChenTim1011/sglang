@@ -63,16 +63,15 @@ def naive_int8_scaled_mm(
         bias: [N] float
     """
     # Dequantize inputs to float
-    # mat1 is uint8, but PyTorch doesn't support uint8 matmul well, convert to float directly
-    # Note: sgl-kernel implementation treats mat1 as uint8
-    mat1_f = mat1_int8.to(torch.float32)
-
-    # mat2 is int8
+    # mat1 is uint8, but represents signed int8 values (symmetric quantization)
+    # So we must view it as int8 before converting to float
+    mat1_f = mat1_int8.view(torch.int8).to(torch.float32)
     mat2_f = mat2_int8.to(torch.float32)
 
     # Compute integer matrix multiplication in float32 to avoid overflow
-    # mat1: [M, K], mat2: [N, K] -> mat2.T: [K, N]
-    # Out_int = mat1 @ mat2.T
+    # Note: sgl-kernel expects mat2 to be [N, K]
+    # In PyTorch, matmul(M x K, K x N) -> M x N
+    # So we transpose mat2 to [K, N]
     out_f = torch.matmul(mat1_f, mat2_f.t())
 
     # Apply scales: out[m, n] = out_int[m, n] * s1[m] * s2[n]
@@ -95,7 +94,9 @@ class TestGemmInt8Rvv:
     @pytest.mark.parametrize("K", [32, 128, 256])
     @pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32])
     def test_basic_correctness(self, M, N, K, out_dtype):
-        mat1 = torch.randint(0, 255, (M, K), dtype=torch.uint8)
+        # mat1: uint8 (activation), effectively signed int8 (-128 to 127) due to symmetric quantization
+        mat1_s8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
+        mat1 = mat1_s8.view(torch.uint8)
 
         mat2 = torch.randint(-128, 127, (N, K), dtype=torch.int8)
 
@@ -123,7 +124,8 @@ class TestGemmInt8Rvv:
         ]
 
         for M, N, K in configs:
-            mat1 = torch.randint(0, 100, (M, K), dtype=torch.uint8)
+            mat1_s8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
+            mat1 = mat1_s8.view(torch.uint8)
             mat2 = torch.randint(-50, 50, (N, K), dtype=torch.int8)
             scales1 = torch.rand(M, dtype=torch.float32) * 0.01
             scales2 = torch.rand(N, dtype=torch.float32) * 0.01
@@ -143,7 +145,8 @@ class TestGemmInt8Rvv:
         M, N, K = 4, 64, 64
         out_dtype = torch.float32
 
-        mat1 = torch.randint(0, 255, (M, K), dtype=torch.uint8)
+        mat1_s8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
+        mat1 = mat1_s8.view(torch.uint8)
         mat2 = torch.randint(-128, 127, (N, K), dtype=torch.int8)
         scales1 = torch.ones(M, dtype=torch.float32)
         scales2 = torch.ones(N, dtype=torch.float32)
@@ -167,15 +170,16 @@ class TestGemmInt8RvvEdgeCases:
         M, N, K = 4, 64, 64
         out_dtype = torch.float32
 
-        mat1 = torch.zeros(M, K, dtype=torch.uint8)
-        mat1[0, 0] = 0
-        mat1[0, 1] = 255
-        mat1[1, 0] = 128
+        # Test min/max values for mat1 (uint8 representing int8)
+        # -128 (0x80) -> 128 (0x80) as uint8
+        # 127 (0x7F) -> 127 (0x7F) as uint8
+        # 0 (0x00) -> 0 (0x00) as uint8
+        # -1 (0xFF) -> 255 (0xFF) as uint8
+        mat1_s8 = torch.tensor([[-128, 127, 0, -1]], dtype=torch.int8).repeat(M, K // 4)
+        mat1 = mat1_s8.view(torch.uint8)
 
-        mat2 = torch.zeros(N, K, dtype=torch.int8)
-        mat2[0, 0] = -128
-        mat2[0, 1] = 127
-        mat2[1, 0] = 0
+        # Test min/max values for mat2 (int8)
+        mat2 = torch.tensor([[-128, 127, 0, -1]], dtype=torch.int8).repeat(N, K // 4)
 
         scales1 = torch.ones(M, dtype=torch.float32) * 0.01
         scales2 = torch.ones(N, dtype=torch.float32) * 0.01
@@ -194,7 +198,8 @@ class TestGemmInt8RvvEdgeCases:
         M, N, K = 4, 64, 64
         out_dtype = torch.float32
 
-        mat1 = torch.randint(0, 255, (M, K), dtype=torch.uint8)
+        mat1_s8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
+        mat1 = mat1_s8.view(torch.uint8)
         mat2 = torch.randint(-128, 127, (N, K), dtype=torch.int8)
 
         scales1 = torch.ones(M, dtype=torch.float32) * 1e-6
@@ -214,7 +219,8 @@ class TestGemmInt8RvvEdgeCases:
         M, N, K = 4, 64, 64
         out_dtype = torch.float32
 
-        mat1 = torch.randint(0, 100, (M, K), dtype=torch.uint8)
+        mat1_s8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
+        mat1 = mat1_s8.view(torch.uint8)
         mat2 = torch.randint(-50, 50, (N, K), dtype=torch.int8)
 
         scales1 = torch.ones(M, dtype=torch.float32) * 100.0
@@ -254,7 +260,8 @@ class TestGemmInt8RvvEdgeCases:
         M, N, K = 4, 64, 64
         out_dtype = torch.float32
 
-        mat1 = torch.randint(0, 255, (M, K), dtype=torch.uint8)
+        mat1_s8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
+        mat1 = mat1_s8.view(torch.uint8)
         mat2 = torch.zeros(N, K, dtype=torch.int8)
 
         scales1 = torch.ones(M, dtype=torch.float32) * 0.01
@@ -280,7 +287,8 @@ class TestGemmInt8RvvNumericalStability:
         M, N, K = 4, 64, 64
         out_dtype = torch.float32
 
-        mat1 = torch.randint(0, 255, (M, K), dtype=torch.uint8)
+        mat1_s8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
+        mat1 = mat1_s8.view(torch.uint8)
         mat2 = torch.randint(-128, 127, (N, K), dtype=torch.int8)
 
         scales1 = torch.rand(M, dtype=torch.float32) * 0.1
@@ -298,7 +306,8 @@ class TestGemmInt8RvvNumericalStability:
         M, N, K = 4, 64, 64
         out_dtype = torch.float32
 
-        mat1 = torch.randint(0, 10, (M, K), dtype=torch.uint8)
+        mat1_s8 = torch.randint(-10, 10, (M, K), dtype=torch.int8)
+        mat1 = mat1_s8.view(torch.uint8)
         mat2 = torch.randint(-5, 5, (N, K), dtype=torch.int8)
 
         scales1 = torch.ones(M, dtype=torch.float32) * 1e-3
@@ -354,7 +363,8 @@ class TestGemmInt8RvvErrorHandling:
         K2 = 64
         out_dtype = torch.float32
 
-        mat1 = torch.randint(0, 255, (M, K1), dtype=torch.uint8)
+        mat1_s8 = torch.randint(-128, 127, (M, K1), dtype=torch.int8)
+        mat1 = mat1_s8.view(torch.uint8)
         mat2 = torch.randint(-128, 127, (N, K2), dtype=torch.int8)
         scales1 = torch.ones(M, dtype=torch.float32) * 0.01
         scales2 = torch.ones(N, dtype=torch.float32) * 0.01
@@ -384,7 +394,8 @@ class TestGemmInt8RvvErrorHandling:
         M, N, K = 4, 64, 64
         out_dtype = torch.float32
 
-        mat1 = torch.randint(0, 255, (M, K), dtype=torch.uint8)
+        mat1_s8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
+        mat1 = mat1_s8.view(torch.uint8)
         mat2 = torch.randint(-128, 127, (N, K), dtype=torch.int8)
         scales1 = torch.ones(M + 10, dtype=torch.float32) * 0.01
         scales2 = torch.ones(N, dtype=torch.float32) * 0.01
@@ -400,7 +411,8 @@ class TestGemmInt8RvvErrorHandling:
         M, N, K = 4, 64, 64
         out_dtype = torch.float32
 
-        mat1 = torch.randint(0, 255, (M, K), dtype=torch.uint8)
+        mat1_s8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
+        mat1 = mat1_s8.view(torch.uint8)
         mat2 = torch.randint(-128, 127, (N, K), dtype=torch.int8)
         scales1 = torch.zeros(M, dtype=torch.float32)
         scales2 = torch.zeros(N, dtype=torch.float32)
@@ -454,7 +466,8 @@ class TestGemmInt8RvvCombinatorial:
         """Test various M × N × K combinations."""
         out_dtype = torch.float32
 
-        mat1 = torch.randint(0, 255, (M, K), dtype=torch.uint8)
+        mat1_s8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
+        mat1 = mat1_s8.view(torch.uint8)
         mat2 = torch.randint(-128, 127, (N, K), dtype=torch.int8)
         scales1 = torch.rand(M, dtype=torch.float32) * 0.1
         scales2 = torch.rand(N, dtype=torch.float32) * 0.1
@@ -488,7 +501,8 @@ class TestGemmInt8RvvCombinatorial:
         M, N, K = 4, 64, 64
         out_dtype = torch.float32
 
-        mat1 = torch.randint(0, 255, (M, K), dtype=torch.uint8)
+        mat1_s8 = torch.randint(-128, 127, (M, K), dtype=torch.int8)
+        mat1 = mat1_s8.view(torch.uint8)
         mat2 = torch.randint(-128, 127, (N, K), dtype=torch.int8)
         scales1 = torch.ones(M, dtype=torch.float32) * scales1_val
         scales2 = torch.ones(N, dtype=torch.float32) * scales2_val
@@ -522,7 +536,9 @@ class TestGemmInt8RvvCombinatorial:
         """Test various M × out_dtype combinations."""
         N, K = 64, 64
 
-        mat1 = torch.randint(0, 255, (M, K), dtype=torch.uint8)
+        # Test min/max values
+        mat1_s8 = torch.tensor([[-128, 127, 0, -1]], dtype=torch.int8).repeat(M, K // 4)
+        mat1 = mat1_s8.view(torch.uint8)
         mat2 = torch.randint(-128, 127, (N, K), dtype=torch.int8)
         scales1 = torch.rand(M, dtype=torch.float32) * 0.1
         scales2 = torch.rand(N, dtype=torch.float32) * 0.1
