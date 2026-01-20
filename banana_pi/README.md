@@ -5,35 +5,29 @@ This directory contains scripts and test suites for building, deploying, and tes
 ## Directory Structure
 
 ### (RVV)`test_tinyllama_rvv/`
-**Purpose**: TinyLlama 1.1B model testing and backend comparison
+**Purpose**: End-to-end testing of TinyLlama 1.1B model with RVV backend on Banana Pi
 
 **Contents**:
 - `benchmark_rvv_backends.py` - Compare RVV vs TORCH_NATIVE backend performance
 - `test_tinyllama_rvv.py` - Interactive chat interface with TinyLlama
-- `test_environment.py` - Environment validation script
-- Configuration files are generated dynamically by scripts (no static config file needed)
-- `triton_stub.py` & `vllm_stub.py` - Stub modules for RISC-V compatibility
+- `manage_rvv_env.py` - Consolidated environment manager (installs stubs, verifies env)
+- `launch_server_rvv.py` - Shared server launcher wrapper
+- `bench_endtoend.sh` - End-to-end benchmark script (moved from `tests_rvv_kernels/`)
+- Stub modules (installed by `manage_rvv_env.py`)
 
 **Usage**: See `test_tinyllama_rvv/README.md` for detailed documentation.
 
 ---
 
 ### (RVV)`tests/`
-**Purpose**: End-to-end validation and benchmarking on Banana Pi
+**Purpose**: vlen tests and memory profiling on Banana Pi
 
 **Contents**:
-- `test_end_to_end_int8.py` - End-to-end INT8 KV cache validation
-- `test_model_accuracy_int8.py` - Model accuracy tests (perplexity, token prediction)
-- `test_parametrized_int8.py` - Parameterized testing across configurations
 - `test_memory_bandwidth.py` - Memory bandwidth analysis
-- `profile_paged_attention.py` - Paged attention performance profiling
-- `test_vlen_alignment.py` - VLEN alignment validation
+- `test_vlen.py` - vlen tests
 - `test_utils.py` - Shared utility functions
-- `run_tests.sh` - Test runner for end-to-end tests (runs Python test scripts)
 
 **Usage**: See `tests/README.md` for detailed documentation.
-
-**Note**: This directory contains application-level end-to-end tests. For kernel-level unit tests, see `tests_rvv_kernels/`.
 
 ---
 
@@ -41,14 +35,9 @@ This directory contains scripts and test suites for building, deploying, and tes
 **Purpose**: Kernel-level unit tests and benchmarks
 
 **Contents**:
-- `tests_benchs_rvv_kernels.sh` - Test runner for sgl-kernel unit tests and benchmarks (runs pytest)
+- `tests_benchs_rvv_kernels.sh` - Test runner for sgl-kernel unit tests and benchmarks
 
 **Usage**: See `tests_rvv_kernels/README.md` for detailed documentation.
-
-**Note**:
-- Runs pytest tests and benchmarks from `sgl-kernel/` directory
-- Tests individual kernel functions (decode, extend, GEMM)
-- Must be run on Banana Pi (not from x86_64 host)
 
 ---
 
@@ -63,8 +52,6 @@ This directory contains scripts and test suites for building, deploying, and tes
 - `build_and_deploy_sgl-kernel.config.sh` - User-specific configuration (optional)
 
 **Usage**: See `install/README.md` for detailed documentation.
-
-**Note**: All scripts in this directory are designed to run from an **x86_64 host** machine.
 
 ---
 
@@ -85,40 +72,28 @@ This directory contains scripts and test suites for building, deploying, and tes
 
 ### Testing
 
-**⚠️ Important: Before running any tests, you must set up the environment variables:**
+**⚠️ Important: Before running any tests, source the environment settings:**
 
 ```bash
-# Set OpenMP library paths
-export LD_PRELOAD=~/.local/lib/libomp.so
-export LD_LIBRARY_PATH=~/.local/lib:$LD_LIBRARY_PATH
-
-# Activate virtual environment
-source ~/.local_riscv_env/workspace/venv_sglang/bin/activate
+# Sourcing this script sets up LD_PRELOAD, LD_LIBRARY_PATH, and the virtual environment
+source banana_pi/environment_setting.sh
 ```
 
-**Note**: These environment variables are required for all tests and benchmarks. You can add them to your `~/.bashrc` to make them persistent:
-```bash
-echo 'export LD_PRELOAD=~/.local/lib/libomp.so' >> ~/.bashrc
-echo 'export LD_LIBRARY_PATH=~/.local/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
-echo 'source ~/.local_riscv_env/workspace/venv_sglang/bin/activate' >> ~/.bashrc
-```
+1. **Run TinyLlama benchmark** (on Banana Pi):
+   ```bash
+   cd test_tinyllama_rvv
+   # Check environment
+   python3 manage_rvv_env.py
+   # Run benchmarks
+   python3 benchmark_rvv_backends.py
+   # Run end-to-end suite
+   ./bench_endtoend.sh --bench-serving
+   ```
 
-1. **Run sgl-kernel unit tests and benchmarks** (on Banana Pi):
+2. **Run sgl-kernel tests** (on Banana Pi):
    ```bash
    cd tests_rvv_kernels
    ./tests_benchs_rvv_kernels.sh
-   ```
-
-2. **Run end-to-end tests** (on Banana Pi):
-   ```bash
-   cd tests
-   ./run_tests.sh
-   ```
-
-3. **Run TinyLlama benchmark** (on Banana Pi):
-   ```bash
-   cd test_tinyllama_rvv
-   python benchmark_rvv_backends.py
    ```
 
 ---
@@ -136,8 +111,8 @@ echo 'source ~/.local_riscv_env/workspace/venv_sglang/bin/activate' >> ~/.bashrc
 ### On Banana Pi (for running)
 - Python 3
 - Virtual environment (created by `setup_banana_pi.sh`)
-- OpenMP library (`libomp.so` - installed by `setup_banana_pi.sh`)
-- SGLang dependencies (installed by `setup_banana_pi.sh`)
+- OpenMP library (`libomp.so`)
+- SGLang dependencies
 
 ---
 

@@ -30,6 +30,7 @@ class _StubModule(ModuleType):
     def __init__(self, name):
         super().__init__(name)
         self.__path__ = []
+        self.__file__ = "stub_file.py"
 
     def __getattr__(self, name):
         # Return a stub value for any attribute access
@@ -41,21 +42,47 @@ class _StubModule(ModuleType):
 class _StubValue:
     """Return-self object to tolerate chained attribute / method access."""
 
-    __slots__ = ("_value",)
-
     def __init__(self, value=None):
         self._value = value
 
     def __call__(self, *args, **kwargs):
-        return self
+        # Allow boolean checks to work if they call a method that returns this
+        return _StubValue()
 
     def __getattr__(self, name):
+        # Handle __file__ and __path__ specially to satisfy inspect/importlib
+        if name in ("__file__", "__path__"):
+            return None
+
+        # Create a new stub for any other attribute
         value = _StubValue()
-        object.__setattr__(self, name, value)
+        try:
+            object.__setattr__(self, name, value)
+        except AttributeError:
+            pass
         return value
 
+    def __bool__(self):
+        return bool(self._value)
+
+    def __str__(self):
+        return str(self._value) if self._value is not None else ""
+
+    def __repr__(self):
+        return f"<_StubValue {self._value}>"
+
     def __setattr__(self, name, value):
-        object.__setattr__(self, name, value)
+        if name == "_value":
+            object.__setattr__(self, name, value)
+        else:
+            object.__setattr__(self, name, value)
+
+    def endswith(self, suffix):
+        """Mock string method to satisfy inspect.getsourcefile"""
+        return False
+
+    def startswith(self, prefix):
+        return False
 
 
 # Create vllm module structure

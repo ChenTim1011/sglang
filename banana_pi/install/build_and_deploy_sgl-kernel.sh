@@ -3,11 +3,10 @@
 # Usage: ./build_and_deploy_sgl-kernel.sh [OPTIONS]
 #
 # This script automates the complete workflow:
-#   0. Check/Build Clang 19 RISC-V toolchain (if needed)
+#   0. Check/Build Clang 19+ RISC-V toolchain
 #   1. Build sglang-kernel wheel for RISC-V on x86_64 host
 #   2. Transfer wheel file to Banana Pi via SCP
 #   3. Install wheel on Banana Pi via SSH
-#   4. Verify installation and run tests (optional)
 
 set -euo pipefail
 
@@ -68,7 +67,7 @@ check_prerequisites() {
     done
 
     if [ ${#missing_tools[@]} -gt 0 ]; then
-        echo "❌ ERROR: Missing required tools: ${missing_tools[*]}"
+        echo "[ERROR] ERROR: Missing required tools: ${missing_tools[*]}"
         echo "   Please install them before running this script."
         return 1
     fi
@@ -81,7 +80,7 @@ check_prerequisites() {
     done
 
     if [ ${#optional_tools[@]} -gt 0 ]; then
-        echo "⚠️  WARNING: Optional tools not found: ${optional_tools[*]}"
+        echo "[WARNING]  WARNING: Optional tools not found: ${optional_tools[*]}"
         echo "   The script will use fallback methods, but these tools are recommended:"
         echo "     - rsync: For faster directory synchronization"
         echo "     - numfmt: For better file size formatting"
@@ -89,7 +88,7 @@ check_prerequisites() {
 
     # Check Python build tools
     if ! python3 -m pip show build >/dev/null 2>&1 && ! command -v uv >/dev/null 2>&1; then
-        echo "⚠️  WARNING: Neither 'build' package nor 'uv' found."
+        echo "[WARNING]  WARNING: Neither 'build' package nor 'uv' found."
         echo "   The script will attempt to install 'build' automatically, but you may need:"
         echo "     pip install build scikit-build-core wheel"
     fi
@@ -136,7 +135,6 @@ while [[ $# -gt 0 ]]; do
             echo "  1. Build sglang-kernel wheel for RISC-V"
             echo "  2. Transfer wheel to Banana Pi"
             echo "  3. Install wheel on Banana Pi"
-            echo "  4. Run tests (optional)"
             echo ""
             echo "Options:"
             echo "  --user USER           Banana Pi username (default: $BANANA_PI_USER)"
@@ -183,9 +181,9 @@ if [ "$SKIP_CONFIRM" = false ]; then
         echo ""
         if [ -n "${input_token}" ]; then
             GITHUB_TOKEN="${input_token}"
-            echo "✓ GitHub token will be used for authentication"
+            echo "[OK] GitHub token will be used for authentication"
         else
-            echo "⚠️  No GitHub token provided. Download may fail if repository is private."
+            echo "[WARNING]  No GitHub token provided. Download may fail if repository is private."
         fi
         echo ""
     fi
@@ -199,7 +197,7 @@ echo "Prerequisites (SSH Key Setup):"
 echo "  To avoid entering your password multiple times, set up SSH keys:"
 echo "    1. Generate key (if needed): ssh-keygen -t ed25519"
 echo "    2. Copy key to Banana Pi:    ssh-copy-id -i ~/.ssh/id_ed25519.pub ${BANANA_PI_USER}@${BANANA_PI_HOST}"
-echo "    Example: ssh-copy-id -i ~/.ssh/id_ed25519.pub jtchen@140.114.78.64"
+echo "    Example: ssh-copy-id -i ~/.ssh/id_ed25519.pub user@192.168.1.10"
 echo ""
 echo "Target: ${BANANA_PI_USER}@${BANANA_PI_HOST}"
 echo ""
@@ -207,16 +205,16 @@ echo "Configuration:"
 echo "  Host: ${BANANA_PI_HOST}"
 echo "  User: ${BANANA_PI_USER}"
 if [ -n "${SKIP_CLANG_BUILD}" ]; then
-    echo "  ⏭️  Skip Clang build: Yes"
+    echo "  [SKIP]  Skip Clang build: Yes"
 fi
 if [ -n "${SKIP_BUILD}" ]; then
-    echo "  ⏭️  Skip wheel build: Yes"
+    echo "  [SKIP]  Skip wheel build: Yes"
 fi
 if [ -n "${SKIP_TRANSFER}" ]; then
-    echo "  ⏭️  Skip transfer: Yes"
+    echo "  [SKIP]  Skip transfer: Yes"
 fi
 if [ -n "${SKIP_INSTALL}" ]; then
-    echo "  ⏭️  Skip install: Yes"
+    echo "  [SKIP]  Skip install: Yes"
 fi
 echo ""
 
@@ -225,7 +223,7 @@ echo "Checking system prerequisites..."
 if ! check_prerequisites; then
     exit 1
 fi
-echo "✅ Prerequisites check passed"
+echo "[INFO] Prerequisites check passed"
 echo ""
 
 # Function to build Clang 19
@@ -323,20 +321,20 @@ detect_clang19() {
         MAJOR_VERSION=$(echo "${CLANG_VERSION}" | grep -oE "clang version ([0-9]+)" | grep -oE "[0-9]+" | head -1 || echo "")
 
         if [ -n "${MAJOR_VERSION}" ] && [ "${MAJOR_VERSION}" -ge 19 ]; then
-            echo "✅ Clang 19 detected: ${CLANG_VERSION}"
+            echo "[INFO] Clang 19 detected: ${CLANG_VERSION}"
             echo "   Location: ${CLANG19_INSTALL_DIR}"
             return 0
         fi
     fi
 
     # Try to setup environment and check
-    if setup_clang19_env >/dev/null 2>&1; then
+    if setup_clang_env >/dev/null 2>&1; then
         if [ -n "${CC}" ] && [ -f "${CC}" ]; then
             CLANG_VERSION=$("${CC}" --version 2>/dev/null | head -1 || echo "")
             MAJOR_VERSION=$(echo "${CLANG_VERSION}" | grep -oE "clang version ([0-9]+)" | grep -oE "[0-9]+" | head -1 || echo "")
 
             if [ -n "${MAJOR_VERSION}" ] && [ "${MAJOR_VERSION}" -ge 19 ]; then
-                echo "✅ Clang 19 detected: ${CLANG_VERSION}"
+                echo "[INFO] Clang 19 detected: ${CLANG_VERSION}"
                 echo "   Location: ${CC}"
                 return 0
             fi
@@ -349,7 +347,7 @@ detect_clang19() {
         MAJOR_VERSION=$(echo "${CLANG_VERSION}" | grep -oE "clang version ([0-9]+)" | grep -oE "[0-9]+" | head -1 || echo "")
 
         if [ -n "${MAJOR_VERSION}" ] && [ "${MAJOR_VERSION}" -ge 19 ]; then
-            echo "✅ Clang 19 detected in system: ${CLANG_VERSION}"
+            echo "[INFO] Clang 19 detected in system: ${CLANG_VERSION}"
             return 0
         fi
     fi
@@ -365,10 +363,10 @@ if [ -z "${SKIP_CLANG_BUILD}" ]; then
     echo ""
 
     if detect_clang19; then
-        echo "✅ Step 0 complete: Clang 19 already available"
+        echo "[INFO] Step 0 complete: Clang 19 already available"
         echo ""
     else
-        echo "❌ Clang 19 not detected"
+        echo "[ERROR] Clang 19 not detected"
         echo ""
         echo "Clang 19 or later is required for RISC-V Vector Extension support."
         echo ""
@@ -396,15 +394,15 @@ if [ -z "${SKIP_CLANG_BUILD}" ]; then
             case "${CLANG_CHOICE}" in
                 1)
                     if build_clang19; then
-                        echo "✅ Step 0 complete: Clang 19 built successfully"
+                        echo "[INFO] Step 0 complete: Clang 19 built successfully"
                         echo ""
                     else
-                        echo "❌ ERROR: Clang 19 build failed or cancelled"
+                        echo "[ERROR] ERROR: Clang 19 build failed or cancelled"
                         exit 1
                     fi
                     ;;
                 2)
-                    echo "⚠️  Skipping Clang 19 build"
+                    echo "[WARNING]  Skipping Clang 19 build"
                     echo "   Please ensure Clang 19 is installed at ~/tools/clang19-riscv"
                     echo "   or set CLANG19_TOOLCHAIN_DIR environment variable."
                     SKIP_CLANG_BUILD=1
@@ -422,48 +420,64 @@ if [ -z "${SKIP_CLANG_BUILD}" ]; then
             # Non-interactive mode: try to build
             echo "Non-interactive mode: attempting to build Clang 19..."
             if build_clang19; then
-                echo "✅ Step 0 complete: Clang 19 built successfully"
+                echo "[INFO] Step 0 complete: Clang 19 built successfully"
                 echo ""
             else
-                echo "❌ ERROR: Clang 19 build failed"
+                echo "[ERROR] ERROR: Clang 19 build failed"
                 exit 1
             fi
         fi
     fi
 else
-    echo "⏭️  Skipping Clang 19 check (SKIP_CLANG_BUILD is set)"
+    echo "[SKIP]  Skipping Clang 19 check (SKIP_CLANG_BUILD is set)"
     echo ""
 fi
 
-# Function to setup Clang 19 RISC-V environment
-setup_clang19_env() {
-    local CLANG19_TOOLCHAIN_DIR="${CLANG19_TOOLCHAIN_DIR:-${HOME}/tools/clang19-riscv}"
+# Function to setup Clang 19+ RISC-V environment
+setup_clang_env() {
+    local CLANG_TOOLCHAIN_DIR="${CLANG_TOOLCHAIN_DIR:-}"
     local ALT_CLANG_TOOLCHAIN_DIR="${ALT_CLANG_TOOLCHAIN_DIR:-}"
     local GCC_TOOLCHAIN_ROOT="${GCC_TOOLCHAIN_ROOT:-}"
 
     # Discover toolchain
-    if [ -d "${CLANG19_TOOLCHAIN_DIR}" ] && [ -x "${CLANG19_TOOLCHAIN_DIR}/bin/clang" ]; then
-        TOOLCHAIN="${CLANG19_TOOLCHAIN_DIR}"
-        echo "[INFO] ✅ Using Clang toolchain at ${TOOLCHAIN}"
+    if [ -n "${CLANG_TOOLCHAIN_DIR}" ] && [ -d "${CLANG_TOOLCHAIN_DIR}" ] && [ -x "${CLANG_TOOLCHAIN_DIR}/bin/clang" ]; then
+         TOOLCHAIN="${CLANG_TOOLCHAIN_DIR}"
+         echo "[INFO] [INFO] Using user-specified Clang toolchain at ${TOOLCHAIN}"
+    # Search for available Clang toolchains (Priority: 21 > 20 > 19)
+    elif [ -d "${HOME}/tools/clang21-riscv" ] && [ -f "${HOME}/tools/clang21-riscv/bin/clang" ]; then
+        TOOLCHAIN="${HOME}/tools/clang21-riscv"
+        echo "[INFO] [INFO] Using Clang 21 from ${TOOLCHAIN}"
+    elif [ -d "${HOME}/tools/clang20-riscv" ] && [ -f "${HOME}/tools/clang20-riscv/bin/clang" ]; then
+        TOOLCHAIN="${HOME}/tools/clang20-riscv"
+        echo "[INFO] [INFO] Using Clang 20 from ${TOOLCHAIN}"
+    elif [ -d "${HOME}/tools/clang19-riscv" ] && [ -f "${HOME}/tools/clang19-riscv/bin/clang" ]; then
+        TOOLCHAIN="${HOME}/tools/clang19-riscv"
+        echo "[INFO] [INFO] Using Clang 19 from ${TOOLCHAIN}"
     elif [ -n "${ALT_CLANG_TOOLCHAIN_DIR}" ] && [ -d "${ALT_CLANG_TOOLCHAIN_DIR}" ] && [ -x "${ALT_CLANG_TOOLCHAIN_DIR}/bin/clang" ]; then
         TOOLCHAIN="${ALT_CLANG_TOOLCHAIN_DIR}"
         echo "[WARNING] Using fallback Clang toolchain at ${TOOLCHAIN}"
     else
-        echo "[ERROR] Clang toolchain not found."
-        echo "        Please build Clang 19 or set CLANG19_TOOLCHAIN_DIR to a valid path."
-        echo "        You can also set ALT_CLANG_TOOLCHAIN_DIR for an alternative location."
+        echo "[ERROR] Clang toolchain (>=19) not found in ${HOME}/tools/"
+        echo "        Please build Clang 19+ or set CLANG19_TOOLCHAIN_DIR/CLANG_TOOLCHAIN_DIR."
         return 1
     fi
 
+    export TOOLCHAIN
     export PATH="${TOOLCHAIN}/bin:${PATH}"
 
     # Set compiler binaries
-    if [ -x "${TOOLCHAIN}/bin/clang" ]; then
-        export CC="${TOOLCHAIN}/bin/clang"
-        export CXX="${TOOLCHAIN}/bin/clang++"
-    elif [ -x "${TOOLCHAIN}/bin/clang-19" ]; then
+    if [ -f "${TOOLCHAIN}/bin/clang-21" ]; then
+        export CC="${TOOLCHAIN}/bin/clang-21"
+        export CXX="${TOOLCHAIN}/bin/clang++-21"
+    elif [ -f "${TOOLCHAIN}/bin/clang-20" ]; then
+        export CC="${TOOLCHAIN}/bin/clang-20"
+        export CXX="${TOOLCHAIN}/bin/clang++-20"
+    elif [ -f "${TOOLCHAIN}/bin/clang-19" ]; then
         export CC="${TOOLCHAIN}/bin/clang-19"
         export CXX="${TOOLCHAIN}/bin/clang++-19"
+    elif [ -x "${TOOLCHAIN}/bin/clang" ]; then
+        export CC="${TOOLCHAIN}/bin/clang"
+        export CXX="${TOOLCHAIN}/bin/clang++"
     else
         echo "[ERROR] clang binary not found under ${TOOLCHAIN}/bin"
         return 1
@@ -589,8 +603,8 @@ setup_clang19_env() {
         echo "Target triple:"
         "${CC}" -print-target-triple 2>/dev/null || true
         echo ""
-        echo "RISC-V Vector Extension support:"
-        "${CC}" -march=rv64gcv -mabi=lp64d -target=${TARGET_TRIPLE} -E -dM - < /dev/null 2>/dev/null | grep -i "__riscv_v" | head -5 || echo "Could not verify RVV support"
+        echo "RISC-V Vector Extension support Check:"
+        "${CC}" -march=rv64gcv_zvfh -mabi=lp64d -E -dM - < /dev/null 2>/dev/null | grep -i "__riscv_v" || echo "Could not verify RVV support"
     else
         echo "[ERROR] clang binary not runnable."
         return 1
@@ -650,7 +664,7 @@ download_pytorch_riscv_from_github() {
             # Debug: Verify token is set (without showing actual token)
             TOKEN_LEN=${#GITHUB_TOKEN_VAL}
             if [ $TOKEN_LEN -lt 20 ]; then
-                echo "⚠️  Warning: Token seems too short (${TOKEN_LEN} chars). Please verify it's correct."
+                echo "[WARNING]  Warning: Token seems too short (${TOKEN_LEN} chars). Please verify it's correct."
             fi
             echo "Using GitHub token for authentication (token length: ${TOKEN_LEN} chars)..."
 
@@ -664,7 +678,7 @@ download_pytorch_riscv_from_github() {
             # Check for authentication errors in API response (before checking tag_name)
             if echo "$API_TEST" | grep -qE '"message".*"Bad credentials"'; then
                 API_ERROR_MSG=$(echo "$API_TEST" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('message', 'Unknown error'))" 2>/dev/null || echo "Unknown error")
-                echo "❌ ERROR: GitHub API authentication failed"
+                echo "[ERROR] ERROR: GitHub API authentication failed"
                 echo "   Response: ${API_ERROR_MSG}"
                 echo "   Please check your GitHub token has 'repo' scope"
                 echo "   Token length: ${TOKEN_LEN} chars"
@@ -672,7 +686,7 @@ download_pytorch_riscv_from_github() {
                 rm -rf "${TEMP_DIR}"
                 return 1
             elif echo "$API_TEST" | grep -q '"tag_name"'; then
-                echo "✓ GitHub API response received successfully"
+                echo "[OK] GitHub API response received successfully"
                 # Debug: Check API_TEST length
                 API_TEST_LEN=${#API_TEST}
                 echo "Debug: API response length: $API_TEST_LEN characters"
@@ -686,7 +700,7 @@ download_pytorch_riscv_from_github() {
                     ALL_ASSETS=$(echo "$API_TEST" | python3 -c "import sys, json; data=json.load(sys.stdin); assets=data.get('assets', []); print('\n'.join([a.get('name', '') for a in assets]))" 2>&1)
 
                     if echo "$ALL_ASSETS" | grep -qE "(Error|Traceback|Exception)"; then
-                        echo "⚠️  Error getting assets list: $ALL_ASSETS"
+                        echo "[WARNING]  Error getting assets list: $ALL_ASSETS"
                         echo "Debug: First 500 chars of API_TEST:"
                         echo "$API_TEST" | head -c 500
                         echo ""
@@ -698,7 +712,7 @@ download_pytorch_riscv_from_github() {
                             fi
                         done
                     else
-                        echo "⚠️  No assets found in API response"
+                        echo "[WARNING]  No assets found in API response"
                     fi
 
                     # Use exact same command as setup_banana_pi.sh: $API_TEST and $ARCHIVE_FILE
@@ -715,7 +729,7 @@ download_pytorch_riscv_from_github() {
                             -o "${TEMP_ARCHIVE}" \
                             "$DOWNLOAD_URL" 2>&1)
                     else
-                        echo "⚠️  Asset ID not found for '$ARCHIVE_FILE'"
+                        echo "[WARNING]  Asset ID not found for '$ARCHIVE_FILE'"
                         # Get available assets for debugging
                         AVAILABLE_ASSETS=$(echo "$API_TEST" | python3 -c "import sys, json; data=json.load(sys.stdin); assets=data.get('assets', []); available=[a.get('name', '<unknown>') for a in assets]; print(', '.join(available) if available else '(none)')" 2>/dev/null || echo "")
                         if [ -n "$AVAILABLE_ASSETS" ]; then
@@ -730,7 +744,7 @@ download_pytorch_riscv_from_github() {
                             "${DOWNLOAD_URL}" 2>&1)
                     fi
                 else
-                    echo "⚠️  python3 not found, using browser_download_url"
+                    echo "[WARNING]  python3 not found, using browser_download_url"
                     CURL_OUTPUT=$(curl -L -w "\nHTTP_STATUS:%{http_code}" \
                         -H "Authorization: token ${GITHUB_TOKEN_VAL}" \
                         -H "Accept: application/octet-stream" \
@@ -740,13 +754,13 @@ download_pytorch_riscv_from_github() {
             else
                 # Check if API call failed due to authentication
                 if echo "${API_TEST}" | grep -qE '"message".*"Not Found"|"message".*"Bad credentials"'; then
-                    echo "❌ ERROR: GitHub API authentication failed"
+                    echo "[ERROR] ERROR: GitHub API authentication failed"
                     echo "   Response: $(echo "${API_TEST}" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('message', 'Unknown error'))" 2>/dev/null || echo 'Unknown error')"
                     echo "   Please check your GitHub token has 'repo' scope"
                     rm -rf "${TEMP_DIR}"
                     return 1
                 else
-                    echo "⚠️  GitHub API response does not contain 'tag_name'"
+                    echo "[WARNING]  GitHub API response does not contain 'tag_name'"
                     echo "   This may indicate the release doesn't exist or API access failed"
                     echo "   Trying browser_download_url with token authentication..."
                     # For private repos, browser_download_url also needs token
@@ -759,7 +773,7 @@ download_pytorch_riscv_from_github() {
             fi
             CURL_EXIT=$?
         else
-            echo "⚠️  GITHUB_TOKEN is empty! Attempting download without authentication..."
+            echo "[WARNING]  GITHUB_TOKEN is empty! Attempting download without authentication..."
             CURL_OUTPUT=$(curl -L -w "\nHTTP_STATUS:%{http_code}" \
                 -o "${TEMP_ARCHIVE}" \
                 "${DOWNLOAD_URL}" 2>&1)
@@ -773,7 +787,7 @@ download_pytorch_riscv_from_github() {
         if [ "${HTTP_STATUS}" = "200" ] && [ -f "${TEMP_ARCHIVE}" ] && [ -s "${TEMP_ARCHIVE}" ]; then
             DOWNLOAD_SUCCESS=true
         else
-            echo "❌ ERROR: Download failed (HTTP ${HTTP_STATUS:-unknown})"
+            echo "[ERROR] ERROR: Download failed (HTTP ${HTTP_STATUS:-unknown})"
             if [ "${HTTP_STATUS}" = "404" ]; then
                 echo "   File not found. Please verify release '${RELEASE_TAG}' exists and contains '${ARCHIVE_FILE}'"
             elif [ "${HTTP_STATUS}" = "401" ] || [ "${HTTP_STATUS}" = "403" ]; then
@@ -784,7 +798,7 @@ download_pytorch_riscv_from_github() {
                     echo ""
                 fi
             elif [ "${HTTP_STATUS}" = "302" ] || [ "${HTTP_STATUS}" = "301" ]; then
-                echo "⚠️  Redirect detected (HTTP ${HTTP_STATUS}). This may indicate authentication issues."
+                echo "[WARNING]  Redirect detected (HTTP ${HTTP_STATUS}). This may indicate authentication issues."
             elif [ -z "${HTTP_STATUS}" ]; then
                 echo "   No HTTP status code received. Check network connectivity."
                 if [ -f "${TEMP_ARCHIVE}" ]; then
@@ -817,7 +831,7 @@ download_pytorch_riscv_from_github() {
         if [ ${WGET_EXIT} -eq 0 ] && [ -f "${TEMP_ARCHIVE}" ] && [ -s "${TEMP_ARCHIVE}" ]; then
             DOWNLOAD_SUCCESS=true
         else
-            echo "❌ ERROR: wget download failed (exit code: ${WGET_EXIT})"
+            echo "[ERROR] ERROR: wget download failed (exit code: ${WGET_EXIT})"
             if echo "${WGET_OUTPUT}" | grep -q "404"; then
                 echo "   File not found (404). Possible reasons:"
                 echo "     1. Release '${RELEASE_TAG}' does not exist"
@@ -831,7 +845,7 @@ download_pytorch_riscv_from_github() {
             return 1
         fi
     else
-        echo "❌ ERROR: Neither curl nor wget found. Please install one of them."
+        echo "[ERROR] ERROR: Neither curl nor wget found. Please install one of them."
         rm -rf "${TEMP_DIR}"
         return 1
     fi
@@ -841,16 +855,16 @@ download_pytorch_riscv_from_github() {
         return 1
     fi
 
-    echo "✅ Download complete"
+    echo "[INFO] Download complete"
     echo ""
 
     # Verify archive format
     echo "Verifying archive format..."
     FILE_TYPE=$(file "${TEMP_ARCHIVE}" | cut -d: -f2-)
     if echo "${FILE_TYPE}" | grep -qE "(gzip|tar|compressed|POSIX tar)"; then
-        echo "✅ Archive format verified: ${FILE_TYPE}"
+        echo "[INFO] Archive format verified: ${FILE_TYPE}"
     else
-        echo "❌ ERROR: Downloaded file is not a valid archive!"
+        echo "[ERROR] ERROR: Downloaded file is not a valid archive!"
         echo "   File type: ${FILE_TYPE}"
         rm -rf "${TEMP_DIR}"
         return 1
@@ -864,13 +878,13 @@ download_pytorch_riscv_from_github() {
     # Check if file is gzip compressed or uncompressed tar
     if echo "${FILE_TYPE}" | grep -qE "gzip|compressed"; then
         if ! tar -xzf "${TEMP_ARCHIVE}" -C "${TEMP_EXTRACT_DIR}" 2>&1; then
-            echo "❌ ERROR: Failed to extract gzip-compressed archive"
+            echo "[ERROR] ERROR: Failed to extract gzip-compressed archive"
             rm -rf "${TEMP_DIR}" "${TEMP_EXTRACT_DIR}"
             return 1
         fi
     else
         if ! tar -xf "${TEMP_ARCHIVE}" -C "${TEMP_EXTRACT_DIR}" 2>&1; then
-            echo "❌ ERROR: Failed to extract tar archive"
+            echo "[ERROR] ERROR: Failed to extract tar archive"
             rm -rf "${TEMP_DIR}" "${TEMP_EXTRACT_DIR}"
             return 1
         fi
@@ -879,7 +893,7 @@ download_pytorch_riscv_from_github() {
     # Inspect archive structure and move to install directory
     echo "Inspecting archive structure..."
     mkdir -p "${INSTALL_DIR}" || {
-        echo "❌ ERROR: Failed to create installation directory ${INSTALL_DIR}"
+        echo "[ERROR] ERROR: Failed to create installation directory ${INSTALL_DIR}"
         rm -rf "${TEMP_DIR}" "${TEMP_EXTRACT_DIR}"
         return 1
     }
@@ -889,14 +903,14 @@ download_pytorch_riscv_from_github() {
     if [ -d "${TEMP_EXTRACT_DIR}/pytorch-riscv/torch" ]; then
         echo "Detected structure: pytorch-riscv/torch/"
         cp -r "${TEMP_EXTRACT_DIR}/pytorch-riscv"/* "${INSTALL_DIR}/" || {
-            echo "❌ ERROR: Failed to copy files"
+            echo "[ERROR] ERROR: Failed to copy files"
             rm -rf "${TEMP_DIR}" "${TEMP_EXTRACT_DIR}"
             return 1
         }
     elif [ -d "${TEMP_EXTRACT_DIR}/riscv_pytorch/torch" ]; then
         echo "Detected structure: riscv_pytorch/torch/"
         cp -r "${TEMP_EXTRACT_DIR}/riscv_pytorch"/* "${INSTALL_DIR}/" || {
-            echo "❌ ERROR: Failed to copy files"
+            echo "[ERROR] ERROR: Failed to copy files"
             rm -rf "${TEMP_DIR}" "${TEMP_EXTRACT_DIR}"
             return 1
         }
@@ -904,7 +918,7 @@ download_pytorch_riscv_from_github() {
     elif [ -d "${TEMP_EXTRACT_DIR}/torch" ]; then
         echo "Detected structure: torch/"
         cp -r "${TEMP_EXTRACT_DIR}/torch" "${INSTALL_DIR}/" || {
-            echo "❌ ERROR: Failed to copy files"
+            echo "[ERROR] ERROR: Failed to copy files"
             rm -rf "${TEMP_DIR}" "${TEMP_EXTRACT_DIR}"
             return 1
         }
@@ -912,15 +926,15 @@ download_pytorch_riscv_from_github() {
     elif [ -f "${TEMP_EXTRACT_DIR}/lib/libtorch.so" ] || [ -f "${TEMP_EXTRACT_DIR}/share/cmake/Torch/TorchConfig.cmake" ]; then
         echo "Detected structure: direct files (lib/, share/)"
         cp -r "${TEMP_EXTRACT_DIR}"/* "${INSTALL_DIR}/" || {
-            echo "❌ ERROR: Failed to copy files"
+            echo "[ERROR] ERROR: Failed to copy files"
             rm -rf "${TEMP_DIR}" "${TEMP_EXTRACT_DIR}"
             return 1
         }
     else
         # Unknown structure, try to copy everything
-        echo "⚠️  Unknown archive structure, attempting to copy all files..."
+        echo "[WARNING]  Unknown archive structure, attempting to copy all files..."
         cp -r "${TEMP_EXTRACT_DIR}"/* "${INSTALL_DIR}/" 2>/dev/null || {
-            echo "❌ ERROR: Failed to copy files"
+            echo "[ERROR] ERROR: Failed to copy files"
             echo "   Archive contents:"
             ls -la "${TEMP_EXTRACT_DIR}" | head -10
             rm -rf "${TEMP_DIR}" "${TEMP_EXTRACT_DIR}"
@@ -928,7 +942,7 @@ download_pytorch_riscv_from_github() {
         }
     fi
 
-    echo "✅ Extraction complete"
+    echo "[INFO] Extraction complete"
     echo ""
 
     # Clean up temporary directories
@@ -937,17 +951,17 @@ download_pytorch_riscv_from_github() {
     # Verify installation
     echo "Verifying PyTorch RISC-V installation..."
     if [ -f "${INSTALL_DIR}/torch/lib/libtorch.so" ] && [ -f "${INSTALL_DIR}/torch/share/cmake/Torch/TorchConfig.cmake" ]; then
-        echo "✅ PyTorch RISC-V installed successfully to ${INSTALL_DIR}"
+        echo "[INFO] PyTorch RISC-V installed successfully to ${INSTALL_DIR}"
         echo "   Structure: ${INSTALL_DIR}/torch/"
         echo ""
         return 0
     elif [ -f "${INSTALL_DIR}/share/cmake/Torch/TorchConfig.cmake" ] && [ -f "${INSTALL_DIR}/lib/libtorch.so" ]; then
-        echo "✅ PyTorch RISC-V installed successfully to ${INSTALL_DIR}"
+        echo "[INFO] PyTorch RISC-V installed successfully to ${INSTALL_DIR}"
         echo "   Structure: ${INSTALL_DIR}/ (direct)"
         echo ""
         return 0
     else
-        echo "❌ ERROR: PyTorch RISC-V installation verification failed."
+        echo "[ERROR] ERROR: PyTorch RISC-V installation verification failed."
         echo "   Expected files (libtorch.so, TorchConfig.cmake) not found in ${INSTALL_DIR}."
         echo ""
         echo "   Archive structure may be different. Please check:"
@@ -1027,24 +1041,24 @@ if [ -z "${SKIP_BUILD}" ]; then
     echo ""
 
     # Setup Clang 19 environment (integrated, no external script needed)
-    echo "Setting up Clang 19 RISC-V environment..."
-    if ! setup_clang19_env; then
-        echo "❌ ERROR: Failed to setup Clang 19 environment."
-        echo "   Please ensure Clang 19 is installed at ~/tools/clang19-riscv or set CLANG19_TOOLCHAIN_DIR."
+    echo "Setting up Clang RISC-V environment..."
+    if ! setup_clang_env; then
+        echo "[ERROR] ERROR: Failed to setup Clang environment."
+        echo "   Please ensure Clang 19+ is installed."
         exit 1
     fi
     echo ""
 
     # Verify Clang 19
     if [ ! -f "${CC}" ]; then
-        echo "❌ ERROR: Clang compiler not found at: ${CC}"
+        echo "[ERROR] ERROR: Clang compiler not found at: ${CC}"
         exit 1
     fi
 
     CLANG_VERSION=$("${CC}" --version 2>/dev/null | head -1)
     MAJOR_VERSION=$(echo "${CLANG_VERSION}" | grep -oE "clang version ([0-9]+)" | grep -oE "[0-9]+" | head -1)
     if [ -z "${MAJOR_VERSION}" ] || [ "${MAJOR_VERSION}" -lt 19 ]; then
-        echo "❌ ERROR: Clang 19 or later is required. Current version: ${MAJOR_VERSION}"
+        echo "[ERROR] ERROR: Clang 19 or later is required. Current version: ${MAJOR_VERSION}"
         echo "   Please build Clang 19 first or ensure it's properly configured."
         exit 1
     fi
@@ -1065,7 +1079,7 @@ if [ -z "${SKIP_BUILD}" ]; then
     if detect_pytorch_cross_prefix; then
         echo "Using PyTorch cross prefix: ${TORCH_PY_PREFIX}"
     else
-        echo "❌ PyTorch RISC-V cross-compilation package not found."
+        echo "[ERROR] PyTorch RISC-V cross-compilation package not found."
         echo ""
         echo "PyTorch RISC-V cross-compilation package is required for building sgl-kernel."
         echo ""
@@ -1115,14 +1129,14 @@ if [ -z "${SKIP_BUILD}" ]; then
                     if download_pytorch_riscv_from_github; then
                         # Re-detect after download
                         if detect_pytorch_cross_prefix; then
-                            echo "✅ PyTorch RISC-V installed and detected: ${TORCH_PY_PREFIX}"
+                            echo "[INFO] PyTorch RISC-V installed and detected: ${TORCH_PY_PREFIX}"
                         else
-                            echo "❌ ERROR: PyTorch RISC-V was downloaded but not detected correctly."
+                            echo "[ERROR] ERROR: PyTorch RISC-V was downloaded but not detected correctly."
                             echo "   Please check the installation at ${BANANA_PI_DIR}/riscv_pytorch"
                             exit 1
                         fi
                     else
-                        echo "❌ ERROR: Failed to download PyTorch RISC-V from GitHub Release."
+                        echo "[ERROR] ERROR: Failed to download PyTorch RISC-V from GitHub Release."
                         echo ""
                         echo "You can try:"
                         echo "  1. Check your network connection"
@@ -1137,7 +1151,7 @@ if [ -z "${SKIP_BUILD}" ]; then
                     exit 1
                     ;;
                 3)
-                    echo "⚠️  Continuing without PyTorch (build will likely fail)"
+                    echo "[WARNING]  Continuing without PyTorch (build will likely fail)"
                     echo "   You can set TORCH_PY_PREFIX later and re-run with --skip-clang-build"
                     ;;
                 *)
@@ -1151,14 +1165,14 @@ if [ -z "${SKIP_BUILD}" ]; then
             if download_pytorch_riscv_from_github; then
                 # Re-detect after download
                 if detect_pytorch_cross_prefix; then
-                    echo "✅ PyTorch RISC-V installed and detected: ${TORCH_PY_PREFIX}"
+                    echo "[INFO] PyTorch RISC-V installed and detected: ${TORCH_PY_PREFIX}"
                 else
-                    echo "❌ ERROR: PyTorch RISC-V was downloaded but not detected correctly."
+                    echo "[ERROR] ERROR: PyTorch RISC-V was downloaded but not detected correctly."
                     echo "   Please check the installation at ${BANANA_PI_DIR}/riscv_pytorch"
                     exit 1
                 fi
             else
-                echo "❌ ERROR: Failed to download PyTorch RISC-V from GitHub Release."
+                echo "[ERROR] ERROR: Failed to download PyTorch RISC-V from GitHub Release."
                 echo "   Please install manually or check network connection."
                 exit 1
             fi
@@ -1167,7 +1181,7 @@ if [ -z "${SKIP_BUILD}" ]; then
 
     # Get sgl-kernel directory
     if ! detect_sgl_kernel_dir; then
-        echo "❌ ERROR: Unable to locate sgl-kernel directory. Set SGL_KERNEL_DIR env var."
+        echo "[ERROR] ERROR: Unable to locate sgl-kernel directory. Set SGL_KERNEL_DIR env var."
         exit 1
     fi
 
@@ -1180,7 +1194,7 @@ if [ -z "${SKIP_BUILD}" ]; then
     rm -rf build/ dist/ *.egg-info
     find . -maxdepth 3 -name "*.so" -type f -delete 2>/dev/null || true
     find . -maxdepth 3 -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
-    echo "✅ Clean complete"
+    echo "[INFO] Clean complete"
     echo ""
 
     # Set environment variables for cross-compilation
@@ -1203,15 +1217,15 @@ EOF
 
     if "${CC}" ${CFLAGS} /tmp/test_riscv.c -o /tmp/test_riscv 2>/dev/null; then
         if file /tmp/test_riscv | grep -qi "riscv\|RISC-V"; then
-            echo "✅ RISC-V cross-compilation test passed"
+            echo "[INFO] RISC-V cross-compilation test passed"
             rm -f /tmp/test_riscv /tmp/test_riscv.c
         else
-            echo "❌ ERROR: Compiled binary is not RISC-V"
+            echo "[ERROR] ERROR: Compiled binary is not RISC-V"
             rm -f /tmp/test_riscv /tmp/test_riscv.c
             exit 1
         fi
     else
-        echo "❌ ERROR: RISC-V cross-compilation test failed"
+        echo "[ERROR] ERROR: RISC-V cross-compilation test failed"
         rm -f /tmp/test_riscv /tmp/test_riscv.c
         exit 1
     fi
@@ -1231,29 +1245,6 @@ EOF
     export SGL_ENABLE_ROCM=OFF
     export SGL_ENABLE_VULKAN=OFF
 
-    # Switch to RVV CMakeLists.txt for RISC-V build
-    CPU_CMAKE_DIR="${SGL_KERNEL_DIR}/csrc/cpu"
-    RVV_CMAKE="${CPU_CMAKE_DIR}/RVVCMakeLists.txt"
-    ORIG_CMAKE="${CPU_CMAKE_DIR}/CMakeLists.txt"
-    BACKUP_CMAKE="${CPU_CMAKE_DIR}/CMakeLists.txt.orig"
-
-    if [ -f "${RVV_CMAKE}" ]; then
-        echo "Switching to RVV CMakeLists.txt for RISC-V build..."
-        # Backup original CMakeLists.txt if not already backed up
-        if [ ! -f "${BACKUP_CMAKE}" ]; then
-            cp "${ORIG_CMAKE}" "${BACKUP_CMAKE}"
-        fi
-        # Use RVV CMakeLists.txt
-        cp "${RVV_CMAKE}" "${ORIG_CMAKE}"
-        echo "✅ Using RVVCMakeLists.txt for RVV kernel build"
-
-        # Set cleanup trap to restore original CMakeLists.txt
-        trap 'if [ -f "${BACKUP_CMAKE}" ]; then cp "${BACKUP_CMAKE}" "${ORIG_CMAKE}"; rm -f "${BACKUP_CMAKE}"; echo "Restored original CMakeLists.txt"; fi' EXIT
-    else
-        echo "⚠️  RVVCMakeLists.txt not found at ${RVV_CMAKE}"
-        echo "   Using existing CMakeLists.txt (must have RVV support)"
-    fi
-
     # Build wheel
     echo "Building sglang-kernel wheel for RISC-V..."
     export _PYTHON_HOST_PLATFORM="linux-riscv64"
@@ -1269,27 +1260,27 @@ EOF
     fi
 
     if ! ${BUILD_CMD} 2>&1 | tee build_riscv_wheel.log; then
-        echo "❌ ERROR: Wheel build failed. See build_riscv_wheel.log for details."
+        echo "[ERROR] ERROR: Wheel build failed. See build_riscv_wheel.log for details."
         exit 1
     fi
 
     echo ""
-    echo "✅ Step 1 complete: Wheel built successfully"
+    echo "[INFO] Step 1 complete: Wheel built successfully"
     echo ""
 else
-    echo "⏭️  Skipping build step (SKIP_BUILD is set)"
+    echo "[SKIP]  Skipping build step (SKIP_BUILD is set)"
     echo ""
 fi
 
 # Find wheel file
 if ! detect_sgl_kernel_dir; then
-    echo "❌ ERROR: Unable to locate sgl-kernel directory. Set SGL_KERNEL_DIR env var."
+    echo "[ERROR] ERROR: Unable to locate sgl-kernel directory. Set SGL_KERNEL_DIR env var."
     exit 1
 fi
 WHEEL_FILE=$(find "${SGL_KERNEL_DIR}/dist" -name "sgl_kernel-*linux_riscv64.whl" -o -name "sgl_kernel-*.whl" 2>/dev/null | head -1)
 
 if [ -z "${WHEEL_FILE}" ] || [ ! -f "${WHEEL_FILE}" ]; then
-    echo "❌ ERROR: Wheel file not found"
+    echo "[ERROR] ERROR: Wheel file not found"
     echo "   Searched in: ${SGL_KERNEL_DIR}/dist"
     exit 1
 fi
@@ -1308,20 +1299,20 @@ if [ -z "${SKIP_TRANSFER}" ]; then
 
     echo "Testing SSH connection..."
     if ! ssh_cmd -o ConnectTimeout=5 -o BatchMode=yes "${BANANA_PI_USER}@${BANANA_PI_HOST}" "echo 'SSH connection successful'" 2>/dev/null; then
-        echo "⚠️  WARNING: SSH key authentication may not be set up"
+        echo "[WARNING]  WARNING: SSH key authentication may not be set up"
         echo "   You may be prompted for password"
     fi
 
     echo "Transferring ${WHEEL_BASENAME} to ${BANANA_PI_USER}@${BANANA_PI_HOST}..."
     scp_cmd "${WHEEL_FILE}" "${BANANA_PI_USER}@${BANANA_PI_HOST}:~/${WHEEL_BASENAME}" || {
-        echo "❌ ERROR: Failed to transfer wheel"
+        echo "[ERROR] ERROR: Failed to transfer wheel"
         exit 1
     }
 
     echo "Syncing banana_pi tools to ${BANANA_PI_USER}@${BANANA_PI_HOST}:${REMOTE_BANANA_PI_DIR}..."
     echo "Note: Excluding riscv_pytorch/ (only needed for cross-compilation on x86 host)"
     ssh_cmd "${BANANA_PI_USER}@${BANANA_PI_HOST}" "mkdir -p ${REMOTE_BANANA_PI_DIR}" || {
-        echo "❌ ERROR: Failed to create remote directory ${REMOTE_BANANA_PI_DIR}"
+        echo "[ERROR] ERROR: Failed to create remote directory ${REMOTE_BANANA_PI_DIR}"
         exit 1
     }
 
@@ -1329,7 +1320,7 @@ if [ -z "${SKIP_TRANSFER}" ]; then
         # Exclude riscv_pytorch/ - it's only needed for cross-compilation, not on Banana Pi
         if ! rsync -a --delete --exclude='riscv_pytorch' -e "${SSH_BIN}" "${BANANA_PI_DIR}/" "${BANANA_PI_USER}@${BANANA_PI_HOST}:${REMOTE_BANANA_PI_DIR}/"; then
             rsync -a --delete --exclude='riscv_pytorch' -e "env LD_LIBRARY_PATH= ${SSH_BIN}" "${BANANA_PI_DIR}/" "${BANANA_PI_USER}@${BANANA_PI_HOST}:${REMOTE_BANANA_PI_DIR}/" || {
-                echo "❌ ERROR: Failed to sync banana_pi directory via rsync"
+                echo "[ERROR] ERROR: Failed to sync banana_pi directory via rsync"
                 exit 1
             }
         fi
@@ -1337,16 +1328,16 @@ if [ -z "${SKIP_TRANSFER}" ]; then
         # For tar, we need to exclude riscv_pytorch directory
         if ! tar -C "${BANANA_PI_DIR}" --exclude='riscv_pytorch' -cf - . | "${SSH_BIN}" "${BANANA_PI_USER}@${BANANA_PI_HOST}" "tar -C ${REMOTE_BANANA_PI_DIR} -xf -"; then
             tar -C "${BANANA_PI_DIR}" --exclude='riscv_pytorch' -cf - . | env LD_LIBRARY_PATH= "${SSH_BIN}" "${BANANA_PI_USER}@${BANANA_PI_HOST}" "tar -C ${REMOTE_BANANA_PI_DIR} -xf -" || {
-                echo "❌ ERROR: Failed to sync banana_pi directory via tar"
+                echo "[ERROR] ERROR: Failed to sync banana_pi directory via tar"
                 exit 1
             }
         fi
     fi
 
-    echo "✅ Step 2 complete: Wheel transferred successfully"
+    echo "[INFO] Step 2 complete: Wheel transferred successfully"
     echo ""
 else
-    echo "⏭️  Skipping transfer step (SKIP_TRANSFER is set)"
+    echo "[SKIP]  Skipping transfer step (SKIP_TRANSFER is set)"
     echo ""
 fi
 
@@ -1363,7 +1354,7 @@ set -e
 # Activate virtual environment if exists
 if [ -d ~/.local_riscv_env/workspace/venv_sglang ]; then
     source ~/.local_riscv_env/workspace/venv_sglang/bin/activate
-    echo "✓ Activated virtual environment"
+    echo "[OK] Activated virtual environment"
 fi
 
 # Set up OpenMP library paths for RISC-V
@@ -1371,9 +1362,9 @@ fi
 if [ -f ~/.local/lib/libomp.so ]; then
     export LD_PRELOAD=~/.local/lib/libomp.so
     export LD_LIBRARY_PATH=~/.local/lib:$LD_LIBRARY_PATH
-    echo "✓ Set up OpenMP library paths"
+    echo "[OK] Set up OpenMP library paths"
 else
-    echo "⚠️  Warning: ~/.local/lib/libomp.so not found, OpenMP may not work"
+    echo "[WARNING]  Warning: ~/.local/lib/libomp.so not found, OpenMP may not work"
 fi
 
 # Find wheel file
@@ -1383,7 +1374,7 @@ fi
     fi
 
     if [ ! -f "${WHEEL_FILE}" ]; then
-        echo "❌ ERROR: Wheel file not found on Banana Pi"
+        echo "[ERROR] ERROR: Wheel file not found on Banana Pi"
         exit 1
     fi
 
@@ -1418,38 +1409,38 @@ fi
     # Install new wheel with --ignore-installed to skip all checks
     echo "Installing new wheel..."
     pip install --ignore-installed --no-deps "${WHEEL_FILE}" || {
-    echo "❌ ERROR: Failed to install wheel"
+    echo "[ERROR] ERROR: Failed to install wheel"
     exit 1
 }
 
-echo "✓ sgl-kernel installed successfully"
+echo "[OK] sgl-kernel installed successfully"
 echo ""
 
 # Verify installation
 echo "Verifying installation..."
 echo "LD_PRELOAD=$LD_PRELOAD"
 echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-python3 -c "import sgl_kernel; print('✓ sgl_kernel imported successfully')" || {
-    echo "❌ ERROR: Failed to import sgl_kernel"
+python3 -c "import sgl_kernel; print('[OK] sgl_kernel imported successfully')" || {
+    echo "[ERROR] ERROR: Failed to import sgl_kernel"
     exit 1
 }
 
-python3 -c "import torch; print('✓ PyTorch ops available:', hasattr(torch.ops.sgl_kernel, 'decode_attention_cpu'))" || {
-    echo "⚠️  WARNING: decode_attention_cpu not available"
+python3 -c "import torch; print('[OK] PyTorch ops available:', hasattr(torch.ops.sgl_kernel, 'decode_attention_cpu'))" || {
+    echo "[WARNING]  WARNING: decode_attention_cpu not available"
 }
 
 echo ""
 ENDSSH
 
     if [ $? -ne 0 ]; then
-        echo "❌ ERROR: Installation failed on Banana Pi"
+        echo "[ERROR] ERROR: Installation failed on Banana Pi"
         exit 1
     fi
 
-    echo "✅ Step 3 complete: Wheel installed successfully"
+    echo "[INFO] Step 3 complete: Wheel installed successfully"
     echo ""
 else
-    echo "⏭️  Skipping install step (SKIP_INSTALL is set)"
+    echo "[SKIP]  Skipping install step (SKIP_INSTALL is set)"
     echo ""
 fi
 
@@ -1461,5 +1452,5 @@ echo ""
 echo "Summary:"
 echo "  Wheel file: ${WHEEL_BASENAME}"
 echo "  Target: ${BANANA_PI_USER}@${BANANA_PI_HOST}"
-echo "  Status: ✅ Installed and verified"
+echo "  Status: [INFO] Installed and verified"
 echo ""

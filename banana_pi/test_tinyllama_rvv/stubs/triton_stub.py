@@ -70,6 +70,9 @@ class _StubValue:
 class _StubModule(ModuleType):
     """Module that lazily creates stub values for any missing attributes."""
 
+    __version__ = "stub"
+    _is_stub = True
+
     def __getattr__(self, name):
         if name.startswith("__"):
             raise AttributeError(name)
@@ -138,6 +141,7 @@ triton_module.__spec__ = importlib.util.spec_from_loader(
 
 # Submodules required by torch/sglang
 triton_module.language = _StubModule("triton.language")
+triton_module.language.__path__ = []
 triton_module.compiler = _StubModule("triton.compiler")
 triton_module.runtime = _StubModule("triton.runtime")
 triton_module.testing = _StubModule("triton.testing")
@@ -186,8 +190,12 @@ tl.full_like = stub_function
 
 # Provide tl extras (others auto-stub via __getattr__)
 tl.extra = _StubModule("triton.language.extra")
+tl.extra.__path__ = []
 tl.extra.cuda = _StubModule("triton.language.extra.cuda")
+tl.extra.cuda.__path__ = []
 tl.extra.cuda.libdevice = _StubModule("triton.language.extra.cuda.libdevice")
+tl.extra.libdevice = _StubModule("triton.language.extra.libdevice")
+
 tl.math = _StubModule("triton.language.math")
 tl.math.max = stub_function
 tl.math.min = stub_function
@@ -279,6 +287,7 @@ sys.modules["triton.language"] = triton_module.language
 sys.modules["triton.language.extra"] = tl.extra
 sys.modules["triton.language.extra.cuda"] = tl.extra.cuda
 sys.modules["triton.language.extra.cuda.libdevice"] = tl.extra.cuda.libdevice
+sys.modules["triton.language.extra.libdevice"] = tl.extra.libdevice
 sys.modules["triton.language.math"] = tl.math
 sys.modules["triton.language.core"] = tl.core
 sys.modules["triton.language.tensor"] = tl.tensor

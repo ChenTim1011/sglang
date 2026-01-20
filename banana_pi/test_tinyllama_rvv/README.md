@@ -1,172 +1,99 @@
-# TinyLlama RVV Test Directory
+# TinyLlama RVV Test Suite
 
-This directory contains scripts for testing and benchmarking TinyLlama 1.1B model with the RVV backend.
-
-## Files
-
-### `benchmark_rvv_backends.py`
-**Purpose**: Compare RVV vs TORCH_NATIVE backend performance for TinyLlama 1.1B
-
-**What it does**:
-- Launches SGLang server with specified backend (RVV or TORCH_NATIVE)
-- Measures SGLang-style metrics:
-  - TTFT (Time To First Token): Prefill latency
-  - Token generation throughput: tokens/second
-  - Decode latency: Average time per token
-  - End-to-end latency: Total generation time
-- Compares backends and shows speedup (RVV vs TORCH_NATIVE)
-
-**Usage**:
-```bash
-# Compare both backends (default)
-python benchmark_rvv_backends.py
-
-# Test only RVV or TORCH_NATIVE
-python benchmark_rvv_backends.py --backend rvv
-python benchmark_rvv_backends.py --backend torch_native
-
-# Custom parameters
-python benchmark_rvv_backends.py --warmup 3 --num-runs 10 --max-tokens 100
-
-# Restart server for each backend (clean environment)
-python benchmark_rvv_backends.py --restart
-
-# Save results to JSON
-python benchmark_rvv_backends.py --output results.json
-```
-
-**Output**: Shows comparison table with speedup metrics (e.g., "RVV is 1.25x faster than TORCH_NATIVE")
+This directory contains scripts for benchmarking and testing the TinyLlama 1.1B model using the high-performance RISC-V Vector (RVV) backend for SGLang.
 
 ---
 
-### `test_tinyllama_rvv.py`
-**Purpose**: Interactive chat interface with TinyLlama using RVV backend
+## How to Use (Tutorial)
 
-**What it does**:
-- Checks and launches SGLang server with RVV backend
-- Provides interactive chat interface
-- Manages server lifecycle (startup, shutdown)
-- Validates environment (libomp, dependencies)
+### Step 1: Initialize the Environment
 
-**Usage**:
+After connecting to the Banana Pi, you need to source the environment settings script to configure paths and library variables.
+
 ```bash
-python test_tinyllama_rvv.py
+source ../environment_setting.sh
+```
+*Tip: This sets up `LD_PRELOAD` for OpenMP and activates the Python virtual environment.*
+
+### Step 2: Manage Environment (Stubs & Verification)
+
+We provide a unified tool to install necessary "stub" packages (like `triton` and `vllm` which are simulated on RISC-V) and verify that your system is ready.
+
+```bash
+# Verify environment and install missing stubs automatically
+python3 manage_rvv_env.py
 ```
 
-**Features**:
-- Automatic server management
-- Environment validation
-- Interactive chat loop
-- Graceful shutdown handling
+If you see **"All verification steps passed!"**, you are ready to go.
 
----
+### Step 3: Run Interactive Chat
 
-### `test_environment.py`
-**Purpose**: Validate environment setup for TinyLlama testing
+Test the model in real-time with an interactive chat interface. This script handles the SGLang server lifecycle automatically.
 
-**What it checks**:
-- Python dependencies
-- SGLang installation
-- RVV backend availability
-- System configuration
-
-**Usage**:
 ```bash
-python test_environment.py
+python3 test_tinyllama_rvv.py
+```
+
+### Step 4: Run Performance Benchmarks
+
+Compare the performance of the optimized RVV backend against the standard PyTorch native backend.
+
+```bash
+# Run benchmark with default settings
+python3 benchmark_rvv_backends.py
+
+# Compare specific backends
+python3 benchmark_rvv_backends.py --backend rvv
+python3 benchmark_rvv_backends.py --backend torch_native
+```
+
+### Step 5: Run Full End-to-End Suite
+
+Run the comprehensive end-to-end benchmark script (moved from `tests_rvv_kernels/`) which supports one-batch, offline, and serving benchmarks.
+
+```bash
+# Run serving benchmark
+./bench_endtoend.sh --bench-serving
 ```
 
 ---
 
-### Configuration Files
-**Purpose**: SGLang server configuration files (generated dynamically)
+## File Descriptions
 
-**How it works**:
-- `benchmark_rvv_backends.py` generates config files dynamically via `create_config_file()`
-- Config files are created as `config_benchmark_{backend}.yaml` (e.g., `config_benchmark_rvv.yaml`)
-- `test_tinyllama_rvv.py` also uses dynamic config generation
+### Core Scripts
 
-**Configuration** (generated):
-- Model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
-- Device: CPU
-- Attention backend: RVV or TORCH_NATIVE (depending on test)
-- Memory settings optimized for Banana Pi (16GB RAM)
-- KV cache: FP16 (auto)
+*   **`manage_rvv_env.py`**
+    **Purpose**: The all-in-one environment manager.
+    **Function**: It installs "stub" packages (simulated versions of `triton`, `vllm`, `torchvision` for RISC-V compatibility) and runs a comprehensive health check on your environment (checking imports, libomp, and config generation).
+    **Usage**: `python3 manage_rvv_env.py`
 
-**Note**: No static `config_rvv.yaml` file is needed - configs are generated on-the-fly
+*   **`benchmark_rvv_backends.py`**
+    **Purpose**: Performance benchmarking tool.
+    **Function**: Launches the SGLang server and measures key metrics: Time To First Token (TTFT), Token Generation Throughput, and End-to-End Latency. It can compare RVV vs. Torch Native backends.
+    **Usage**: `python3 benchmark_rvv_backends.py [options]`
 
----
+*   **`test_tinyllama_rvv.py`**
+    **Purpose**: Interactive demo.
+    **Function**: A chat interface that launches the server and allows you to talk to TinyLlama. It serves as an end-to-end integration test.
+    **Usage**: `python3 test_tinyllama_rvv.py`
 
-### `triton_stub.py` & `vllm_stub.py`
-**Purpose**: Stub modules for dependencies not available on RISC-V
+*   **`launch_server_rvv.py`**
+    **Purpose**: RISC-V specific server launcher.
+    **Function**: A wrapper used by other scripts to launch the SGLang server. It handles critical setup like monkey-patching `transformers` to avoid circular imports on RISC-V and ensuring the `rvv` backend is correctly registered.
 
-**What they do**:
-- Provide minimal implementations of `triton` and `vllm` modules
-- Prevent import errors when these modules are not available
-- Required for SGLang to run on RISC-V hardware
+*   **`bench_endtoend.sh`**
+    **Purpose**: Comprehensive end-to-end benchmark runner.
+    **Function**: Runs single batch, offline throughput, and serving benchmarks. Supports command line flags nicely.
+    **Usage**: `./bench_endtoend.sh --bench-serving`
 
-**Usage**: Automatically loaded by test scripts
+### Helper Files
 
----
+*   **`../environment_setting.sh`**
+    **Purpose**: Shell environment setup.
+    **Function**: Sets `LD_PRELOAD`, `LD_LIBRARY_PATH`, and activates the `venv_sglang` virtual environment. Use `source` to run it.
 
-### Dependencies
-**Purpose**: Python dependencies for TinyLlama testing
+*   **`stubs/`**
+    **Purpose**: Compatibility layer.
+    **Function**: Contains the source code for the stub packages (`triton_stub.py`, `vllm_stub.py`, etc.) installed by `manage_rvv_env.py`.
 
-**Note**: All dependencies are automatically installed by `setup_banana_pi.sh`. The dependencies include:
-- `requests` - HTTP client for API calls
-- `psutil` - System and process utilities
-- `pyyaml` - YAML parser for configuration files
-- And many other SGLang dependencies
-
-**Manual installation** (if needed):
-```bash
-pip install requests psutil pyyaml
-```
-
----
-
-## Quick Start
-
-**⚠️ Important: Before running any scripts, set up the environment:**
-
-```bash
-# Set OpenMP library paths
-export LD_PRELOAD=~/.local/lib/libomp.so
-export LD_LIBRARY_PATH=~/.local/lib:$LD_LIBRARY_PATH
-
-# Activate virtual environment
-source ~/.local_riscv_env/workspace/venv_sglang/bin/activate
-```
-
-1. **Validate environment**:
-   ```bash
-   python test_environment.py
-   ```
-
-2. **Run backend comparison**:
-   ```bash
-   python benchmark_rvv_backends.py
-   ```
-
-3. **Interactive chat**:
-   ```bash
-   python test_tinyllama_rvv.py
-   ```
-
----
-
-## Notes
-
-- All scripts require SGLang to be installed and configured
-- RVV backend must be compiled and available in SGLang
-- Server management scripts handle OpenMP library paths automatically
-- Benchmark scripts create temporary config files for each backend
-- Results can be saved to JSON for further analysis
-
----
-
-## Troubleshooting
-
-- **Server fails to start**: Check logs in `benchmark_*.log` files
-- **Import errors**: Ensure `triton_stub.py` and `vllm_stub.py` are in the directory
-- **OpenMP errors**: Verify `~/.local/lib/libomp.so` exists and is accessible
-- **Backend not found**: Ensure RVV backend is registered in SGLang's attention registry
+### Configuration

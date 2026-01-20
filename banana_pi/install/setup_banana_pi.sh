@@ -8,9 +8,9 @@
 # - Install wheels (from GitHub Releases)
 # - Install libomp library (from GitHub Releases)
 # - Configure environment
-# - Run tests
+# - Configure environment
 #
-# Usage: ./setup_banana_pi.sh [--user USER] [--host HOST] [--yes] [--skip-wheels] [--skip-test] [--wheels-tag TAG]
+# Usage: ./setup_banana_pi.sh [--user USER] [--host HOST] [--yes] [--skip-wheels] [--wheels-tag TAG]
 
 set -e
 
@@ -26,7 +26,6 @@ BANANA_PI_USER="${BANANA_PI_USER:-jtchen}"
 BANANA_PI_HOST="${BANANA_PI_HOST:-140.114.78.64}"
 SKIP_CONFIRM=false
 SKIP_WHEELS=false
-SKIP_TEST=true
 SGLANG_REPO="https://github.com/nthu-pllab/pllab-sglang.git"
 SGLANG_BRANCH="rvv_backend"
 WORKSPACE_DIR="$HOME/.local_riscv_env/workspace"
@@ -85,10 +84,7 @@ while [[ $# -gt 0 ]]; do
             SKIP_WHEELS=true
             shift
             ;;
-        --skip-test)
-            SKIP_TEST=true
-            shift
-            ;;
+
         --wheels-tag)
             WHEELS_RELEASE_TAG="$2"
             shift 2
@@ -105,7 +101,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --host HOST      Banana Pi host/IP (default: 140.114.78.64)"
             echo "  --yes, -y        Skip confirmation prompts"
             echo "  --skip-wheels    Skip wheel installation"
-            echo "  --skip-test      Skip running test after setup"
+
             echo "  --wheels-tag TAG  Release tag for wheels (default: v1.0)"
             echo "  --github-token TOKEN  GitHub token for private repo access (or set GITHUB_TOKEN env var, or will be prompted)"
             echo "  --help, -h        Show this help message"
@@ -150,7 +146,7 @@ echo "Prerequisites (SSH Key Setup):"
 echo "  To avoid entering your password multiple times, set up SSH keys:"
 echo "    1. Generate key (if needed): ssh-keygen -t ed25519"
 echo "    2. Copy key to Banana Pi:    ssh-copy-id -i ~/.ssh/id_ed25519.pub $BANANA_PI_USER@$BANANA_PI_HOST"
-echo "    Example: ssh-copy-id -i ~/.ssh/id_ed25519.pub jtchen@140.114.78.64"
+echo "    Example: ssh-copy-id -i ~/.ssh/id_ed25519.pub user@192.168.1.10"
 echo ""
 echo "This script will:"
 echo "  1. Clone/update sglang repository (pllab-sglang/rvv_backend)"
@@ -163,7 +159,7 @@ echo "  --user USER         Banana Pi username (default: $BANANA_PI_USER)"
 echo "  --host HOST         Banana Pi host/IP (default: $BANANA_PI_HOST)"
 echo "  --yes, -y           Skip confirmation prompts"
 echo "  --skip-wheels       Skip wheel installation"
-echo "  --skip-test         Skip running test after setup"
+
 echo "  --wheels-tag TAG    Release tag for wheels (default: v1.0)"
 echo "  --github-token TOKEN  GitHub token for private repo (or will be prompted)"
 echo "  --help, -h          Show detailed help"
@@ -189,7 +185,7 @@ if [ "$SKIP_CONFIRM" = false ]; then
         echo ""
         GITHUB_TOKEN="${input_token}"
         if [ -n "$GITHUB_TOKEN" ]; then
-            log_info "✓ GitHub token will be used for authentication"
+            log_info "[OK] GitHub token will be used for authentication"
         else
             log_warn "No GitHub token provided."
             log_warn "  - Release downloads may fail"
@@ -197,7 +193,7 @@ if [ "$SKIP_CONFIRM" = false ]; then
             log_warn "  - Password prompt: Use your GitHub PAT as the password"
         fi
     else
-        log_info "✓ GitHub token already provided (will be used for Git operations and Release downloads)"
+        log_info "[OK] GitHub token already provided (will be used for Git operations and Release downloads)"
     fi
     echo ""
 fi
@@ -225,7 +221,7 @@ SSH_CONNECTION_EXIT=$?
 set -e
 
 if [ $SSH_CONNECTION_EXIT -eq 0 ]; then
-    log_info "✓ SSH connection OK"
+    log_info "[OK] SSH connection OK"
 elif [ $SSH_CONNECTION_EXIT -eq 124 ]; then
     log_error "SSH connection timeout (10 seconds)"
     log_info "Please check:"
@@ -279,7 +275,7 @@ WHEEL_BUILDER_URL="https://gitlab.com/api/v4/projects/riseproject%2Fpython%2Fwhe
 log_step "Creating workspace directory..."
 mkdir -p "$WORKSPACE_DIR"
 cd "$WORKSPACE_DIR"
-log_info "✓ Workspace directory created"
+log_info "[OK] Workspace directory created"
 
 # Step 2: Clone or update sglang repo
 log_step "Setting up sglang repository..."
@@ -478,7 +474,7 @@ if [ -d "$PROJECT_DIR/.git" ]; then
                             log_error "Failed to reset to remote version"
                             exit 1
                         }
-                        log_info "✓ Repository reset to remote version"
+                        log_info "[OK] Repository reset to remote version"
                         ;;
                     2)
                         log_info "Aborting merge and keeping local version..."
@@ -539,7 +535,7 @@ if [ -d "$PROJECT_DIR/.git" ]; then
                 git remote set-url origin "$SGLANG_REPO" 2>/dev/null
             fi
 
-            log_info "✓ Repository updated"
+            log_info "[OK] Repository updated"
             ;;
         2)
         log_info "Removing existing repository and cloning fresh copy..."
@@ -552,7 +548,7 @@ if [ -d "$PROJECT_DIR/.git" ]; then
         git clone -b "$SGLANG_BRANCH" "$CLONE_URL" "$PROJECT_DIR" || {
             log_error "Failed to clone repository"
             if [ -z "$GITHUB_TOKEN" ]; then
-                log_info "💡 Tip: For private repositories, you may need to provide a GitHub token."
+                log_info "[TIP] Tip: For private repositories, you may need to provide a GitHub token."
                 log_info "   Password prompt: Use your GitHub Personal Access Token (PAT) as the password."
             fi
             exit 1
@@ -562,7 +558,7 @@ if [ -d "$PROJECT_DIR/.git" ]; then
             cd "$PROJECT_DIR"
             git remote set-url origin "$SGLANG_REPO" 2>/dev/null
         fi
-        log_info "✓ Repository cloned"
+        log_info "[OK] Repository cloned"
             ;;
         3)
             log_info "Skipping repository setup, using existing repository"
@@ -629,7 +625,7 @@ if [ -d "$PROJECT_DIR/.git" ]; then
                 git remote set-url origin "$SGLANG_REPO" 2>/dev/null
             fi
 
-            log_info "✓ Repository updated"
+            log_info "[OK] Repository updated"
             ;;
     esac
 else
@@ -656,7 +652,7 @@ else
         git clone -b "$SGLANG_BRANCH" "$CLONE_URL" "$PROJECT_DIR" || {
             log_error "Failed to clone repository"
             if [ -z "$GITHUB_TOKEN" ]; then
-                log_info "💡 Tip: For private repositories, you may need to provide a GitHub token."
+                log_info "[TIP] Tip: For private repositories, you may need to provide a GitHub token."
                 log_info "   Password prompt: Use your GitHub Personal Access Token (PAT) as the password."
             fi
             exit 1
@@ -666,7 +662,7 @@ else
             cd "$PROJECT_DIR"
             git remote set-url origin "$SGLANG_REPO" 2>/dev/null
         fi
-        log_info "✓ Repository cloned"
+        log_info "[OK] Repository cloned"
     else
         log_warn "Skipping repository clone"
         log_info "You will need to set up the repository manually"
@@ -681,7 +677,7 @@ if [ ! -d "$PROJECT_DIR/.git" ]; then
     exit 1
 fi
 
-log_info "✓ Repository ready"
+log_info "[OK] Repository ready"
 
 # Step 3: Create virtual environment
 log_step "Setting up Python virtual environment..."
@@ -696,7 +692,7 @@ fi
 
 # Activate virtual environment
 source "$VENV_DIR/bin/activate"
-log_info "✓ Virtual environment ready"
+log_info "[OK] Virtual environment ready"
 
 # Upgrade pip
 log_info "Upgrading pip..."
@@ -778,7 +774,7 @@ if [ "$SKIP_WHEELS" != "true" ]; then
                     CURL_OUTPUT=$(curl -L -w "\nHTTP_STATUS:%{http_code}" -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/octet-stream" -o "$ARCHIVE_FILE" "$DOWNLOAD_URL" 2>&1)
                 fi
             else
-                log_warn "⚠ Token may not have access to release API, trying browser_download_url"
+                log_warn "[WARNING] Token may not have access to release API, trying browser_download_url"
                 CURL_OUTPUT=$(curl -L -w "\nHTTP_STATUS:%{http_code}" -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/octet-stream" -o "$ARCHIVE_FILE" "$DOWNLOAD_URL" 2>&1)
             fi
             CURL_EXIT=$?
@@ -859,13 +855,13 @@ if [ "$SKIP_WHEELS" != "true" ]; then
     fi
 
     if [ "$DOWNLOAD_SUCCESS" = true ] && [ -f "$ARCHIVE_FILE" ]; then
-        log_info "  ✓ Downloaded $ARCHIVE_FILE"
+        log_info "  [OK] Downloaded $ARCHIVE_FILE"
 
         # Verify downloaded file is actually a tar archive (gzip or uncompressed)
         log_info "Verifying archive format..."
         FILE_TYPE=$(file "$ARCHIVE_FILE" | cut -d: -f2-)
         if echo "$FILE_TYPE" | grep -qE "(gzip|tar|compressed|POSIX tar)"; then
-            log_info "  ✓ Archive format verified: $FILE_TYPE"
+            log_info "  [OK] Archive format verified: $FILE_TYPE"
         else
             log_error "Downloaded file is not a valid archive!"
             log_info "File type: $FILE_TYPE"
@@ -909,7 +905,7 @@ if [ "$SKIP_WHEELS" != "true" ]; then
                 exit 1
             fi
         fi
-        log_info "  ✓ Extracted archive"
+        log_info "  [OK] Extracted archive"
 
         # Install all wheels (check if already installed first)
         log_info "Installing Python wheels..."
@@ -922,15 +918,15 @@ if [ "$SKIP_WHEELS" != "true" ]; then
                 # Check if package is already installed
                 if python -c "import ${package_name//-/_}" 2>/dev/null || \
                    pip show "$package_name" >/dev/null 2>&1; then
-                    log_info "  ⊙ $wheel_name already installed, skipping"
+                    log_info "  [INFO] $wheel_name already installed, skipping"
                     INSTALLED_WHEELS+=("$wheel_name (already installed)")
                 else
                     log_info "  Installing $wheel_name..."
                     if pip install "$wheel_file" --quiet 2>&1; then
-                        log_info "  ✓ Installed $wheel_name"
+                        log_info "  [OK] Installed $wheel_name"
                         INSTALLED_WHEELS+=("$wheel_name")
                     else
-                        log_warn "  ✗ Failed to install $wheel_name"
+                        log_warn "  [ERROR] Failed to install $wheel_name"
                         FAILED_WHEELS+=("$wheel_name")
                     fi
                 fi
@@ -996,19 +992,19 @@ if [ "$SKIP_WHEELS" != "true" ]; then
                                     echo "export LD_PRELOAD=\"$LIBOMP_DIR/libomp.so\${LD_PRELOAD:+:\$LD_PRELOAD}\"" >> ~/.bashrc
                                     echo "export LD_LIBRARY_PATH=\"$LIBOMP_DIR:\${LD_LIBRARY_PATH}\"" >> ~/.bashrc
                                 fi
-                                log_info "  ✓ libomp configured at $LIBOMP_DIR/libomp.so"
+                                log_info "  [OK] libomp configured at $LIBOMP_DIR/libomp.so"
                                 LIBOMP_INSTALLED=true
                             else
-                                log_warn "  ✗ libomp.so not found at expected location after copy"
+                                log_warn "  [ERROR] libomp.so not found at expected location after copy"
                                 LIBOMP_INSTALLED=false
                             fi
                         else
-                            log_warn "  ✗ Failed to copy libomp.so to $LIBOMP_DIR"
+                            log_warn "  [ERROR] Failed to copy libomp.so to $LIBOMP_DIR"
                             rm -rf "$TEMP_EXTRACT_DIR"
                             LIBOMP_INSTALLED=false
                         fi
                     else
-                        log_warn "  ✗ libomp.so not found in archive structure"
+                        log_warn "  [ERROR] libomp.so not found in archive structure"
                         log_info "    Archive contents:"
                         find "$TEMP_EXTRACT_DIR" -type f -name "*.so" 2>/dev/null | head -5 | while read -r file; do
                             log_info "      $file"
@@ -1017,7 +1013,7 @@ if [ "$SKIP_WHEELS" != "true" ]; then
                         LIBOMP_INSTALLED=false
                     fi
                 else
-                    log_warn "  ✗ Failed to extract libomp archive"
+                    log_warn "  [ERROR] Failed to extract libomp archive"
                     log_info "    Extraction command: $EXTRACT_CMD"
                     log_info "    File type: $LIBOMP_FILE_TYPE"
                     LIBOMP_INSTALLED=false
@@ -1107,7 +1103,6 @@ OTHER_CORE_DEPS=(
     "openai"
     "dill"
     "multiprocess"
-    "torchao"
     "xgrammar"
     "pytest"
     "pyzmq"
@@ -1137,7 +1132,7 @@ for package in "${WHEEL_BUILDER_PACKAGES[@]}"; do
 
     # Check if already installed
     if python -c "import $import_name" 2>/dev/null; then
-        log_info "  ⊙ $package already installed, skipping"
+        log_info "  [INFO] $package already installed, skipping"
         SKIPPED_PACKAGES+=("$package")
     else
         log_info "Installing $package from wheel_builder..."
@@ -1147,20 +1142,20 @@ for package in "${WHEEL_BUILDER_PACKAGES[@]}"; do
         set -e
 
         if [ $INSTALL_EXIT -eq 0 ] || python -c "import $import_name" 2>/dev/null; then
-            log_info "  ✓ Installed $package"
+            log_info "  [OK] Installed $package"
             INSTALLED_PACKAGES+=("$package")
         else
-            log_warn "  ✗ Failed from wheel_builder, trying PyPI..."
+            log_warn "  [ERROR] Failed from wheel_builder, trying PyPI..."
             set +e
             pip install "$package" --quiet 2>/dev/null
             INSTALL_EXIT=$?
             set -e
 
             if [ $INSTALL_EXIT -eq 0 ] || python -c "import $import_name" 2>/dev/null; then
-                log_info "  ✓ Installed $package from PyPI"
+                log_info "  [OK] Installed $package from PyPI"
                 INSTALLED_PACKAGES+=("$package")
             else
-                log_warn "  ✗ Failed to install $package"
+                log_warn "  [ERROR] Failed to install $package"
                 FAILED_PACKAGES+=("$package")
             fi
         fi
@@ -1211,7 +1206,7 @@ for package in "${OTHER_CORE_DEPS[@]}"; do
 
     # Check if already installed
     if python -c "import $import_name" 2>/dev/null; then
-        log_info "  ⊙ $package already installed, skipping"
+        log_info "  [INFO] $package already installed, skipping"
         SKIPPED_PACKAGES+=("$package")
     else
         log_info "Installing $package..."
@@ -1228,43 +1223,43 @@ for package in "${OTHER_CORE_DEPS[@]}"; do
            python -c "import $import_name" 2>/dev/null; then
             # Double-check by trying to import
             if python -c "import $import_name" 2>/dev/null; then
-                log_info "  ⊙ $package already installed, skipping"
+                log_info "  [INFO] $package already installed, skipping"
                 SKIPPED_PACKAGES+=("$package")
             else
                 # pip says it's installed but import fails
                 # This is OK - some packages don't need to be imported or have different import names
                 # Just check if pip shows it's installed
                 if echo "$INSTALL_ERROR" | grep -qiE "Requirement already satisfied.*$base_package"; then
-                    log_info "  ⊙ $package already installed, skipping"
+                    log_info "  [INFO] $package already installed, skipping"
                     SKIPPED_PACKAGES+=("$package")
                 else
                     # Can't import and pip doesn't say it's installed - might be an issue
-                    log_warn "  ⚠ $package installed but cannot be imported"
+                    log_warn "  [WARNING] $package installed but cannot be imported"
                     FAILED_PACKAGES+=("$package")
                 fi
             fi
         elif [ $INSTALL_EXIT -eq 0 ]; then
             # Installation succeeded
             if python -c "import $import_name" 2>/dev/null; then
-                log_info "  ✓ Installed $package"
+                log_info "  [OK] Installed $package"
                 INSTALLED_PACKAGES+=("$package")
             else
                 # Installation succeeded but can't import - this is OK for some packages
                 # Check if pip actually installed it successfully
                 if pip show "$base_package" >/dev/null 2>&1; then
-                    log_info "  ✓ Installed $package (import check skipped)"
+                    log_info "  [OK] Installed $package (import check skipped)"
                     INSTALLED_PACKAGES+=("$package")
                 else
-                    log_warn "  ⚠ $package installation may have failed"
+                    log_warn "  [WARNING] $package installation may have failed"
                     FAILED_PACKAGES+=("$package")
                 fi
             fi
         elif python -c "import $import_name" 2>/dev/null; then
             # Installation failed but package can be imported (might be installed from elsewhere)
-            log_info "  ⊙ $package is available (import check passed)"
+            log_info "  [INFO] $package is available (import check passed)"
             SKIPPED_PACKAGES+=("$package")
         else
-            log_warn "  ✗ Failed to install $package"
+            log_warn "  [ERROR] Failed to install $package"
             # Show error details for debugging (especially for RISC-V platform)
             if echo "$INSTALL_ERROR" | grep -qE "(No matching distribution|Could not find|not available)"; then
                 log_info "    Reason: Package may not have wheels for RISC-V architecture"
@@ -1279,6 +1274,25 @@ for package in "${OTHER_CORE_DEPS[@]}"; do
         fi
     fi
 done
+
+# Install torchao from source to resolve version mismatch with custom PyTorch
+log_info "Installing torchao from source (to match custom PyTorch version)..."
+if python -c "import torchao; print(torchao.__version__)" 2>/dev/null | grep -q "+git"; then
+    log_info "  [INFO] torchao (source build) already installed, skipping"
+    INSTALLED_PACKAGES+=("torchao")
+else
+    log_info "  Building torchao from source (tag v0.14.1)..."
+    # Use --no-build-isolation to use the installed torch
+    set +e
+    if pip install git+https://github.com/pytorch/ao.git@v0.14.1 --no-deps --no-build-isolation 2>&1; then
+        log_info "  [OK] Installed torchao from source"
+        INSTALLED_PACKAGES+=("torchao")
+    else
+        log_warn "  [ERROR] Failed to install torchao from source"
+        FAILED_PACKAGES+=("torchao")
+    fi
+    set -e
+fi
 
 # Install sglang in development mode using --no-deps (to skip GPU-specific packages)
 SGLANG_INSTALL_LOG="$WORKSPACE_DIR/sglang_install.log"
@@ -1297,11 +1311,11 @@ fi
 set -e
 
 if [ $SGLANG_INSTALL_EXIT -eq 0 ]; then
-    log_info "  ✓ Installed sglang (without dependencies)"
+    log_info "  [OK] Installed sglang (without dependencies)"
     log_info "  Note: Dependencies should be installed in previous steps or can be installed manually as needed"
     INSTALLED_PACKAGES+=("sglang")
 else
-    log_warn "  ✗ Failed to install sglang in development mode"
+    log_warn "  [ERROR] Failed to install sglang in development mode"
     if [ -f "$SGLANG_INSTALL_LOG" ]; then
         log_warn "  └─ See last 40 log lines for details:"
         tail -n 40 "$SGLANG_INSTALL_LOG"
@@ -1325,22 +1339,22 @@ if [ -f "$TRITON_STUB_SOURCE" ]; then
         # This ensures that 'import triton' works directly in subprocess
         TRITON_INIT="$TRITON_PKG_DIR/__init__.py"
         if cp "$TRITON_STUB_SOURCE" "$TRITON_INIT" 2>/dev/null; then
-            log_info "  ✓ Installed triton stub package to $TRITON_PKG_DIR"
+            log_info "  [OK] Installed triton stub package to $TRITON_PKG_DIR"
             log_info "  Note: 'import triton' will now work in subprocess (e.g., sglang.launch_server)"
 
             # Also copy triton_stub.py to site-packages for backward compatibility
             TRITON_STUB_TARGET="$SITE_PACKAGES/triton_stub.py"
             if cp "$TRITON_STUB_SOURCE" "$TRITON_STUB_TARGET" 2>/dev/null; then
-                log_info "  ✓ Also installed triton_stub.py to $TRITON_STUB_TARGET (for backward compatibility)"
+                log_info "  [OK] Also installed triton_stub.py to $TRITON_STUB_TARGET (for backward compatibility)"
             fi
         else
-            log_warn "  ✗ Failed to copy triton_stub to triton package directory"
+            log_warn "  [ERROR] Failed to copy triton_stub to triton package directory"
         fi
     else
-        log_warn "  ⚠ Could not find site-packages directory"
+        log_warn "  [WARNING] Could not find site-packages directory"
     fi
 else
-    log_warn "  ⚠ triton_stub.py not found at $TRITON_STUB_SOURCE"
+    log_warn "  [WARNING] triton_stub.py not found at $TRITON_STUB_SOURCE"
 fi
 
 # Install vllm stub as a proper package so subprocess can import it
@@ -1360,22 +1374,22 @@ if [ -f "$VLLM_STUB_SOURCE" ]; then
         # This ensures that 'import vllm' works directly in subprocess
         VLLM_INIT="$VLLM_PKG_DIR/__init__.py"
         if cp "$VLLM_STUB_SOURCE" "$VLLM_INIT" 2>/dev/null; then
-            log_info "  ✓ Installed vllm stub package to $VLLM_PKG_DIR"
+            log_info "  [OK] Installed vllm stub package to $VLLM_PKG_DIR"
             log_info "  Note: 'import vllm' will now work in subprocess (e.g., sglang.launch_server)"
 
             # Also copy vllm_stub.py to site-packages for backward compatibility
             VLLM_STUB_TARGET="$SITE_PACKAGES/vllm_stub.py"
             if cp "$VLLM_STUB_SOURCE" "$VLLM_STUB_TARGET" 2>/dev/null; then
-                log_info "  ✓ Also installed vllm_stub.py to $VLLM_STUB_TARGET (for backward compatibility)"
+                log_info "  [OK] Also installed vllm_stub.py to $VLLM_STUB_TARGET (for backward compatibility)"
             fi
         else
-            log_warn "  ✗ Failed to copy vllm_stub to vllm package directory"
+            log_warn "  [ERROR] Failed to copy vllm_stub to vllm package directory"
         fi
     else
-        log_warn "  ⚠ Could not find site-packages directory"
+        log_warn "  [WARNING] Could not find site-packages directory"
     fi
 else
-    log_warn "  ⚠ vllm_stub.py not found at $VLLM_STUB_SOURCE"
+    log_warn "  [WARNING] vllm_stub.py not found at $VLLM_STUB_SOURCE"
 fi
 
 # Display installation summary
@@ -1385,37 +1399,37 @@ echo "============================================================"
 if [ ${#INSTALLED_WHEELS[@]} -gt 0 ]; then
     log_info "Successfully installed/verified wheels (${#INSTALLED_WHEELS[@]}):"
     for wheel in "${INSTALLED_WHEELS[@]}"; do
-        echo "  ✓ $wheel"
+        echo "  [OK] $wheel"
     done
 fi
 
 if [ "$LIBOMP_INSTALLED" = true ]; then
-    log_info "OpenMP library: ✓ Installed/configured"
+    log_info "OpenMP library: [OK] Installed/configured"
 else
-    log_warn "OpenMP library: ✗ Not installed"
+    log_warn "OpenMP library: [ERROR] Not installed"
 fi
 
 if [ ${#INSTALLED_PACKAGES[@]} -gt 0 ]; then
     log_info "Successfully installed packages (${#INSTALLED_PACKAGES[@]}):"
     for pkg in "${INSTALLED_PACKAGES[@]}"; do
-        echo "  ✓ $pkg"
+        echo "  [OK] $pkg"
     done
 fi
 
 if [ ${#SKIPPED_PACKAGES[@]} -gt 0 ]; then
     log_info "Skipped (already installed) (${#SKIPPED_PACKAGES[@]}):"
     for pkg in "${SKIPPED_PACKAGES[@]}"; do
-        echo "  ⊙ $pkg"
+        echo "  [INFO] $pkg"
     done
 fi
 
 if [ ${#FAILED_WHEELS[@]} -gt 0 ] || [ ${#FAILED_PACKAGES[@]} -gt 0 ]; then
     log_warn "Failed installations:"
     for wheel in "${FAILED_WHEELS[@]}"; do
-        echo "  ✗ $wheel"
+        echo "  [ERROR] $wheel"
     done
     for pkg in "${FAILED_PACKAGES[@]}"; do
-        echo "  ✗ $pkg"
+        echo "  [ERROR] $pkg"
     done
     echo ""
     log_info "You may need to install these manually or check for compatibility issues"
@@ -1436,7 +1450,7 @@ if [ -f "$LIBOMP_SO" ]; then
         echo "export LD_PRELOAD=\"$LIBOMP_SO\${LD_PRELOAD:+:\$LD_PRELOAD}\"" >> ~/.bashrc
         echo "export LD_LIBRARY_PATH=\"$LIBOMP_DIR:\${LD_LIBRARY_PATH}\"" >> ~/.bashrc
     fi
-    log_info "✓ OpenMP library configured"
+    log_info "[OK] OpenMP library configured"
 else
     log_warn "libomp.so not found at $LIBOMP_SO"
     log_info "You may need to install OpenMP library manually"
@@ -1451,7 +1465,7 @@ VERIFY_ERRORS=0
 # Check if test file exists
 TEST_FILE="banana_pi/test_tinyllama_rvv/test_tinyllama_rvv.py"
 if [ -f "$TEST_FILE" ]; then
-    log_info "✓ Test file found: $TEST_FILE"
+    log_info "[OK] Test file found: $TEST_FILE"
 else
     log_warn "Test file not found: $TEST_FILE"
     log_warn "  └─ Pull latest changes or re-run this script with option 1 'update' or 2 're-clone'"
@@ -1461,7 +1475,7 @@ fi
 # Check if benchmark script exists (which generates config files dynamically)
 BENCHMARK_SCRIPT="banana_pi/test_tinyllama_rvv/benchmark_rvv_backends.py"
 if [ -f "$BENCHMARK_SCRIPT" ]; then
-    log_info "✓ Benchmark script found: $BENCHMARK_SCRIPT"
+    log_info "[OK] Benchmark script found: $BENCHMARK_SCRIPT"
     log_info "  (Config files are generated dynamically by the script)"
 else
     log_warn "Benchmark script not found: $BENCHMARK_SCRIPT"
@@ -1470,7 +1484,7 @@ else
 fi
 
 if [ $VERIFY_ERRORS -eq 0 ]; then
-    log_info "✓ Setup verification passed"
+    log_info "[OK] Setup verification passed"
 else
     log_warn "Setup verification completed with warnings. Please address the missing files above."
 fi
@@ -1528,7 +1542,7 @@ if [ $SCP_EXIT_CODE -ne 0 ]; then
     exit 1
 fi
 
-log_info "✓ Script transferred successfully to $REMOTE_SCRIPT_PATH"
+log_info "[OK] Script transferred successfully to $REMOTE_SCRIPT_PATH"
 
 # Make script executable
 set +e
@@ -1580,8 +1594,11 @@ fi
 
 echo ""
 log_info "Setup completed!"
-log_info "To run tests manually, SSH to Banana Pi and run:"
-echo "  cd ~/.local_riscv_env/workspace/sglang"
-echo "  source ~/.local_riscv_env/workspace/venv_sglang/bin/activate"
-echo "  python banana_pi/test_tinyllama_rvv/test_tinyllama_rvv.py"
+log_info "Next steps:"
+echo "  1. Activate environment (run this once per session):"
+echo "     cd ~/.local_riscv_env/workspace/sglang"
+echo "     source banana_pi/environment_setting.sh"
+echo ""
+echo "  2. Run the test:"
+echo "     python banana_pi/test_tinyllama_rvv/test_tinyllama_rvv.py"
 echo ""

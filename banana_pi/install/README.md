@@ -86,7 +86,7 @@ This directory contains scripts for building, deploying, and setting up the SGLa
 ./setup_banana_pi.sh --skip-wheels
 
 # Custom target
-./setup_banana_pi.sh --user jtchen --host 140.114.78.64
+./setup_banana_pi.sh --user changeuser --host changehost
 ```
 
 **Prerequisites**:

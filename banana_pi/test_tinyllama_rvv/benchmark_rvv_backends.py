@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Benchmark Script for RVV vs torch_native Backend Comparison
+End-to-End Model Benchmark Script for RVV vs torch_native Backend Comparison
 
 This script measures:
 - TTFT (Time To First Token): Prefill latency
@@ -35,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -74,6 +75,77 @@ except ImportError:
     sys.exit(1)
 
 
+# Memory Monitoring with Child Process Support
+class BenchmarkMemoryMonitor(threading.Thread):
+    def __init__(self, output_file="benchmark_memory.csv", interval=0.2):
+        super().__init__()
+        self.output_file = output_file
+        self.interval = interval
+        self.running = True
+        self.stop_event = threading.Event()
+        self.current_phase = "Init"
+        self.token_count = 0  # To track decoding progress
+        self.peak_rss_mb = 0  # Track peak globally per session or reset if needed
+
+        # Write header
+        with open(self.output_file, "w") as f:
+            f.write(
+                "timestamp,elapsed,phase,token_count,total_rss_mb,parent_rss_mb,children_rss_mb,num_processes\n"
+            )
+
+    def set_phase(self, phase, token_count=0):
+        self.current_phase = phase
+        self.token_count = token_count
+        # Log immediately on phase change
+        self.log_memory()
+
+    def update_token_count(self, count):
+        self.token_count = count
+
+    def get_total_memory(self):
+        try:
+            parent = psutil.Process()  # Current process
+            children = parent.children(recursive=True)
+
+            parent_mem = parent.memory_info().rss
+            children_mem = sum(p.memory_info().rss for p in children)
+
+            return parent_mem, children_mem, len(children) + 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return 0, 0, 0
+
+    def log_memory(self):
+        try:
+            parent_mem, children_mem, num_procs = self.get_total_memory()
+            total_mb = (parent_mem + children_mem) / (1024 * 1024)
+            parent_mb = parent_mem / (1024 * 1024)
+            child_mb = children_mem / (1024 * 1024)
+
+            self.peak_rss_mb = max(self.peak_rss_mb, total_mb)
+
+            elapsed = time.time() - self.start_time
+            timestamp = time.strftime("%H:%M:%S")
+
+            with open(self.output_file, "a") as f:
+                f.write(
+                    f"{timestamp},{elapsed:.2f},{self.current_phase},{self.token_count},{total_mb:.2f},{parent_mb:.2f},{child_mb:.2f},{num_procs}\n"
+                )
+
+            return total_mb
+        except Exception as e:
+            # Avoid crashing the benchmark just for logging
+            return 0
+
+    def run(self):
+        self.start_time = time.time()
+        while not self.stop_event.is_set():
+            self.log_memory()
+            time.sleep(self.interval)
+
+    def stop(self):
+        self.stop_event.set()
+
+
 @dataclass
 class BenchmarkResult:
     """Holds benchmark results for a single run"""
@@ -86,6 +158,7 @@ class BenchmarkResult:
     throughput_tps: float  # Tokens per second (excluding TTFT)
     decode_latency_ms: float = 0.0  # Average decode latency per token
     end_to_end_latency_ms: float = 0.0  # Total latency / tokens
+    peak_memory_mb: float = 0.0  # Peak memory usage during this run
     success: bool = True
     error_msg: Optional[str] = None
 
@@ -112,13 +185,14 @@ class BenchmarkSummary:
     min_ttft_ms: float
     max_ttft_ms: float
     std_ttft_ms: float = 0.0
-    avg_throughput_tps: float
-    min_throughput_tps: float
-    max_throughput_tps: float
+    avg_throughput_tps: float = 0.0
+    min_throughput_tps: float = 0.0
+    max_throughput_tps: float = 0.0
     std_throughput_tps: float = 0.0
-    avg_total_time_ms: float
+    avg_total_time_ms: float = 0.0
     avg_decode_latency_ms: float = 0.0
     avg_tokens_generated: float = 0.0
+    avg_peak_memory_mb: float = 0.0
     success_rate: float = 0.0
     results: List[BenchmarkResult] = field(default_factory=list)
     accuracy_result: Optional[AccuracyResult] = None
@@ -141,7 +215,7 @@ def find_sglang_processes():
 
 def shutdown_server():
     """Shutdown SGLang server"""
-    print("🛑 Shutting down existing SGLang server...")
+    print("Shutting down existing SGLang server...")
     processes = find_sglang_processes()
 
     if not processes:
@@ -164,10 +238,10 @@ def shutdown_server():
     return True
 
 
-def check_server_running(host="127.0.0.1", port=30000, timeout=10):
+def check_server_running(host="127.0.0.1", port=30000, timeout=600):
     """
     Check if SGLang server is running by trying a simple GET request.
-    Uses longer timeout (10s) since server may be under load.
+    Uses longer timeout (600s) since server may be under load.
     """
     try:
         response = requests.get(f"http://{host}:{port}/health", timeout=timeout)
@@ -179,76 +253,12 @@ def check_server_running(host="127.0.0.1", port=30000, timeout=10):
         return False
 
 
-def create_config_file(
-    backend: str,
-    config_dir: str,
-    kv_cache_dtype: str = "auto",
-    disable_radix: bool = False,
-) -> str:
-    """Create a config file for the specified backend.
-
-    This function writes a reduced-resource benchmark config (optimized to
-    lower startup memory/CPU load) to the `config_dir` and returns the path
-    to the generated YAML file.
-    """
-    # Reduced-resource settings for Banana Pi (16GB RAM)
-    model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    mem_fraction_static = 0.5
-    max_prefill = 512
-    max_total = 1024
-    chunked_prefill = 256
-    cpu_offload = 0
-    stream_interval = 1
-    enable_metrics = False
-
-    disable_radix_line = (
-        "disable-radix-cache: true" if disable_radix else "# disable-radix-cache: false"
-    )
-
-    config_content = f"""# SGLang Benchmark Configuration - {backend.upper()} Backend
-model-path: {model_path}
-device: cpu
-host: 127.0.0.1
-port: 30000
-
-tensor-parallel-size: 1
-
-# Attention Backend Configuration
-attention-backend: {backend}
-prefill-attention-backend: {backend}
-decode-attention-backend: {backend}
-
-model-impl: transformers
-dtype: float16
-kv-cache-dtype: {kv_cache_dtype}
-
-# Memory Management
-mem-fraction-static: {mem_fraction_static}
-max-running-requests: 1
-max-prefill-tokens: {max_prefill}
-max-total-tokens: {max_total}
-chunked-prefill-size: {chunked_prefill}
-cpu-offload-gb: {cpu_offload}
-{disable_radix_line}
-
-stream-interval: {stream_interval}
-num-continuous-decode-steps: 1
-
-enable-metrics: {str(enable_metrics).lower()}
-log-requests: false
-"""
-    config_path = os.path.join(config_dir, f"config_benchmark_{backend}.yaml")
-    with open(config_path, "w") as f:
-        f.write(config_content)
-    return config_path
-
-
 def launch_server(
     config_path: str, log_file: str, timeout: int = 1800, backend: Optional[str] = None
 ) -> bool:
     """Launch SGLang server with specified config"""
-    print(f"🚀 Launching server with config: {config_path}")
-    print(f"📝 Log file: {log_file}")
+    print(f"Launching server with config: {config_path}")
+    print(f"Log file: {log_file}")
 
     # Prepare environment
     env = os.environ.copy()
@@ -256,6 +266,9 @@ def launch_server(
     pythonpath = env.get("PYTHONPATH", "")
     if script_dir not in pythonpath.split(":"):
         env["PYTHONPATH"] = f"{script_dir}{':' + pythonpath if pythonpath else ''}"
+
+    # Force SGLang to recognize this as a CPU environment to avoid looking for vLLM GPU kernels
+    env["SGLANG_USE_CPU_ENGINE"] = "1"
 
     # For RVV we disable torch.compile (Inductor issues on riscv toolchains).
     # For torch_native keep defaults (may allow JIT/compile to proceed).
@@ -272,6 +285,74 @@ def launch_server(
         env["SGLANG_ENABLE_TORCH_COMPILE"] = "0"
 
     # Set OpenMP library paths for RVV (required for sgl-kernel)
+    # Respect user's LD_PRELOAD if set, otherwise try to find it
+    if "LD_PRELOAD" in env:
+        print(f"   Using existing LD_PRELOAD: {env['LD_PRELOAD']}")
+    else:
+        home_dir = os.path.expanduser("~")
+        omp_lib_path = os.path.join(home_dir, ".local", "lib", "libomp.so")
+        if os.path.exists(omp_lib_path):
+            env["LD_PRELOAD"] = omp_lib_path
+            local_lib = os.path.join(home_dir, ".local", "lib")
+            existing_ld_path = env.get("LD_LIBRARY_PATH", "")
+            if local_lib not in existing_ld_path:
+                env["LD_LIBRARY_PATH"] = (
+                    f"{local_lib}:{existing_ld_path}" if existing_ld_path else local_lib
+                )
+            print(f"   OpenMP: LD_PRELOAD={omp_lib_path} (Auto-detected)")
+        else:
+            print(
+                "Warning: libomp.so not found in ~/.local/lib and LD_PRELOAD not set. RVV kernels may hang."
+            )
+
+
+def launch_server(
+    log_file: str,
+    backend: str,
+    model_path: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    port: int = 30000,
+    host: str = "127.0.0.1",
+    timeout: int = 1800,
+    mem_fraction_static: float = 0.5,
+    max_prefill: int = 512,
+    max_total: int = 1024,
+    chunked_prefill: int = 256,
+    disable_radix: bool = False,
+    kv_cache_dtype: str = "auto",
+    quantization: Optional[str] = None,
+) -> bool:
+    """Launch SGLang server with specified parameters"""
+    print(f"Launching server for backend: {backend}")
+    print(f"Log file: {log_file}")
+
+    # Prepare environment
+    env = os.environ.copy()
+
+    # Ensure toolchain python path is included if running from source
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    python_path = os.path.join(repo_root, "python")
+    if os.path.exists(python_path) and python_path not in env.get(
+        "PYTHONPATH", ""
+    ).split(":"):
+        env["PYTHONPATH"] = f"{python_path}:{env.get('PYTHONPATH', '')}"
+
+    # Force SGLang to recognize this as a CPU environment
+    env["SGLANG_USE_CPU_ENGINE"] = "1"
+
+    # Backend-specific environment variables
+    if backend == "rvv":
+        env["TORCH_COMPILE_DISABLE"] = "1"
+        env["TORCHDYNAMO_DISABLE"] = "1"
+        env["SGLANG_ENABLE_TORCH_COMPILE"] = "0"
+    elif backend == "torch_native":
+        env["SGLANG_DISABLE_RVV_GEMM"] = "1"
+        env["TORCH_COMPILE_DISABLE"] = "1"
+        env["TORCHDYNAMO_DISABLE"] = "1"
+        env["SGLANG_ENABLE_TORCH_COMPILE"] = "0"
+
+    # Set OpenMP library paths for RVV (required for sgl-kernel)
     home_dir = os.path.expanduser("~")
     omp_lib_path = os.path.join(home_dir, ".local", "lib", "libomp.so")
     if os.path.exists(omp_lib_path):
@@ -282,105 +363,70 @@ def launch_server(
             env["LD_LIBRARY_PATH"] = (
                 f"{local_lib}:{existing_ld_path}" if existing_ld_path else local_lib
             )
-        print(f"   OpenMP: LD_PRELOAD={omp_lib_path}")
+        print(f"   OpenMP: LD_PRELOAD={omp_lib_path} (Auto-detected)")
 
     # Set CPU threads binding if not set
     if not env.get("SGLANG_CPU_OMP_THREADS_BIND"):
         env["SGLANG_CPU_OMP_THREADS_BIND"] = "all"
 
-    # Build wrapper script that loads stubs and launches server properly
-    wrapper_script = os.path.join(script_dir, "_benchmark_launcher.py")
-    with open(wrapper_script, "w") as f:
-        f.write(
-            f"""#!/usr/bin/env python3
-import sys
-import os
-import importlib
-import traceback
+    # Use the shared launch_server_rvv.py script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    launcher_script = os.path.join(script_dir, "launch_server_rvv.py")
+    if not os.path.exists(launcher_script):
+        print(f"Error: Launcher script not found at {launcher_script}")
+        return False
 
-# Add stubs to path
-script_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, script_dir)
+    # Construct server arguments
+    server_cmd = [
+        sys.executable,
+        launcher_script,
+        "--model-path",
+        model_path,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--attention-backend",
+        backend,
+        "--mem-fraction-static",
+        str(mem_fraction_static),
+        "--max-prefill-tokens",
+        str(max_prefill),
+        "--max-total-tokens",
+        str(max_total),
+        "--chunked-prefill-size",
+        str(chunked_prefill),
+        "--cpu-offload-gb",
+        "0",
+        "--stream-interval",
+        "1",
+        "--dtype",
+        "bfloat16" if kv_cache_dtype == "bfloat16" else "float16",
+        "--kv-cache-dtype",
+        kv_cache_dtype if kv_cache_dtype != "fp16" else "auto",
+        "--tp",
+        "1",  # tensor-parallel-size
+    ]
 
-# Step 1: Load vllm_stub FIRST
-vllm_stub_loaded = False
-try:
-    import vllm_stub
-    print("✓ vllm_stub loaded")
-    vllm_stub_loaded = True
-except ImportError:
-    vllm_stub_path = os.path.join(script_dir, "vllm_stub.py")
-    if os.path.exists(vllm_stub_path):
-        try:
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("vllm_stub", vllm_stub_path)
-            vllm_stub = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(vllm_stub)
-            print("✓ vllm_stub loaded from script directory")
-            vllm_stub_loaded = True
-        except Exception as e:
-            print(f"⚠ Failed to load vllm_stub: {{e}}")
+    if disable_radix:
+        server_cmd.append("--disable-radix-cache")
 
-# Step 2: Load triton_stub
-try:
-    import triton_stub
-    print("✓ triton_stub loaded")
-except ImportError:
-    triton_stub_path = os.path.join(script_dir, "triton_stub.py")
-    if os.path.exists(triton_stub_path):
-        try:
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("triton_stub", triton_stub_path)
-            triton_stub = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(triton_stub)
-            print("✓ triton_stub loaded from script directory")
-        except Exception as e:
-            print(f"⚠ Failed to load triton_stub: {{e}}")
+    if quantization:
+        server_cmd.extend(["--quantization", quantization])
 
-# Step 3: Force import and registration of rvv backend
-try:
-    from sglang.srt.layers.attention import rvv_backend
-    print("✓ rvv_backend module imported")
-    from sglang.srt.layers.attention import attention_registry
-    importlib.reload(attention_registry)
-    if "rvv" in attention_registry.ATTENTION_BACKENDS:
-        print("✓ rvv backend is registered")
-    else:
-        print("⚠ rvv backend NOT registered!")
-        print(f"Available: {{list(attention_registry.ATTENTION_BACKENDS.keys())}}")
-except Exception as e:
-    print(f"⚠ Error registering rvv backend: {{e}}")
-    traceback.print_exc()
-
-# Step 4: Launch server using sglang.launch_server module
-import subprocess
-config_file = r"{config_path}"
-print("=" * 60)
-print("Launching SGLang server...")
-print("=" * 60)
-try:
-    result = subprocess.run(
-        [sys.executable, "-m", "sglang.launch_server", "--config", config_file],
-        check=False
-    )
-    sys.exit(result.returncode)
-except Exception as e:
-    print(f"\\n❌ Exception when launching server: {{e}}")
-    traceback.print_exc()
-    sys.exit(1)
-"""
-        )
-    os.chmod(wrapper_script, 0o755)
+    if env.get("SGLANG_CPU_OMP_THREADS_BIND") == "all":
+        # SGLang might need explicit bind args if not env var driven alone
+        pass
 
     # Start server
     with open(log_file, "w") as log_f:
         log_f.write(f"Starting server at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        log_f.write(f"Config: {config_path}\n")
+        log_f.write(f"Cmd: {' '.join(server_cmd)}\n")
         log_f.write("=" * 60 + "\n\n")
         log_f.flush()
 
         process = subprocess.Popen(
-            [sys.executable, wrapper_script],
+            server_cmd,
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
@@ -416,8 +462,8 @@ except Exception as e:
     while time.time() - start_time < timeout:
         # If process exited early, show logs and fail fast
         if process.poll() is not None:
-            print(f"❌ Server process exited with code: {process.returncode}")
-            print("--- Last log snippet ---")
+            print(f"Server process exited with code: {process.returncode}")
+            print("Last log snippet:")
             print(tail_log(log_file, tail_lines))
             return False
 
@@ -427,14 +473,12 @@ except Exception as e:
             # Try a simple request with generous timeout to verify server is responding
             response = requests.get(
                 f"http://127.0.0.1:30000/health",
-                timeout=15,  # Generous timeout for slow CPU
+                timeout=200,  # Generous timeout for slow CPU
             )
             if response.status_code == 200:
-                print(f"✅ Server started in {elapsed:.1f}s")
+                print(f"Server started in {elapsed:.1f}s")
                 return True
         except requests.exceptions.Timeout:
-            # Timeout on health check might mean server is running but slow
-            # Try to send an actual request to verify (this proves server is live)
             try:
                 resp = requests.post(
                     "http://127.0.0.1:30000/v1/chat/completions",
@@ -443,12 +487,11 @@ except Exception as e:
                         "messages": [{"role": "user", "content": "test"}],
                         "max_tokens": 1,
                     },
-                    timeout=15,
+                    timeout=200,
                 )
-                # If we got any response (even an error), server is up
                 if resp.status_code in [200, 400, 422, 500]:
                     print(
-                        f"✅ Server started in {elapsed:.1f}s (verified via chat endpoint)"
+                        f"Server started in {elapsed:.1f}s (verified via chat endpoint)"
                     )
                     return True
             except:
@@ -456,7 +499,6 @@ except Exception as e:
         except:
             pass
 
-        # Periodically show tail of log to help debugging long startups
         if time.time() - last_tail >= tail_interval:
             last_tail = time.time()
             print(
@@ -468,8 +510,8 @@ except Exception as e:
 
         time.sleep(5)
 
-    print(f"❌ Server startup timeout ({timeout}s)")
-    print("--- Final log snippet ---")
+    print(f"Server startup timeout ({timeout}s)")
+    print("Final log snippet:")
     print(tail_log(log_file, tail_lines))
     return False
 
@@ -481,6 +523,8 @@ def run_single_benchmark(
     host: str = "127.0.0.1",
     port: int = 30000,
     timeout: int = 1800,
+    mem_monitor: Optional[BenchmarkMemoryMonitor] = None,
+    phase_prefix: str = "",
 ) -> BenchmarkResult:
     """Run a single benchmark request and measure timing"""
 
@@ -496,6 +540,12 @@ def run_single_benchmark(
         "temperature": 0.1,
         "stream": True,  # Use streaming to measure TTFT
     }
+
+    if mem_monitor:
+        mem_monitor.set_phase(f"{phase_prefix}Prefill", 0)
+        start_peak = (
+            mem_monitor.peak_rss_mb
+        )  # Capture peak before request starts if needed, but usually we care about peak during request
 
     try:
         start_time = time.perf_counter()
@@ -534,8 +584,17 @@ def run_single_benchmark(
                             if content:
                                 if ttft is None:
                                     ttft = (time.perf_counter() - start_time) * 1000
+                                    # First token received: Prefill done, Decode starts
+                                    if mem_monitor:
+                                        mem_monitor.set_phase(
+                                            f"{phase_prefix}Decode", 1
+                                        )
+
                                 # Count tokens (approximate by splitting)
                                 tokens_generated += 1
+                                if mem_monitor:
+                                    mem_monitor.update_token_count(tokens_generated)
+
                     except json.JSONDecodeError:
                         pass
 
@@ -556,6 +615,8 @@ def run_single_benchmark(
         # End-to-end latency per token
         e2e_latency = total_time / tokens_generated if tokens_generated > 0 else 0
 
+        peak_mem = mem_monitor.peak_rss_mb if mem_monitor else 0.0
+
         return BenchmarkResult(
             backend=backend,
             prompt=prompt,
@@ -565,6 +626,7 @@ def run_single_benchmark(
             throughput_tps=throughput,
             decode_latency_ms=decode_latency,
             end_to_end_latency_ms=e2e_latency,
+            peak_memory_mb=peak_mem,
             success=True,
         )
 
@@ -603,7 +665,7 @@ def run_accuracy_test(
     Run Perplexity (PPL) test using a sliding window approach with a known text.
     Uses wikitext-2 like approach with a single long prompt.
     """
-    print(f"\n🧪 Running Accuracy Test (PPL) for {backend} ({kv_cache_dtype})...")
+    print(f"\nRunning Accuracy Test (PPL) for {backend} ({kv_cache_dtype})...")
 
     # Use a longer text for PPL calculation
     # Taken from Wikitext-2 validation set (first few lines)
@@ -698,35 +760,44 @@ def run_benchmark_suite(
     max_tokens: int = 50,
     test_accuracy: bool = False,
     kv_cache_dtype: str = "auto",
+    mem_monitor: Optional[BenchmarkMemoryMonitor] = None,
 ) -> BenchmarkSummary:
     """Run a complete benchmark suite for a backend"""
 
     print(f"\n{'='*60}")
-    print(f"📊 Benchmarking {backend.upper()} Backend")
+    print(f"Benchmarking {backend.upper()} Backend")
     print(f"{'='*60}")
 
     # Run Accuracy Test first if requested
     accuracy_res = None
     if test_accuracy:
+        if mem_monitor:
+            mem_monitor.set_phase(f"Testing_{backend}_Accuracy")
         accuracy_res = run_accuracy_test(backend, kv_cache_dtype)
         if not accuracy_res.success:
-            print(f"⚠️ Accuracy test failed: {accuracy_res.error_msg}")
+            print(f"Accuracy test failed: {accuracy_res.error_msg}")
 
     results = []
 
     # Warmup runs
     if warmup_runs > 0:
-        print(f"\n🔥 Warmup ({warmup_runs} runs)...")
+        print(f"\nWarmup ({warmup_runs} runs)...")
+        if mem_monitor:
+            mem_monitor.set_phase(f"Testing_{backend}_Warmup")
         for i in range(warmup_runs):
             warmup_prompt = "Hello"
-            result = run_single_benchmark(warmup_prompt, backend, max_tokens=10)
+            result = run_single_benchmark(
+                warmup_prompt,
+                backend,
+                max_tokens=10,
+                mem_monitor=mem_monitor,
+                phase_prefix=f"Warmup_{i}_",
+            )
             status = "✓" if result.success else "✗"
             print(f"   Warmup {i+1}: {status} (tokens={result.tokens_generated})")
 
     # Actual benchmark runs
-    print(
-        f"\n📈 Benchmark runs ({num_runs} runs per prompt, max_tokens={max_tokens})..."
-    )
+    print(f"\nBenchmark runs ({num_runs} runs per prompt, max_tokens={max_tokens})...")
     for prompt_idx, prompt in enumerate(prompts):
         print(
             f'\n   Prompt {prompt_idx + 1}: "{prompt[:50]}..."'
@@ -735,7 +806,13 @@ def run_benchmark_suite(
         )
 
         for run_idx in range(num_runs):
-            result = run_single_benchmark(prompt, backend, max_tokens=max_tokens)
+            result = run_single_benchmark(
+                prompt,
+                backend,
+                max_tokens=max_tokens,
+                mem_monitor=mem_monitor,
+                phase_prefix=f"Prompt{prompt_idx+1}_Run{run_idx}_",
+            )
             results.append(result)
 
             if result.success:
@@ -779,6 +856,7 @@ def run_benchmark_suite(
         r.decode_latency_ms for r in stats_results if r.decode_latency_ms > 0
     ]
     tokens_list = [r.tokens_generated for r in stats_results]
+    peak_mems = [r.peak_memory_mb for r in stats_results]
 
     # Calculate statistics with numpy if available
     if HAS_NUMPY:
@@ -793,6 +871,9 @@ def run_benchmark_suite(
         avg_total_time = np.mean(total_times) if total_times else 0
         avg_decode_latency = np.mean(decode_latencies) if decode_latencies else 0
         avg_tokens = np.mean(tokens_list) if tokens_list else 0
+        avg_peak_mem = (
+            np.max(peak_mems) if peak_mems else 0
+        )  # Use Max of peaks as the conservative metric
     else:
         # Fallback to basic statistics
         avg_ttft = sum(ttfts) / len(ttfts) if ttfts else 0
@@ -808,6 +889,7 @@ def run_benchmark_suite(
             sum(decode_latencies) / len(decode_latencies) if decode_latencies else 0
         )
         avg_tokens = sum(tokens_list) / len(tokens_list) if tokens_list else 0
+        avg_peak_mem = max(peak_mems) if peak_mems else 0
 
     return BenchmarkSummary(
         backend=backend,
@@ -823,6 +905,7 @@ def run_benchmark_suite(
         avg_total_time_ms=avg_total_time,
         avg_decode_latency_ms=avg_decode_latency,
         avg_tokens_generated=avg_tokens,
+        avg_peak_memory_mb=avg_peak_mem,
         success_rate=len(successful_results) / len(results) * 100,
         results=results,
         accuracy_result=accuracy_res,
@@ -833,7 +916,7 @@ def print_summary_table(summaries: List[BenchmarkSummary]):
     """Print a comparison table of benchmark results"""
 
     print("\n" + "=" * 100)
-    print("📊 BENCHMARK RESULTS SUMMARY")
+    print("BENCHMARK RESULTS SUMMARY")
     print("=" * 100)
 
     # Accuracy / PPL Table
@@ -859,9 +942,9 @@ def print_summary_table(summaries: List[BenchmarkSummary]):
 
     # Header - more metrics
     print(
-        f"\n{'Backend':<15} {'Avg TTFT':<12} {'Avg Decode':<14} {'Avg TPS':<12} {'Avg Tokens':<12} {'Success':<10}"
+        f"\n{'Backend':<15} {'Avg TTFT':<12} {'Avg Decode':<14} {'Avg TPS':<12} {'Avg Tokens':<12} {'Avg Peak Mem':<14} {'Success':<10}"
     )
-    print("-" * 100)
+    print("-" * 115)
 
     for summary in summaries:
         print(
@@ -870,10 +953,11 @@ def print_summary_table(summaries: List[BenchmarkSummary]):
             f"{summary.avg_decode_latency_ms:>10.1f} ms/t "
             f"{summary.avg_throughput_tps:>8.2f} t/s "
             f"{summary.avg_tokens_generated:>8.1f}     "
+            f"{summary.avg_peak_memory_mb:>10.2f} MB "
             f"{summary.success_rate:>8.1f}%"
         )
 
-    print("-" * 100)
+    print("-" * 115)
 
     # Detailed table
     print(
@@ -899,7 +983,7 @@ def print_summary_table(summaries: List[BenchmarkSummary]):
 
         # Only compare if both are successful enough
         if s1.success_rate > 0 and s2.success_rate > 0:
-            print("\n📈 COMPARISON (RISC-V vs torch_native):")
+            print("\nCOMPARISON (RISC-V vs torch_native):")
 
             # Determine which is which
             if s1.backend == "rvv":
@@ -994,7 +1078,7 @@ def save_results_json(summaries: List[BenchmarkSummary], output_file: str):
             indent=2,
         )
 
-    print(f"\n📄 Results saved to: {output_file}")
+    print(f"Results saved to: {output_file}")
 
 
 def main():
@@ -1048,79 +1132,116 @@ Examples:
         help="KV cache dtype (auto, float16, int8)",
     )
     parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        help="Model quantization method (e.g., w8a8_int8, fp8)",
+    )
+    parser.add_argument(
         "--test-accuracy",
         action="store_true",
         help="Run accuracy (perplexity) test in addition to latency benchmarks",
     )
+    parser.add_argument(
+        "--memory-log",
+        default="benchmark_ram_usage.csv",
+        help="CSV file to log memory usage",
+    )
+
+    # Internal arguments for server dispatch
+    parser.add_argument("--exec-server", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--config", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
-    # Test prompts of varying complexity
-    prompts = [
-        "What is 2+2?",
-        "Explain what a CPU does in one sentence.",
-        "Write a short poem about computers.",
-    ]
+    # Dispatch to server mode if requested
+    if args.exec_server:
+        if not args.config:
+            print("Error: --config required for --exec-server")
+            sys.exit(1)
+        run_server_process(args.config)
+        return
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Start Memory Monitor
+    print(f"Starting memory monitor (log: {args.memory_log})...")
+    mem_monitor = BenchmarkMemoryMonitor(output_file=args.memory_log, interval=0.1)
+    mem_monitor.start()
 
-    backends_to_test = []
-    if args.backend == "both":
-        backends_to_test = ["rvv", "torch_native"]
-    else:
-        backends_to_test = [args.backend]
+    try:
+        mem_monitor.set_phase("Startup")
+        # Test prompts of varying complexity
+        prompts = [
+            "What is 2+2?",
+            "Explain what a CPU does in one sentence.",
+            "Write a short poem about computers.",
+        ]
 
-    summaries = []
+        script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    print("🚀 SGLang Backend Benchmark")
-    print("=" * 60)
-    print(f"   Backends: {', '.join(backends_to_test)}")
-    print(f"   Warmup runs: {args.warmup}")
-    print(f"   Measurement runs: {args.num_runs}")
-    print(f"   Max tokens: {args.max_tokens}")
-    print(f"   Prompts: {len(prompts)}")
-    print(f"   KV Cache: {args.kv_cache_dtype}")
-    print(f"   Test Accuracy: {args.test_accuracy}")
-    print("=" * 60)
+        backends_to_test = []
+        if args.backend == "both":
+            backends_to_test = ["rvv", "torch_native"]
+        else:
+            backends_to_test = [args.backend]
 
-    for backend in backends_to_test:
-        print(f"\n\n{'#'*60}")
-        print(f"# Testing {backend.upper()} Backend")
-        print(f"{'#'*60}")
+        summaries = []
 
-        shutdown_server()
-        time.sleep(3)
+        print("SGLang Backend Benchmark")
+        print("=" * 60)
+        print(f"Backends: {', '.join(backends_to_test)}")
+        print(f"Warmup runs: {args.warmup}")
+        print(f"Measurement runs: {args.num_runs}")
+        print(f"Max tokens: {args.max_tokens}")
+        print(f"Prompts: {len(prompts)}")
+        print(f"KV Cache: {args.kv_cache_dtype}")
+        print(f"Quantization: {args.quantization}")
+        print(f"Test Accuracy: {args.test_accuracy}")
+        print("=" * 60)
 
-        # Create config and launch server
-        config_path = create_config_file(
-            backend, script_dir, kv_cache_dtype=args.kv_cache_dtype
-        )
-        log_file = os.path.join(script_dir, f"benchmark_{backend}.log")
+        for backend in backends_to_test:
+            mem_monitor.set_phase(f"Testing_{backend}")
+            print(f"\n\n{'#'*60}")
+            print(f"# Testing {backend.upper()} Backend")
+            print(f"{'#'*60}")
 
-        if not launch_server(
-            config_path, log_file, timeout=args.timeout, backend=backend
-        ):
-            print(f"❌ Failed to start server for {backend} backend")
-            continue
+            shutdown_server()
+            time.sleep(3)
 
-        # Give server a moment to stabilize
-        time.sleep(5)
+            log_file = os.path.join(script_dir, f"benchmark_{backend}.log")
 
-        # Run benchmarks
-        summary = run_benchmark_suite(
-            backend=backend,
-            prompts=prompts,
-            warmup_runs=args.warmup,
-            num_runs=args.num_runs,
-            max_tokens=args.max_tokens,
-            test_accuracy=args.test_accuracy,
-            kv_cache_dtype=args.kv_cache_dtype,
-        )
-        summaries.append(summary)
+            if not launch_server(
+                log_file=log_file,
+                backend=backend,
+                timeout=args.timeout,
+                kv_cache_dtype=args.kv_cache_dtype,
+                quantization=args.quantization,
+            ):
+                print(f"Failed to start server for {backend} backend")
+                continue
 
-        # Shutdown after run
-        shutdown_server()
-        time.sleep(2)
+            # Give server a moment to stabilize
+            time.sleep(5)
+
+            # Run benchmarks
+            summary = run_benchmark_suite(
+                backend=backend,
+                prompts=prompts,
+                warmup_runs=args.warmup,
+                num_runs=args.num_runs,
+                max_tokens=args.max_tokens,
+                test_accuracy=args.test_accuracy,
+                kv_cache_dtype=args.kv_cache_dtype,
+                mem_monitor=mem_monitor,
+            )
+            summaries.append(summary)
+
+            # Shutdown after run
+            shutdown_server()
+            time.sleep(2)
+
+    finally:
+        mem_monitor.stop()
+        mem_monitor.join()
 
     # Print comparison
     if summaries:
@@ -1129,9 +1250,9 @@ Examples:
         if args.output:
             save_results_json(summaries, args.output)
     else:
-        print("\n❌ No successful benchmarks completed")
+        print("\nNo successful benchmarks completed")
 
-    print("\n✅ Benchmark complete!")
+    print("\nBenchmark complete!")
 
 
 if __name__ == "__main__":

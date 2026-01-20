@@ -1,65 +1,7 @@
 # Tests Directory
 
-This directory contains test scripts for validating and benchmarking the RVV backend implementation for SGLang.
-
+This directory contains test scripts for testing vlen and memory profiling.
 ## Test Files
-
-### `test_end_to_end_int8.py`
-**Purpose**: End-to-end validation of INT8 KV cache implementation
-
-**What it tests**:
-- Prefill (Extend) phase with INT8 KV cache
-- Decode phase with INT8 KV cache
-- Accuracy comparison between FP16 and INT8 (cosine similarity, MSE, max error)
-- Performance metrics (TTFT, ITL, TPOT, throughput)
-
-**Usage**:
-```bash
-python test_end_to_end_int8.py
-python test_end_to_end_int8.py --num-requests 4 --seq-len 256
-```
-
----
-
-### `test_model_accuracy_int8.py`
-**Purpose**: Model-level accuracy validation for INT8 quantization (Perplexity Simulation)
-
-**What it tests**:
-- Simulated model perplexity and token prediction accuracy
-- Quantization impact on model quality at the model level
-
-**Note**: This test focuses on model-level metrics (perplexity simulation).
-      For kernel-level accuracy testing (decode attention accuracy), use `test_parametrized_int8.py` instead.
-
-**Usage**:
-```bash
-python test_model_accuracy_int8.py
-python test_model_accuracy_int8.py --vocab-size 32000 --num-sequences 10
-```
-
----
-
-### `test_parametrized_int8.py`
-**Purpose**: Parameterized testing for decode attention accuracy across multiple configurations
-
-**What it tests**:
-- Decode attention accuracy (FP16 vs INT8) across various configurations:
-  - Sequence lengths: 32, 64, 128, 256, 512, 1024
-  - Batch sizes: 1, 2, 4, 8
-  - Head dimensions: 32, 64, 128
-  - Number of heads: 8, 16, 32
-- Output comparison metrics: cosine similarity, MSE, max error
-
-**Note**: This is the primary test for kernel-level accuracy validation.
-      Use this instead of `test_model_accuracy_int8.py` for attention kernel accuracy testing.
-
-**Usage**:
-```bash
-python test_parametrized_int8.py
-python test_parametrized_int8.py --quick  # Fewer configurations
-```
-
----
 
 ### `test_memory_bandwidth.py`
 **Purpose**: Memory bandwidth analysis for INT8 vs FP16 KV cache
@@ -75,22 +17,6 @@ python test_parametrized_int8.py --quick  # Fewer configurations
 python test_memory_bandwidth.py
 python test_memory_bandwidth.py --seq-len 2048 --batch-size 8
 ```
-
----
-
-### `profile_paged_attention.py`
-**Purpose**: Performance profiling for paged attention with INT8 KV cache
-
-**What it tests**:
-- Paged attention performance (simulated paged KV cache)
-- FP16 vs INT8 throughput comparison
-- Memory access patterns and efficiency
-
-**Usage**:
-```bash
-python profile_paged_attention.py
-```
-
 ---
 
 ### `test_vlen_alignment.py`
@@ -119,80 +45,17 @@ python test_vlen_alignment.py
 
 **Usage**: Imported by other test scripts
 
----
-
-## Running Tests
-
-### Test Scripts Overview
-
-This directory contains the **end-to-end test runner** (`run_tests.sh`).
-
-**For kernel-level unit tests and benchmarks**, see `banana_pi/tests_rvv_kernels/` directory.
-
-**Difference**:
-- **`run_tests.sh`** (this directory): Application-level end-to-end validation
-  - Tests: `test_end_to_end_int8.py`, `test_model_accuracy_int8.py`, etc.
-  - Purpose: Validate INT8 KV cache implementation, model accuracy, memory bandwidth
-  - Location: Runs in `banana_pi/tests/` directory
-
-- **`tests_benchs_rvv_kernels.sh`** (`tests_rvv_kernels/` directory): Kernel-level unit tests and benchmarks
-  - Tests: `sgl-kernel/tests/test_rvv_*.py` (pytest)
-  - Benchmarks: `sgl-kernel/benchmark/bench_rvv_*.py`
-  - Purpose: Validate kernel correctness and measure performance
-  - Location: Runs in `sgl-kernel/` directory
-
-### Using the End-to-End Test Runner (`run_tests.sh`)
-
-The `run_tests.sh` script provides a convenient way to run all or specific end-to-end tests:
-
-```bash
-# Show help
-./run_tests.sh --help
-
-# List all available tests
-./run_tests.sh --list
-
-# Run all tests
-./run_tests.sh
-
-# Run specific test
-./run_tests.sh --end-to-end
-./run_tests.sh --model-accuracy
-./run_tests.sh --parametrized
-
-# Run multiple tests
-./run_tests.sh --end-to-end --model-accuracy
-
-# Run with custom arguments
-./run_tests.sh --end-to-end -- --num-requests 4 --seq-len 256
-
-# Run in quick mode (fewer iterations)
-./run_tests.sh --quick
-```
-
-**Note**: The script automatically sets up:
-- `LD_PRELOAD=~/.local/lib/libomp.so`
-- `LD_LIBRARY_PATH=~/.local/lib`
-- Virtual environment activation
-
 ### Running Tests Manually
 
 To run tests individually:
 
 ```bash
-# Basic tests
-python test_end_to_end_int8.py
-python test_model_accuracy_int8.py
-python test_parametrized_int8.py --quick
-
 # Performance analysis
 python test_memory_bandwidth.py
-python profile_paged_attention.py
 
 # System validation
 python test_vlen_alignment.py
 ```
-
 ---
 
 ### Kernel-Level Tests
@@ -201,53 +64,3 @@ For kernel-level unit tests and benchmarks, see the `tests_rvv_kernels/` directo
 - Location: `banana_pi/tests_rvv_kernels/`
 - Script: `tests_benchs_rvv_kernels.sh`
 - Documentation: `banana_pi/tests_rvv_kernels/README.md`
-
----
-
-## Dependencies
-
-All tests require:
-- `torch` (PyTorch)
-- `sgl_kernel` (compiled SGLang kernel with RVV support)
-- `numpy` (optional, for better statistics)
-- `test_utils` (local module)
-
-Some tests may require:
-- `psutil` (for system state checking)
-- `requests` (for HTTP-based benchmarks)
-
----
-
-## Notes
-
-- **All tests require `test_utils.py`** - No fallback logic is provided. If `test_utils` is not available, tests will fail immediately.
-- All tests use `test_utils.py` for consistent statistical analysis and fair comparisons
-- Tests are designed to be run on RISC-V hardware (Banana Pi K1)
-- INT8 tests ensure symmetric quantization (signed int8, no +128 offset) for KV cache
-- Performance tests include warmup iterations and statistical analysis for reliable results
-
-## Test Organization and Differences
-
-### Kernel-Level vs Model-Level Accuracy Tests
-
-- **`test_parametrized_int8.py`**: Kernel-level accuracy testing
-  - Tests decode attention kernel accuracy across multiple configurations
-  - Compares FP16 vs INT8 outputs directly from the kernel
-  - Primary test for validating INT8 quantization correctness
-
-- **`test_model_accuracy_int8.py`**: Model-level accuracy testing
-  - Tests model-level metrics (perplexity, token prediction accuracy)
-  - Simulates quantization impact on model quality
-  - Focuses on end-to-end model behavior, not kernel-level accuracy
-
-### End-to-End vs Component Tests
-
-- **`test_end_to_end_int8.py`**: Complete workflow testing
-  - Tests both prefill (extend) and decode phases
-  - Validates accuracy and performance for the full pipeline
-  - Only test that covers prefill/extend phase
-
-- **`test_parametrized_int8.py`**: Component-level testing
-  - Tests only decode attention (not prefill)
-  - More comprehensive configuration coverage
-  - Faster execution for quick validation

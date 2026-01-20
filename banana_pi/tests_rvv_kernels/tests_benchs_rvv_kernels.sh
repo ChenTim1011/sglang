@@ -154,19 +154,17 @@ echo -e "${BLUE}============================================================${NC
 echo ""
 
 # Source environment
-if [[ -f ~/.local_riscv_env/env.sh ]]; then
-    source ~/.local_riscv_env/env.sh
+script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+if [[ -f "${script_dir}/../environment_setting.sh" ]]; then
+    source "${script_dir}/../environment_setting.sh"
 else
-    echo -e "${RED}ERROR: ~/.local_riscv_env/env.sh not found${NC}"
+    echo -e "${RED}ERROR: ../environment_setting.sh not found${NC}"
     exit 1
 fi
 
-# Activate virtual environment
-if [[ -f ~/.local_riscv_env/workspace/venv_sglang/bin/activate ]]; then
-    source ~/.local_riscv_env/workspace/venv_sglang/bin/activate
-else
-    echo -e "${RED}ERROR: Virtual environment not found${NC}"
-    exit 1
+# Ensure critical variables are set if not handled by environment_setting.sh
+if [[ -z "$LD_LIBRARY_PATH" ]] || [[ "$LD_LIBRARY_PATH" != *".local/lib"* ]]; then
+    export LD_LIBRARY_PATH=~/.local/lib:$LD_LIBRARY_PATH
 fi
 
 # Set library paths
@@ -248,7 +246,7 @@ if [[ "$RUN_TESTS" == "true" ]]; then
 
     # Run Backend Integration Tests (Python Layer)
     if [[ "$RUN_BACKEND" == "true" ]]; then
-        run_test "RVV Backend Integration" "../test/srt/test_rvv_backend.py" || true
+        run_test "RVV Backend Integration" "../test/srt/cpu/rvv/test_rvv_attention_backend.py" || true
     fi
 
     echo ""
