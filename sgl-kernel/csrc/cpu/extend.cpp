@@ -421,7 +421,6 @@ void extend_attention_kernel_impl(
 // extend_seq_lens: [num_seqs]
 // extend_start_loc: [num_seqs]
 //
-#ifndef CPU_CAPABILITY_RVV
 void extend_attention_cpu(
     at::Tensor& q_extend,
     at::Tensor& k_extend,
@@ -567,4 +566,3 @@ void extend_attention_cpu(
     });
   });
 }
-#endif  // #ifndef CPU_CAPABILITY_RVV

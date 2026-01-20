@@ -1,5 +1,9 @@
-// Polynomial approximation for exp(x) = 2^(x*log2(e))
-// Reference: veclibm (https://github.com/rivosinc/veclibm)
+/*
+ * 1. Element-wise Math: transcendentals (exp, tanh, etc.).
+ * 2. Reductions: Sum, Max, etc. across vector elements.
+ * 3. Matrix/Vector Arithmetic: Dot products, Wide Multiply-Accumulate (MAC).
+ * 4. Activation Functions: Softmax helpers etc.
+ */
 
 #ifndef SGL_KERNEL_RVV_VECTOR_MATH_H_
 #define SGL_KERNEL_RVV_VECTOR_MATH_H_
@@ -8,10 +12,14 @@
 
 #include <riscv_vector.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
 namespace {
+
+// Polynomial approximation for exp(x) = 2^(x*log2(e))
+// Reference: veclibm (https://github.com/rivosinc/veclibm)
 
 constexpr float RVV_EXP_C0 = 1.0f;
 constexpr float RVV_EXP_C1 = 0.69314718056f;
@@ -22,6 +30,11 @@ constexpr float RVV_EXP_C5 = 0.00133335581f;
 constexpr float RVV_LOG2_E = 1.44269504089f;
 
 inline vfloat32m4_t vfexp_f32m4(vfloat32m4_t vx, size_t vl) {
+  // Clamp input to avoid denormalized numbers
+  // exp(-87.0) approx 1.6e-38, which is above FLT_MIN (1.17e-38)
+  vx = __riscv_vfmax_vf_f32m4(vx, -87.0f, vl);
+  vx = __riscv_vfmin_vf_f32m4(vx, 88.0f, vl);
+
   vfloat32m4_t v_log2e = __riscv_vfmv_v_f_f32m4(RVV_LOG2_E, vl);
   vfloat32m4_t vz = __riscv_vfmul_vv_f32m4(vx, v_log2e, vl);
   vint32m4_t vn_int = __riscv_vfcvt_x_f_v_i32m4(vz, vl);
@@ -49,6 +62,9 @@ inline vfloat32m4_t vfexp_f32m4(vfloat32m4_t vx, size_t vl) {
 }
 
 inline vfloat32m8_t vfexp_f32m8(vfloat32m8_t vx, size_t vl) {
+  vx = __riscv_vfmax_vf_f32m8(vx, -87.0f, vl);
+  vx = __riscv_vfmin_vf_f32m8(vx, 88.0f, vl);
+
   vfloat32m8_t v_log2e = __riscv_vfmv_v_f_f32m8(RVV_LOG2_E, vl);
   vfloat32m8_t vz = __riscv_vfmul_vv_f32m8(vx, v_log2e, vl);
   vint32m8_t vn_int = __riscv_vfcvt_x_f_v_i32m8(vz, vl);
@@ -122,6 +138,100 @@ inline float exp_and_sum_rvv(float* __restrict__ scores, int n_size, float m_i) 
     total_sum += __riscv_vfmv_f_s_f32m1_f32(v_partial);
   }
   return std::isfinite(total_sum) ? total_sum : 0.0f;
+}
+
+// =============================================================================
+// Math & Reduction Helpers
+// =============================================================================
+
+inline float rvv_reduce_sum_f32(const float* data, int64_t len) {
+  size_t vl = __riscv_vsetvl_e32m8(len);
+  if (vl == static_cast<size_t>(len)) {
+    vfloat32m8_t vdata = __riscv_vle32_v_f32m8(data, vl);
+    vfloat32m1_t vzero = __riscv_vfmv_v_f_f32m1(0.0f, __riscv_vsetvlmax_e32m1());
+    vfloat32m1_t vsum = __riscv_vfredusum_vs_f32m8_f32m1(vdata, vzero, vl);
+    return __riscv_vfmv_f_s_f32m1_f32(vsum);
+  }
+  float sum = 0.f;
+  for (int64_t i = 0; i < len; ++i)
+    sum += data[i];
+  return sum;
+}
+
+inline float rvv_reduce_max_f32(const float* data, int64_t len) {
+  if (len <= 0) return -std::numeric_limits<float>::infinity();
+  size_t vl = __riscv_vsetvl_e32m8(len);
+  if (vl == static_cast<size_t>(len)) {
+    vfloat32m8_t vdata = __riscv_vle32_v_f32m8(data, vl);
+    vfloat32m1_t vmin = __riscv_vfmv_s_f_f32m1(-std::numeric_limits<float>::infinity(), 1);
+    vfloat32m1_t vmax = __riscv_vfredmax_vs_f32m8_f32m1(vdata, vmin, vl);
+    return __riscv_vfmv_f_s_f32m1_f32(vmax);
+  }
+  float max_val = -std::numeric_limits<float>::infinity();
+  for (int64_t i = 0; i < len; ++i)
+    max_val = std::max(max_val, data[i]);
+  return max_val;
+}
+
+// Reduction Wrappers for Different register configurations
+inline float reduce_sum_f32m8(vfloat32m8_t v_acc, size_t vl_max) {
+  vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
+  vfloat32m1_t vred = __riscv_vfredusum_vs_f32m8_f32m1(v_acc, vzero, vl_max);
+  return __riscv_vfmv_f_s_f32m1_f32(vred);
+}
+
+inline float reduce_sum_f32m4(vfloat32m4_t v_acc, size_t vl_max) {
+  vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
+  vfloat32m1_t vred = __riscv_vfredusum_vs_f32m4_f32m1(v_acc, vzero, vl_max);
+  return __riscv_vfmv_f_s_f32m1_f32(vred);
+}
+
+inline float reduce_sum_f32m1(vfloat32m1_t v_acc, size_t vl_max) {
+  vfloat32m1_t vzero = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+  vfloat32m1_t vred = __riscv_vfredusum_vs_f32m1_f32m1(v_acc, vzero, vl_max);
+  return __riscv_vfmv_f_s_f32m1_f32(vred);
+}
+
+inline _Float16 reduce_sum_f16m4(vfloat16m4_t v_acc, size_t vl_max) {
+  vfloat16m1_t vzero = __riscv_vfmv_v_f_f16m1((_Float16)0.0f, 1);
+  vfloat16m1_t vred = __riscv_vfredusum_vs_f16m4_f16m1(v_acc, vzero, vl_max);
+  return __riscv_vfmv_f_s_f16m1_f16(vred);
+}
+
+// Widening Multiply-Accumulate Support
+
+// FP16 Vector-Vector -> FP32 Accumulator
+inline vfloat32m4_t vfwmacc_f16_to_f32m4(vfloat32m4_t vd, vfloat16m2_t vs1, vfloat16m2_t vs2, size_t vl) {
+#if defined(__riscv_zvfh)
+  return __riscv_vfwmacc_vv_f32m4_tu(vd, vs1, vs2, vl);
+#else
+  // Fallback: Convert to f32 then mac
+  vfloat32m4_t vs1_f32 = __riscv_vfwcvt_f_f_v_f32m4(vs1, vl);
+  vfloat32m4_t vs2_f32 = __riscv_vfwcvt_f_f_v_f32m4(vs2, vl);
+  return __riscv_vfmacc_vv_f32m4_tu(vd, vs1_f32, vs2_f32, vl);
+#endif
+}
+
+// FP16 Scalar-Vector -> FP32 Accumulator
+inline vfloat32m4_t vfwmacc_f16_scalar_to_f32m4(vfloat32m4_t vd, _Float16 scalar, vfloat16m2_t vs2, size_t vl) {
+#if 0
+  return __riscv_vfwmacc_vf_f32m4_tu(vd, scalar, vs2, vl);
+#else
+  // Fallback: Convert vector to f32, use float scalar
+  vfloat32m4_t vs2_f32 = __riscv_vfwcvt_f_f_v_f32m4(vs2, vl);
+  return __riscv_vfmacc_vf_f32m4_tu(vd, (float)scalar, vs2_f32, vl);
+#endif
+}
+
+// FP16 Vector-Vector -> FP32 Accumulator (M8)
+inline vfloat32m8_t vfwmacc_f16_to_f32m8(vfloat32m8_t vd, vfloat16m4_t vs1, vfloat16m4_t vs2, size_t vl) {
+#if 0
+  return __riscv_vfwmacc_vv_f32m8_tu(vd, vs1, vs2, vl);
+#else
+  vfloat32m8_t vs1_f32 = __riscv_vfwcvt_f_f_v_f32m8(vs1, vl);
+  vfloat32m8_t vs2_f32 = __riscv_vfwcvt_f_f_v_f32m8(vs2, vl);
+  return __riscv_vfmacc_vv_f32m8_tu(vd, vs1_f32, vs2_f32, vl);
+#endif
 }
 
 }  // namespace

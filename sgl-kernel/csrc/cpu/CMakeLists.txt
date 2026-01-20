@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 project(sgl_kernel)
 
+# For RISC-V Hardware
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64" OR DEFINED ENV{TORCH_PY_PREFIX})
+    message(STATUS "Detected RISC-V Build -> Delegating to rvv/CMakeLists.txt")
+    add_subdirectory(rvv)
+    return()
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -24,54 +31,16 @@ include_directories(
     ${Python_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# Python include directories - handle cross-compilation
-if(CMAKE_SYSROOT)
-    # For cross-compilation, prefer sysroot Python headers
-    if(EXISTS "${CMAKE_SYSROOT}/usr/include/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}")
-        include_directories("${CMAKE_SYSROOT}/usr/include/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}")
-        message(STATUS "Using Python headers from sysroot: ${CMAKE_SYSROOT}/usr/include/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}")
-    endif()
-    # Also add sysroot usr/include for general headers
-    if(EXISTS "${CMAKE_SYSROOT}/usr/include")
-        include_directories("${CMAKE_SYSROOT}/usr/include")
-    endif()
-endif()
-
-# Add system Python include directories (fallback)
-include_directories(${Python_INCLUDE_DIRS})
-
-# Platform-specific source and library directory
-set(MY_ARCH_DIR "")
+# Platform-specific library directory
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(PLAT_LIB_DIR "/usr/lib/x86_64-linux-gnu")
-    set(MY_ARCH_DIR "x86_64")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(PLAT_LIB_DIR "/usr/lib/aarch64-linux-gnu")
-    set(MY_ARCH_DIR "aarch64")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le|ppc64")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le|ppc64")
     set(PLAT_LIB_DIR "/usr/lib/powerpc64le-linux-gnu")
-    set(MY_ARCH_DIR "ppc64")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64|riscv32")
-    set(PLAT_LIB_DIR "/usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu")
-    # Check if RVV is supported (Clang 19+)
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        execute_process(
-            COMMAND ${CMAKE_CXX_COMPILER} --version
-            OUTPUT_VARIABLE CLANG_VERSION_OUTPUT
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        string(REGEX MATCH "clang version ([0-9]+)" _ "${CLANG_VERSION_OUTPUT}")
-        if(CMAKE_MATCH_1)
-            set(CLANG_MAJOR_VERSION "${CMAKE_MATCH_1}")
-            if(CLANG_MAJOR_VERSION GREATER_EQUAL 19)
-                add_compile_definitions(CPU_CAPABILITY_RVV)
-                set(MY_ARCH_DIR "rvv")
-            endif()
-        endif()
-    endif()
 else()
     set(PLAT_LIB_DIR "/usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu")
 endif()
@@ -93,46 +62,25 @@ if(DEFINED ENV{CONDA_PREFIX})
         message(FATAL_ERROR "libnuma not found in Conda environment at ${CONDA_LIB_DIR}\n"
                             "Please install it using: conda install libnuma numactl\n")
     endif()
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64|RISCV" OR CMAKE_CXX_FLAGS MATCHES "--target=riscv64")
-    # RISC-V cross-compilation: skip conda, use sysroot
-    message(STATUS "RISC-V cross-compilation: Skipping conda libraries (x86_64)")
-    set(NUMA_LIB "")
-elseif(CMAKE_SYSROOT)
-    # Cross-compilation: search in sysroot
-    message(STATUS "Cross-compilation: Searching libraries in ${CMAKE_SYSROOT}")
-    find_library(NUMA_LIB numa
-        HINTS
-        "${CMAKE_SYSROOT}/usr/lib/riscv64-linux-gnu"
-        "${CMAKE_SYSROOT}/usr/lib64"
-        "${CMAKE_SYSROOT}/usr/lib"
-        "${CMAKE_SYSROOT}/lib"
-    )
-    if(NUMA_LIB)
-        message(STATUS "Found libnuma: ${NUMA_LIB}")
-    else()
-        message(WARNING "libnuma not found in sysroot. Continuing without it.")
-        set(NUMA_LIB "")
-    endif()
 else()
-    # System libraries
+    if(DEFINED ENV{VIRTUAL_ENV})
+        set(VENV_LIB_DIR "$ENV{VIRTUAL_ENV}/lib")
+        message(STATUS "Using venv lib dir: ${VENV_LIB_DIR}")
+        link_directories(${VENV_LIB_DIR})
+        set(VENV_INCLUDE_DIR "$ENV{VIRTUAL_ENV}/include")
+        include_directories(${VENV_INCLUDE_DIR})
+    endif()
+    # Look for libnuma in system env paths
     find_library(NUMA_LIB numa)
     if(NUMA_LIB)
         message(STATUS "Found libnuma: ${NUMA_LIB}")
+    else()
+        message(FATAL_ERROR "libnuma not found in system environment\n"
+                            "Please install it using: apt-get install libnuma numactl\n")
     endif()
 endif()
 
-# Build all cpp files in current and sub dirs
 file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
-
-# Exclude all arch dependent files, then add back only files for this arch
-set(ARCH_DIRS "x86_64|aarch64|ppc64|rvv")
-list(FILTER SOURCES EXCLUDE REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/(${ARCH_DIRS})/")
-
-if(MY_ARCH_DIR)
-    file(GLOB_RECURSE ARCH_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/${MY_ARCH_DIR}/*.cpp")
-    list(APPEND SOURCES ${ARCH_SOURCES})
-endif()
-
 
 if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
     set(ENV{SGLANG_CPU_FP8_CVT_FTZ} "1")

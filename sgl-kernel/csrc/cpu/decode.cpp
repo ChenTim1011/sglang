@@ -2,81 +2,6 @@
 #include "gemm.h"
 #include "vec.h"
 
-#ifdef CPU_CAPABILITY_RVV
-namespace sgl_kernel {
-namespace rvv {
-
-template <typename scalar_t, typename index_t, int64_t BLOCK_N_IGNORED>
-void decode_attention_kernel_rvv_adapter(
-    scalar_t* __restrict__ output,
-    float* __restrict__ attn_logits,
-    const scalar_t* __restrict__ query,
-    const scalar_t* __restrict__ k_buffer,
-    const scalar_t* __restrict__ v_buffer,
-    const index_t* __restrict__ req_to_token,
-    const int64_t* __restrict__ req_pool_indices,
-    const int64_t* __restrict__ seq_lens,
-    int64_t batches,
-    int64_t num_heads,
-    int64_t head_size,
-    int64_t head_size_v,
-    int64_t num_kv_splits,
-    int64_t q_strideM,
-    int64_t q_strideH,
-    int64_t k_strideN,
-    int64_t k_strideH,
-    int64_t v_strideN,
-    int64_t v_strideH,
-    float scaling,
-    float logit_cap,
-    int64_t max_num_reqs,
-    int64_t max_context_len,
-    int64_t max_total_num_tokens,
-    float k_scale = 1.0f,
-    float v_scale = 1.0f);
-
-template <typename scalar_t, typename index_t, int64_t BLOCK_N_IGNORED>
-void decode_attention_grouped_kernel_rvv_adapter(
-    scalar_t* __restrict__ output,
-    float* __restrict__ attn_logits,
-    const scalar_t* __restrict__ query,
-    const scalar_t* __restrict__ k_buffer,
-    const scalar_t* __restrict__ v_buffer,
-    const index_t* __restrict__ req_to_token,
-    const int64_t* __restrict__ req_pool_indices,
-    const int64_t* __restrict__ seq_lens,
-    int64_t batches,
-    int64_t num_heads,
-    int64_t num_heads_kv,
-    int64_t head_size,
-    int64_t head_size_v,
-    int64_t num_kv_splits,
-    int64_t q_strideM,
-    int64_t q_strideH,
-    int64_t k_strideN,
-    int64_t k_strideH,
-    int64_t v_strideN,
-    int64_t v_strideH,
-    float scaling,
-    float logit_cap,
-    int64_t max_num_reqs,
-    int64_t max_context_len,
-    int64_t max_total_num_tokens,
-    float k_scale = 1.0f,
-    float v_scale = 1.0f);
-
-}  // namespace rvv
-}  // namespace sgl_kernel
-#endif
-
-#if defined(CPU_CAPABILITY_RVV)
-#define decode_attention_kernel_dispatch sgl_kernel::rvv::decode_attention_kernel_rvv_adapter
-#define decode_attention_grouped_kernel_dispatch sgl_kernel::rvv::decode_attention_grouped_kernel_rvv_adapter
-#else
-#define decode_attention_kernel_dispatch decode_attention_kernel_impl
-#define decode_attention_grouped_kernel_dispatch decode_attention_grouped_kernel_impl
-#endif
-
 namespace {
 
 // [NOTE] TODO list for this kernel:
@@ -1128,9 +1053,7 @@ void decode_attention_kernel_impl(
     float logit_cap,
     int64_t max_num_reqs,
     int64_t max_context_len,
-    int64_t max_total_num_tokens,
-    float k_scale = 1.0f,
-    float v_scale = 1.0f) {
+    int64_t max_total_num_tokens) {
   using Vec = at::vec::Vectorized<float>;
 
   // strides
@@ -1207,6 +1130,8 @@ void decode_attention_kernel_impl(
 
         // s_delta <- exp(s_i - m_i)
         at::vec::map<float>([m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta, s_i, n_size);
+
+        // s' <- s' * m_delta + sum(s_delta)
         s_prime *= m_delta;
         s_prime += at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta, n_size);
 
@@ -1463,9 +1388,7 @@ void decode_attention_grouped_kernel_impl(
     float logit_cap,
     int64_t max_num_reqs,
     int64_t max_context_len,
-    int64_t max_total_num_tokens,
-    float k_scale = 1.0f,
-    float v_scale = 1.0f) {
+    int64_t max_total_num_tokens) {
   using Vec = at::vec::Vectorized<float>;
 
   // block length for heads
@@ -1615,7 +1538,6 @@ void decode_attention_grouped_kernel_impl(
 // v_buffer:         [max_total_num_tokens, num_heads, head_size_v]
 // attn_logits:      [num_seqs, num_heads, num_kv_splits, head_size_v + 1]
 // req_to_token:     [max_num_reqs, max_context_len] int32 or int64
-
 // req_pool_indices: [num_seqs] int64
 // seq_lens:         [num_seqs] int64
 //
@@ -1632,9 +1554,7 @@ void decode_attention_cpu(
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
     double sm_scale,
-    double logit_cap,
-    double k_scale = 1.0,
-    double v_scale = 1.0) {
+    double logit_cap) {
   RECORD_FUNCTION(
       "sgl-kernel::decode_attention_cpu",
       std::vector<c10::IValue>(
@@ -1711,7 +1631,6 @@ void decode_attention_cpu(
   int64_t size_per_thread = is_mla ? BLOCK_N * head_size + BLOCK_N * head_size_v : 0;
   auto buffer = at::empty({num_threads, size_per_thread}, k_buffer.options());
 
-  // Use AT_DISPATCH_REDUCED_FLOATING_TYPES for Half and BFloat16 only
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "decode_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
       // update the kv buffer
@@ -1737,8 +1656,7 @@ void decode_attention_cpu(
 
       if (num_heads == num_heads_kv) {
         // MHA
-        // Dispatch to appropriate implementation (Intel AVX512/AMX or RISC-V RVV)
-        decode_attention_kernel_dispatch<scalar_t, index_t, BLOCK_N>(
+        decode_attention_kernel_impl<scalar_t, index_t, BLOCK_N>(
             output.data_ptr<scalar_t>(),
             attn_logits.data_ptr<float>(),
             query.data_ptr<scalar_t>(),
@@ -1762,13 +1680,8 @@ void decode_attention_cpu(
             logit_cap,
             max_num_reqs,
             max_context_len,
-            max_total_num_tokens,
-            (float)k_scale,
-            (float)v_scale);
+            max_total_num_tokens);
       } else if (is_mla) {
-#ifdef CPU_CAPABILITY_RVV
-        TORCH_CHECK(false, "RVV backend does not support MLA yet.");
-#else
         // MLA
         decode_attention_mla_kernel_impl<scalar_t, index_t, BLOCK_N>(
             output.data_ptr<scalar_t>(),
@@ -1797,11 +1710,9 @@ void decode_attention_cpu(
             max_context_len,
             max_total_num_tokens,
             size_per_thread);
-#endif
       } else {
         // GQA/MQA
-        // Dispatch to appropriate implementation
-        decode_attention_grouped_kernel_dispatch<scalar_t, index_t, BLOCK_N>(
+        decode_attention_grouped_kernel_impl<scalar_t, index_t, BLOCK_N>(
             output.data_ptr<scalar_t>(),
             attn_logits.data_ptr<float>(),
             query.data_ptr<scalar_t>(),
@@ -1826,10 +1737,7 @@ void decode_attention_cpu(
             logit_cap,
             max_num_reqs,
             max_context_len,
-            max_total_num_tokens,
-            (float)k_scale,
-            (float)v_scale);
-        // endif from top of file removed earlier, but we need to verify we aren't leaving a hanging endif
+            max_total_num_tokens);
       }
     });
   });

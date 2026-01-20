@@ -3,33 +3,6 @@
 
 #include "shm.h"
 
-// RISC-V stub implementation for all_reduce_outer_loop
-// Since shm.cpp is excluded for RISC-V (contains x86 intrinsics),
-// we provide a simple stub that does nothing for single-rank scenarios
-#ifdef SGLANG_RISCV_NO_SHM_COLLECTIVES
-void all_reduce_outer_loop(torch::Tensor& data, size_t numel, int data_size) {
-  // For single-rank scenarios (common on RISC-V), all_reduce is a no-op
-  // This is safe because in single-rank scenarios, the data is already "reduced"
-  (void)data;
-  (void)numel;
-  (void)data_size;
-}
-
-torch::Tensor& all_gather(torch::Tensor& result, torch::Tensor& data, int dim, size_t numel, int data_size) {
-  // For single-rank scenarios, all_gather is just a copy
-  result.copy_(data);
-  return result;
-}
-
-void shm_initialize(int size, int rank, const char* addr_string, const char* port_string) {
-  // No-op for RISC-V stub
-  (void)size;
-  (void)rank;
-  (void)addr_string;
-  (void)port_string;
-}
-#endif
-
 // Communication settings
 static int world_rank = -1;
 static int world_size = -1;
