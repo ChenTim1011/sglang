@@ -4,7 +4,8 @@ set -e
 # SGLang benchmark for one_batch, offline_throughput,and serving  for Banana Pi (RVV)
 
 
-MODEL_PATH="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+# You can change the model path by setting MODEL_PATH
+MODEL_PATH="meta-llama/Llama-3.2-1B-Instruct"
 
 # Flags
 RUN_ONE_BATCH=false

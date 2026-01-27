@@ -1297,15 +1297,15 @@ fi
 # Install sglang in development mode using --no-deps (to skip GPU-specific packages)
 SGLANG_INSTALL_LOG="$WORKSPACE_DIR/sglang_install.log"
 log_info "Installing sglang (logs: $SGLANG_INSTALL_LOG)..."
-log_info "  Using --no-deps to skip GPU-specific packages (decord2, cuda-python, etc.)"
+log_info "  Using --no-deps and --no-build-isolation to skip build dependencies on RISC-V"
 set +e
 # SGLang's pyproject.toml is in the python/ directory
 if [ -f "$PROJECT_DIR/python/pyproject.toml" ]; then
-    pip install --no-deps -e "$PROJECT_DIR/python" 2>&1 | tee "$SGLANG_INSTALL_LOG"
+    pip install --no-deps --no-build-isolation -e "$PROJECT_DIR/python" 2>&1 | tee "$SGLANG_INSTALL_LOG"
     SGLANG_INSTALL_EXIT=${PIPESTATUS[0]}
 else
     # Fallback: try root directory
-    pip install --no-deps -e "$PROJECT_DIR" 2>&1 | tee "$SGLANG_INSTALL_LOG"
+    pip install --no-deps --no-build-isolation -e "$PROJECT_DIR" 2>&1 | tee "$SGLANG_INSTALL_LOG"
     SGLANG_INSTALL_EXIT=${PIPESTATUS[0]}
 fi
 set -e
