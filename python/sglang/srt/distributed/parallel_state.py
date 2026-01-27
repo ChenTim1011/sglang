@@ -253,6 +253,7 @@ class GroupCoordinator:
 
         for ranks in group_ranks:
             active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
+
             active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions

@@ -1,8 +1,13 @@
 import itertools
+import os
+import sys
 import unittest
 
 import torch
 import torch.nn as nn
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from utils import native_w8a8_per_token_matmul, per_token_quant_int8, precision
 
 from sglang.test.test_utils import CustomTestCase

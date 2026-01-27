@@ -1954,6 +1954,8 @@ def get_device(device_id: Optional[int] = None) -> str:
     if is_cpu():
         if cpu_has_amx_support():
             logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        elif cpu_has_rvv_support():
+            logger.info("RISC-V RVV is detected, using CPU with RVV support.")
         else:
             logger.warning(
                 "CPU device enabled, using torch native backend, low performance expected."
@@ -3299,12 +3301,32 @@ def parse_lscpu_topology():
     except Exception as e:
         raise RuntimeError(f"Unexpected error running 'lscpu': {e}")
 
-    # Parse only data lines (skip comments)
+    # Parse only data lines
     cpu_info = []
     for line in output.splitlines():
-        if not line.startswith("#"):
-            cpu, core, socket, node = map(int, line.strip().split(","))
+        line = line.strip()
+        # Skip comments and empty lines
+        if not line or line.startswith("#"):
+            continue
+
+        # Split and validate
+        parts = line.split(",")
+        if len(parts) != 4:
+            # Skip malformed lines
+            continue
+
+        try:
+            cpu = int(parts[0])
+            core = int(parts[1])
+            socket = int(parts[2])
+            # RISC-V lscpu output format: CPU,Core,Socket,Node
+            # [(0,0,0,),(1,1,0,),(2,2,0,),(3,3,0,),(4,4,0,),(5,5,0,),(6,6,0,),(7,7,0,)]
+            # Handle empty Node field and treat empty as NUMA node 0
+            node = int(parts[3]) if parts[3].strip() else 0
             cpu_info.append((cpu, core, socket, node))
+        except ValueError:
+            # Skip lines with non-integer values
+            continue
 
     # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
     return cpu_info
