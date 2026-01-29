@@ -1,0 +1,190 @@
+name: PR Test (RVV)
+
+on:
+  workflow_dispatch:  # Manual trigger only for initial testing
+    inputs:
+      test_level:
+        description: 'Test level to run'
+        required: false
+        type: choice
+        options:
+          - basic
+          - kernel
+          - integration
+          - full
+        default: 'basic'
+  pull_request:
+    branches: [ main, rvv_backend ]
+    paths:
+      - 'python/sglang/srt/layers/attention/rvv_backend.py'
+      - 'python/sglang/srt/layers/rvv_utils.py'
+      - 'sgl-kernel/csrc/cpu/rvv/**'
+      - 'test/srt/cpu/rvv/**'
+      - 'scripts/ci/rvv/**'
+      - '.github/workflows/pr-test-rvv.yml'
+      - 'docker/rvv.Dockerfile'
+
+concurrency:
+  group: pr-test-rvv-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run_tests: ${{ steps.filter.outputs.rvv_code }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect RVV-related changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rvv_code:
+              - 'python/sglang/srt/layers/attention/rvv_backend.py'
+              - 'python/sglang/srt/layers/rvv_utils.py'
+              - 'sgl-kernel/csrc/cpu/rvv/**'
+              - 'test/srt/cpu/rvv/**'
+              - 'scripts/ci/rvv/**'
+              - '.github/workflows/pr-test-rvv.yml'
+
+  # ==================== Basic Verification ==================== #
+  rvv-basic-test:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.check-changes.outputs.run_tests == 'true'
+      )
+    runs-on: rvv-bpi-f3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start Podman container
+        run: bash scripts/ci/rvv/rvv_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Verify RVV support
+        timeout-minutes: 5
+        run: |
+          podman exec ci_sglang_rvv python3 /workspace/sglang/scripts/ci/rvv/verify_rvv_support.py
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          podman rm -f ci_sglang_rvv || true
+
+  # ==================== Kernel Unit Tests ==================== #
+  rvv-kernel-unit-test:
+    needs: [check-changes, rvv-basic-test]
+    if: |
+      always() &&
+      !cancelled() &&
+      (
+        (github.event_name == 'workflow_dispatch' && (inputs.test_level == 'kernel' || inputs.test_level == 'full')) ||
+        (github.event_name == 'pull_request' && needs.check-changes.outputs.run_tests == 'true')
+      )
+    runs-on: rvv-bpi-f3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start Podman container
+        run: bash scripts/ci/rvv/rvv_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/rvv/rvv_ci_install_dependency.sh
+
+      - name: Run kernel unit tests
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/rvv/rvv_ci_exec.sh -w /workspace/sglang/sgl-kernel/tests \
+            python3 -m pytest test_rvv_gemm.py test_rvv_decode.py test_rvv_extend.py -v
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          podman rm -f ci_sglang_rvv || true
+
+  # ==================== Backend Integration Tests ==================== #
+  rvv-backend-integration-test:
+    needs: [check-changes, rvv-kernel-unit-test]
+    if: |
+      always() &&
+      !cancelled() &&
+      (
+        (github.event_name == 'workflow_dispatch' && (inputs.test_level == 'integration' || inputs.test_level == 'full')) ||
+        (github.event_name == 'pull_request' && needs.check-changes.outputs.run_tests == 'true')
+      )
+    runs-on: rvv-bpi-f3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start Podman container
+        run: bash scripts/ci/rvv/rvv_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/rvv/rvv_ci_install_dependency.sh
+
+      - name: Run RVV backend tests
+        timeout-minutes: 15
+        run: |
+          bash scripts/ci/rvv/rvv_ci_exec.sh -w /workspace/sglang/test/srt/cpu/rvv \
+            python3 -m pytest test_rvv_backend.py test_rvv_attention_backend.py -v
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          podman rm -f ci_sglang_rvv || true
+
+  # ==================== End-to-End Inference Test ==================== #
+  rvv-e2e-test:
+    needs: [check-changes, rvv-backend-integration-test]
+    if: |
+      always() &&
+      !cancelled() &&
+      (github.event_name == 'workflow_dispatch' && inputs.test_level == 'full')
+    runs-on: rvv-bpi-f3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start Podman container
+        run: bash scripts/ci/rvv/rvv_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/rvv/rvv_ci_install_dependency.sh
+
+      - name: Run E2E inference test (Llama 1B)
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/rvv/rvv_ci_exec.sh python3 -c "
+          from sglang import Engine
+          print('Creating Engine with RVV backend...')
+          engine = Engine(
+              model_path='meta-llama/Llama-3.2-1B',
+              backend='rvv',
+              device='cpu'
+          )
+          print('Running inference...')
+          result = engine.generate('Hello, world! Tell me a joke.')
+          print(f'Result: {result}')
+          "
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          podman rm -f ci_sglang_rvv || true
