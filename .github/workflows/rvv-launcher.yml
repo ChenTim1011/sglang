@@ -1,0 +1,69 @@
+name: RVV Test Launcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_level:
+        description: 'Test level to run'
+        required: true
+        type: choice
+        options:
+          - basic
+          - kernel
+          - integration
+          - full
+        default: 'basic'
+      target_branch:
+        description: 'Branch with RVV code'
+        required: false
+        type: string
+        default: 'rvv_backend'
+
+jobs:
+  trigger-rvv-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+
+      - name: Verify workflow exists
+        run: |
+          if [ -f ".github/workflows/pr-test-rvv.yml" ]; then
+            echo "✓ RVV workflow found on ${{ inputs.target_branch }}"
+            cat .github/workflows/pr-test-rvv.yml | head -20
+          else
+            echo "✗ RVV workflow not found on ${{ inputs.target_branch }}"
+            exit 1
+          fi
+
+      - name: Instructions
+        run: |
+          echo "============================================"
+          echo "RVV Test Launcher"
+          echo "============================================"
+          echo ""
+          echo "This launcher helps you run RVV tests from the Actions UI."
+          echo ""
+          echo "Target Branch: ${{ inputs.target_branch }}"
+          echo "Test Level: ${{ inputs.test_level }}"
+          echo ""
+          echo "To run the actual tests:"
+          echo "1. Go to: https://github.com/${{ github.repository }}/actions/workflows/pr-test-rvv.yml"
+          echo "2. Click 'Run workflow'"
+          echo "3. Select branch: ${{ inputs.target_branch }}"
+          echo "4. Choose test level: ${{ inputs.test_level }}"
+          echo ""
+          echo "Or wait for the next step to automatically trigger..."
+          echo "============================================"
+
+      - name: Trigger RVV workflow (manual fallback)
+        run: |
+          echo "Note: GitHub Actions doesn't support cross-branch workflow_dispatch yet."
+          echo ""
+          echo "Please manually trigger the workflow at:"
+          echo "https://github.com/${{ github.repository }}/actions/workflows/pr-test-rvv.yml"
+          echo ""
+          echo "Once you've run it once, it will appear in the Actions UI!"
