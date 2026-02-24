@@ -27,74 +27,134 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# Platform-specific library directory
+# Build all cpp files in current dir; arch-specific subdirs added later
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+
+set(ARCH_DIRS "x86_64|aarch64|riscv64")
+list(FILTER SOURCES EXCLUDE REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/(${ARCH_DIRS})/")
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+  set(RISCV64_SKIP_TOPLEVEL
+    # Replaced by riscv64/*.cpp
+    decode extend gemm gemm_int8 moe
+    # Not supported on RISC-V (no implementation)
+    shm interface moe_int8 gemm_int4 moe_int4 flash_attn
+  )
+  foreach(basename IN LISTS RISCV64_SKIP_TOPLEVEL)
+    list(FILTER SOURCES EXCLUDE REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/${basename}\\.cpp$")
+  endforeach()
+  message(STATUS "RISC-V: skipped top-level sources: ${RISCV64_SKIP_TOPLEVEL}")
+endif()
+
+# Platform-specific source and library directory
+set(MY_ARCH_DIR "")
+
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(PLAT_LIB_DIR "/usr/lib/x86_64-linux-gnu")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(MY_ARCH_DIR "x86_64")
+    add_compile_options(-march=native)
+    message(STATUS "Build Architecture: x86_64")
+
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(PLAT_LIB_DIR "/usr/lib/aarch64-linux-gnu")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le|ppc64")
-    set(PLAT_LIB_DIR "/usr/lib/powerpc64le-linux-gnu")
+    set(MY_ARCH_DIR "aarch64")
+    message(STATUS "Build Architecture: aarch64")
+
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+    set(PLAT_LIB_DIR "/usr/lib/riscv64-linux-gnu")
+    set(MY_ARCH_DIR "riscv64")
+    # RISC-V specific compiler checks
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(WARNING "RISC-V build requires Clang for RVV intrinsics. Current: ${CMAKE_CXX_COMPILER_ID}")
+    else()
+        if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19.0)
+            message(FATAL_ERROR "Clang >= 19.0 required for RVV. Found: ${CMAKE_CXX_COMPILER_VERSION}")
+        endif()
+    endif()
+
+    # RISC-V Compile Definitions & Options
+    add_compile_options(-march=rv64gcv_zvfh -mabi=lp64d -mrvv-vector-bits=256)
+    add_compile_definitions(CPU_CAPABILITY_RVV)
+    add_compile_definitions(SGLANG_RISCV_NO_SHM)
+    add_compile_definitions(SGLANG_RISCV_NO_NUMA)
+    message(STATUS "Build Architecture: riscv64 (RVV enabled)")
+
 else()
     set(PLAT_LIB_DIR "/usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu")
+    message(STATUS "Unknown Architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
+
 link_directories(${PLAT_LIB_DIR})
+
+# Include arch-specific sources
+if(MY_ARCH_DIR)
+    file(GLOB_RECURSE ARCH_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${MY_ARCH_DIR}/*.cpp")
+    list(APPEND SOURCES ${ARCH_SOURCES})
+    message(STATUS "Included ${MY_ARCH_DIR} specialized sources.")
+endif()
 
 # Conda library path support
 if(DEFINED ENV{CONDA_PREFIX})
     set(CONDA_LIB_DIR "$ENV{CONDA_PREFIX}/lib")
-    message(STATUS "Using Conda lib dir: ${CONDA_LIB_DIR}")
     link_directories(${CONDA_LIB_DIR})
-    set(CONDA_INCLUDE_DIR "$ENV{CONDA_PREFIX}/include")
-    include_directories(${CONDA_INCLUDE_DIR})
+    include_directories("$ENV{CONDA_PREFIX}/include")
 
-    # Look for libnuma in Conda's lib directory
     find_library(NUMA_LIB numa HINTS "${CONDA_LIB_DIR}")
-    if(NUMA_LIB)
-        message(STATUS "Found libnuma: ${NUMA_LIB}")
-    else()
-        message(FATAL_ERROR "libnuma not found in Conda environment at ${CONDA_LIB_DIR}\n"
-                            "Please install it using: conda install libnuma numactl\n")
-    endif()
 else()
     if(DEFINED ENV{VIRTUAL_ENV})
-        set(VENV_LIB_DIR "$ENV{VIRTUAL_ENV}/lib")
-        message(STATUS "Using venv lib dir: ${VENV_LIB_DIR}")
-        link_directories(${VENV_LIB_DIR})
-        set(VENV_INCLUDE_DIR "$ENV{VIRTUAL_ENV}/include")
-        include_directories(${VENV_INCLUDE_DIR})
+        link_directories("$ENV{VIRTUAL_ENV}/lib")
+        include_directories("$ENV{VIRTUAL_ENV}/include")
     endif()
-    # Look for libnuma in system env paths
     find_library(NUMA_LIB numa)
-    if(NUMA_LIB)
-        message(STATUS "Found libnuma: ${NUMA_LIB}")
+endif()
+
+# Check for Libnuma (Skip on RISC-V)
+if(NUMA_LIB)
+    message(STATUS "Found libnuma: ${NUMA_LIB}")
+else()
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+        message(FATAL_ERROR "libnuma not found. Please install libnuma/numactl.")
     else()
-        message(FATAL_ERROR "libnuma not found in system environment\n"
-                            "Please install it using: apt-get install libnuma numactl\n")
+        message(STATUS "Skipping libnuma for RISC-V.")
     endif()
 endif()
 
-file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
-
+# SGLang internal environment vars
 if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
     set(ENV{SGLANG_CPU_FP8_CVT_FTZ} "1")
 endif()
 
 if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
-    message(STATUS "Enabling macro: SGLANG_CPU_FP8_CVT_FTZ")
     add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
 endif()
 
-add_compile_options(
-    -O3
-    -Wno-unknown-pragmas
-    -march=native
-    -fopenmp
-)
+# -------------------------------------------------------------------------
+# Target Definition
+# -------------------------------------------------------------------------
+add_compile_options(-O3 -Wno-unknown-pragmas -fopenmp)
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})
+
+# Link libraries based on architecture
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+    # RISC-V: Link PyTorch and OpenMP
+    target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES})
+
+    # OpenMP for RISC-V
+    set(OMP_LIB_PATH "$ENV{RISCV_OMP_LIB_PATH}")
+    if(EXISTS "${OMP_LIB_PATH}")
+        target_link_libraries(common_ops PRIVATE "${OMP_LIB_PATH}")
+    else()
+        find_library(OMP_LIB omp)
+        if(OMP_LIB)
+            target_link_libraries(common_ops PRIVATE ${OMP_LIB})
+        endif()
+    endif()
+else()
+    # x86_64 / aarch64: Link PyTorch and NUMA
+    target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})
+endif()
+
 target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 
-install(TARGETS common_ops
-    LIBRARY DESTINATION sgl_kernel
-)
+install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
