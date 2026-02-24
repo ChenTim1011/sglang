@@ -2,6 +2,7 @@ FROM python:3.13-slim
 SHELL ["/bin/bash", "-c"]
 
 ARG SGLANG_REPO=https://github.com/nthu-pllab/pllab-sglang.git
+# Assume the rvv_backend branch is merged into main
 ARG VER_SGLANG=main
 
 ARG VER_TORCH=2.8.0+spacemit.1

@@ -9,7 +9,7 @@
 set -e
 
 # Configuration
-PODMAN_IMAGE="${PODMAN_IMAGE:-docker.io/juitingchen/sglang-rvv:v1.0}"
+PODMAN_IMAGE="${PODMAN_IMAGE:-docker.io/juitingchen/sglang-rvv:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-ci_sglang_rvv}"
 WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
 

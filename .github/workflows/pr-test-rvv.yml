@@ -18,7 +18,7 @@ on:
     paths:
       - 'python/sglang/srt/layers/attention/rvv_backend.py'
       - 'python/sglang/srt/layers/rvv_utils.py'
-      - 'sgl-kernel/csrc/cpu/rvv/**'
+      - 'sgl-kernel/csrc/cpu/riscv64/**'
       - 'test/srt/cpu/rvv/**'
       - 'scripts/ci/rvv/**'
       - '.github/workflows/pr-test-rvv.yml'
@@ -46,7 +46,7 @@ jobs:
             rvv_code:
               - 'python/sglang/srt/layers/attention/rvv_backend.py'
               - 'python/sglang/srt/layers/rvv_utils.py'
-              - 'sgl-kernel/csrc/cpu/rvv/**'
+              - 'sgl-kernel/csrc/cpu/riscv64/**'
               - 'test/srt/cpu/rvv/**'
               - 'scripts/ci/rvv/**'
               - '.github/workflows/pr-test-rvv.yml'
@@ -100,14 +100,18 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Install dependencies
-        run: bash scripts/ci/rvv/rvv_ci_install_dependency.sh
-
       - name: Run kernel unit tests
-        timeout-minutes: 20
+        timeout-minutes: 40
         run: |
-          bash scripts/ci/rvv/rvv_ci_exec.sh -w /workspace/sglang/sgl-kernel/tests \
-            python3 -m pytest test_rvv_gemm.py test_rvv_decode.py test_rvv_decode_int8.py test_rvv_extend.py test_rvv_extend_int8.py test_rvv_moe.py -v
+          bash scripts/ci/rvv/rvv_ci_exec.sh -w /workspace/sglang \
+            python3 -m unittest \
+              test.srt.cpu.rvv.test_rvv_gemm \
+              test.srt.cpu.rvv.test_rvv_decode \
+              test.srt.cpu.rvv.test_rvv_decode_int8 \
+              test.srt.cpu.rvv.test_rvv_extend \
+              test.srt.cpu.rvv.test_rvv_extend_int8 \
+              test.srt.cpu.rvv.test_rvv_moe \
+              -v
 
       - name: Cleanup container
         if: always()
@@ -134,14 +138,14 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Install dependencies
-        run: bash scripts/ci/rvv/rvv_ci_install_dependency.sh
-
       - name: Run RVV backend tests
-        timeout-minutes: 15
+        timeout-minutes: 40
         run: |
-          bash scripts/ci/rvv/rvv_ci_exec.sh -w /workspace/sglang/test/srt/cpu/rvv \
-            python3 -m pytest test_rvv_backend_registration.py test_rvv_attention_backend.py -v
+          bash scripts/ci/rvv/rvv_ci_exec.sh -w /workspace/sglang \
+            python3 -m unittest \
+              test.srt.cpu.rvv.test_rvv_backend_registration \
+              test.srt.cpu.rvv.test_rvv_attention_backend \
+              -v
 
       - name: Cleanup container
         if: always()
@@ -165,11 +169,8 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Install dependencies
-        run: bash scripts/ci/rvv/rvv_ci_install_dependency.sh
-
       - name: Run E2E inference test (Llama 1B)
-        timeout-minutes: 30
+        timeout-minutes: 40
         run: |
           bash scripts/ci/rvv/rvv_ci_exec.sh python3 -c "
           from sglang import Engine
