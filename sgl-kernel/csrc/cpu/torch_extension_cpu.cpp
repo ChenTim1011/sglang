@@ -19,6 +19,9 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 #include "shm.h"
+#if defined(CPU_CAPABILITY_RVV)
+#include "riscv64/vector_helpers.h"
+#endif
 
 // silu_and_mul
 at::Tensor silu_and_mul_cpu(at::Tensor& input);
@@ -289,6 +292,7 @@ at::Tensor causal_conv1d_update_cpu(
     bool is_vnni);
 
 // shared memory init
+#if !defined(SGLANG_RISCV_NO_SHM)
 void initialize(int64_t size, int64_t rank);
 
 // shared mmeory all_reduce
@@ -296,6 +300,7 @@ void shm_allreduce(at::Tensor& data, int64_t op);
 
 // shared memory all_gather
 at::Tensor shm_allgather(at::Tensor& data, int64_t dim);
+#endif
 
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
@@ -307,7 +312,9 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     bool is_neox);
 
 // CPU and memory binding
+#if !defined(SGLANG_RISCV_NO_NUMA)
 std::string init_cpu_threads_env(const std::string& cpu_ids);
+#endif
 
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
@@ -386,7 +393,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor key, Tensor value, "
+      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cache, Tensor(a!) output, Tensor key, Tensor value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
       "float logit_cap) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
@@ -507,11 +514,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
 
   // all reduce
+#if !defined(SGLANG_RISCV_NO_SHM)
   m.def("initialize(int size, int rank) -> ()");
   m.def("shm_allreduce(Tensor(a!) data, int reduce_op) -> ()");
   m.impl("shm_allreduce", torch::kCPU, &shm_allreduce);
   m.def("shm_allgather(Tensor data, int dim) -> Tensor");
   m.impl("shm_allgather", torch::kCPU, &shm_allgather);
+#endif
 
   // rope
   m.def(
@@ -520,7 +529,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
 
   // CPU and memory binding
+#if !defined(SGLANG_RISCV_NO_NUMA)
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
+#endif
 
   // fused_sigmoid_gating_delta_rule_update
   m.def(
@@ -539,8 +550,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
+#if !defined(SGLANG_RISCV_NO_NUMA)
   m.impl("init_cpu_threads_env", init_cpu_threads_env);
+#endif
+#if !defined(SGLANG_RISCV_NO_SHM)
   m.impl("initialize", &initialize);
+#endif
 }
 
 REGISTER_EXTENSION(common_ops)
