@@ -153,7 +153,8 @@ void extend_attention_int8_cpu(
     double v_scale);
 #endif
 
-// flash attention
+// flash attention (not supported on RISC-V)
+#if !defined(CPU_CAPABILITY_RVV)
 at::Tensor flash_attn_varlen_func(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -163,6 +164,7 @@ at::Tensor flash_attn_varlen_func(
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
     bool causal);
+#endif
 
 // linear attention
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
@@ -225,13 +227,15 @@ at::Tensor int8_scaled_mm_with_quant(
     at::ScalarType out_dtype,
     bool is_vnni);
 
-// int4 gemm
+// int4 gemm (not supported on RISC-V)
+#if !defined(CPU_CAPABILITY_RVV)
 at::Tensor int4_scaled_mm_cpu(
     at::Tensor& x, at::Tensor& w, at::Tensor& w_zeros, at::Tensor& w_scales, std::optional<at::Tensor> bias);
 
 // weight prepack for int4 weights
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales);
+#endif
 
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
@@ -464,11 +468,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("extend_attention_int8_cpu", torch::kCPU, &extend_attention_int8_cpu);
 #endif  // CPU_CAPABILITY_RVV
 
-  // flash attn
+#if defined(CPU_CAPABILITY_RVV)
+  // Hardware VLEN detection: returns vlenb (= VLEN/8) at runtime.
+  m.def("get_rvv_vlenb() -> int");
+  m.impl("get_rvv_vlenb", torch::kCPU, []() -> int64_t { return rvv_get_vlenb(); });
+#endif  // CPU_CAPABILITY_RVV
+
+  // flash attn (not supported on RISC-V)
+#if !defined(CPU_CAPABILITY_RVV)
   m.def(
       "flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
       "int max_seqlen_q, int max_seqlen_k, bool causal) -> Tensor");
   m.impl("flash_attn_varlen_func", torch::kCPU, &flash_attn_varlen_func);
+#endif
 
   // linear attn
   m.def(
@@ -512,7 +524,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "is_vnni) -> Tensor");
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
 
-  // int4 gemm
+  // int4 gemm (not supported on RISC-V)
+#if !defined(CPU_CAPABILITY_RVV)
   m.def("int4_scaled_mm_cpu(Tensor x, Tensor w, Tensor w_zeros, Tensor w_scales, Tensor? bias) -> Tensor");
   m.impl("int4_scaled_mm_cpu", torch::kCPU, &int4_scaled_mm_cpu);
 
@@ -521,6 +534,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales) -> (Tensor, Tensor, "
       "Tensor)");
   m.impl("convert_weight_packed_scale_zp", torch::kCPU, &convert_weight_packed_scale_zp);
+#endif
 
   // bmm
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");

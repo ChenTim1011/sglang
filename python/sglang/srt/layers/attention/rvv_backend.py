@@ -33,45 +33,23 @@ class RVVAttnBackend(AttentionBackend):
 
     def _try_init_rvv_kernels(self):
         try:
-            if not hasattr(torch.ops.sgl_kernel, "get_rvv_vlenb"):
-                return
+            ops = torch.ops.sgl_kernel
 
-            # 1. Detect Hardware
-            self.vlenb = torch.ops.sgl_kernel.get_rvv_vlenb()
+            # 1. Detect Hardware (optional — log only)
+            if hasattr(ops, "get_rvv_vlenb"):
+                self.vlenb = ops.get_rvv_vlenb()
+                logger.info(f"[RVV] Hardware VLEN={self.vlenb * 8}bits detected.")
 
-            # 2. Config & Alignment
-            self.num_head = (
-                self.model_runner.model_config.num_attention_heads
-                // self.model_runner.tp_size
-            )
-            try:
-                self.v_head_dim = self.model_runner.token_to_kv_pool.get_value_buffer(
-                    0
-                ).shape[-1]
-            except:
-                self.v_head_dim = self.model_runner.model_config.head_dim
-
-            # K1 Constraint: 256-bit alignment
-            config_dtype = getattr(
-                self.model_runner.model_config, "dtype", torch.float16
-            )
-            if not isinstance(config_dtype, torch.dtype):
-                config_dtype = torch.float16
-
-            dtype_size = torch.tensor([], dtype=config_dtype).element_size()
-            if (self.v_head_dim * dtype_size) % 32 != 0:
-                logger.warning(
-                    f"[RVV] Head dim {self.v_head_dim} not 32-byte aligned. vlenb={self.vlenb}. Fallback."
-                )
-                return
-
-            # 3. Select Kernel Implementation
-            # Check for INT8 KV cache
+            # 2. Select Kernel Implementation
             pool = self.model_runner.token_to_kv_pool
-            k_buffer = pool.get_key_buffer(0)
+
+            layer_id = 0
+            if hasattr(pool, "full_attention_layer_id_mapping"):
+                layer_id = next(iter(pool.full_attention_layer_id_mapping))
+
+            k_buffer = pool.get_key_buffer(layer_id)
             self.is_int8 = k_buffer.dtype in (torch.int8, torch.uint8)
 
-            ops = torch.ops.sgl_kernel
             if self.is_int8:
                 if hasattr(ops, "decode_attention_int8_cpu") and hasattr(
                     ops, "extend_attention_int8_cpu"
@@ -89,7 +67,7 @@ class RVVAttnBackend(AttentionBackend):
 
             if self.use_rvv_kernels:
                 logger.info(
-                    f"[RVV] Initialized. VLEN={self.vlenb*8}bits. Mode={'INT8' if self.is_int8 else 'FLOAT'}"
+                    f"[RVV] Initialized. Mode={'INT8' if self.is_int8 else 'FLOAT'}"
                 )
 
         except Exception as e:
@@ -99,27 +77,11 @@ class RVVAttnBackend(AttentionBackend):
         if not self.use_rvv_kernels:
             return self.fallback_backend.init_forward_metadata(forward_batch)
 
-        bs = forward_batch.batch_size
-        self.num_kv_splits = 4
-
-        # Optimize: Contiguous allocation for K1
-        # Reverted padding: using v_head_dim + 1 as per current C++ kernel expectation
-        attn_logits = torch.empty(
-            (bs, self.num_head, self.num_kv_splits, self.v_head_dim + 1),
-            dtype=torch.float32,
-            device="cpu",
-        ).contiguous()
-
         max_extend_len = 0
         if not forward_batch.forward_mode.is_decode_or_idle():
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
 
-        if self.is_int8:
-            k_scale = torch.tensor([1.0], dtype=torch.float32, device="cpu")
-            v_scale = torch.tensor([1.0], dtype=torch.float32, device="cpu")
-            self.forward_metadata = (attn_logits, max_extend_len, k_scale, v_scale)
-        else:
-            self.forward_metadata = (attn_logits, max_extend_len)
+        self.forward_metadata = max_extend_len
 
     def forward_decode(
         self,
@@ -137,20 +99,21 @@ class RVVAttnBackend(AttentionBackend):
 
         pool = forward_batch.token_to_kv_pool
 
-        # 1. Save KV
-        if save_kv_cache and not self.is_int8:
-            # Standard optimized path
-            loc = (
-                forward_batch.encoder_out_cache_loc
-                if (
-                    layer.is_cross_attention
-                    and forward_batch.encoder_out_cache_loc is not None
-                )
-                else forward_batch.out_cache_loc
+        # 1. Compute cache loc (handles cross-attention)
+        loc = (
+            forward_batch.encoder_out_cache_loc
+            if (
+                layer.is_cross_attention
+                and forward_batch.encoder_out_cache_loc is not None
             )
+            else forward_batch.out_cache_loc
+        )
+
+        # 2. Save KV
+        if save_kv_cache and not self.is_int8:
             pool.set_kv_buffer(layer, loc, k, v)
 
-        # 2. Prepare Output & Metadata
+        # 3. Prepare Output
         current_bs = q.shape[0]
         q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
@@ -160,17 +123,23 @@ class RVVAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
         o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
+        attn_logits = torch.empty(
+            (current_bs, layer.tp_q_head_num, 4, layer.v_head_dim + 1),
+            dtype=torch.float32,
+            device="cpu",
+        )
+
         if self.is_int8:
-            attn_logits, _, k_scale_tensor, v_scale_tensor = self.forward_metadata
-            # Update scales
-            k_scale_tensor[0] = getattr(layer, "k_scale_float", 1.0)
-            if hasattr(layer, "k_scale") and isinstance(layer.k_scale, torch.Tensor):
-                k_scale_tensor[0] = layer.k_scale.item()
-
-            v_scale_tensor[0] = getattr(layer, "v_scale_float", 1.0)
-            if hasattr(layer, "v_scale") and isinstance(layer.v_scale, torch.Tensor):
-                v_scale_tensor[0] = layer.v_scale.item()
-
+            k_scale = float(
+                layer.k_scale.item()
+                if hasattr(layer, "k_scale") and isinstance(layer.k_scale, torch.Tensor)
+                else getattr(layer, "k_scale_float", 1.0)
+            )
+            v_scale = float(
+                layer.v_scale.item()
+                if hasattr(layer, "v_scale") and isinstance(layer.v_scale, torch.Tensor)
+                else getattr(layer, "v_scale_float", 1.0)
+            )
             self.decode_fwd_impl(
                 q_view,
                 pool.get_key_buffer(layer.layer_id),
@@ -178,18 +147,17 @@ class RVVAttnBackend(AttentionBackend):
                 o_view,
                 k,
                 v,
-                forward_batch.out_cache_loc,
-                attn_logits[:current_bs],
+                loc,
+                attn_logits,
                 forward_batch.req_to_token_pool.req_to_token,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 layer.scaling,
                 layer.logit_cap,
-                k_scale_tensor,
-                v_scale_tensor,
+                k_scale,
+                v_scale,
             )
         else:
-            attn_logits, _ = self.forward_metadata
             self.decode_fwd_impl(
                 q_view,
                 pool.get_key_buffer(layer.layer_id),
@@ -197,8 +165,8 @@ class RVVAttnBackend(AttentionBackend):
                 o_view,
                 k,
                 v,
-                forward_batch.out_cache_loc,
-                attn_logits[:current_bs],
+                loc,
+                attn_logits,
                 forward_batch.req_to_token_pool.req_to_token,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -244,16 +212,19 @@ class RVVAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
         o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        if self.is_int8:
-            _, max_extend_len, k_scale_tensor, v_scale_tensor = self.forward_metadata
-            # Update scales (same logic as decode)
-            k_scale_tensor[0] = getattr(layer, "k_scale_float", 1.0)
-            if hasattr(layer, "k_scale") and isinstance(layer.k_scale, torch.Tensor):
-                k_scale_tensor[0] = layer.k_scale.item()
-            v_scale_tensor[0] = getattr(layer, "v_scale_float", 1.0)
-            if hasattr(layer, "v_scale") and isinstance(layer.v_scale, torch.Tensor):
-                v_scale_tensor[0] = layer.v_scale.item()
+        max_extend_len = self.forward_metadata
 
+        if self.is_int8:
+            k_scale = float(
+                layer.k_scale.item()
+                if hasattr(layer, "k_scale") and isinstance(layer.k_scale, torch.Tensor)
+                else getattr(layer, "k_scale_float", 1.0)
+            )
+            v_scale = float(
+                layer.v_scale.item()
+                if hasattr(layer, "v_scale") and isinstance(layer.v_scale, torch.Tensor)
+                else getattr(layer, "v_scale_float", 1.0)
+            )
             self.extend_fwd_impl(
                 q_view,
                 k,
@@ -269,11 +240,10 @@ class RVVAttnBackend(AttentionBackend):
                 max_extend_len,
                 layer.scaling,
                 layer.logit_cap,
-                k_scale_tensor,
-                v_scale_tensor,
+                k_scale,
+                v_scale,
             )
         else:
-            _, max_extend_len = self.forward_metadata
             self.extend_fwd_impl(
                 q_view,
                 k,

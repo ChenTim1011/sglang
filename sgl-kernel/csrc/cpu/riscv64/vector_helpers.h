@@ -14,6 +14,12 @@ inline constexpr int64_t BLOCK_N = 64;
 inline constexpr size_t MAX_VL_ELEMENTS_M4 = 32;
 }  // namespace rvv_constants
 
+// Returns VLENB (vector register length in bytes) at runtime via vsetvlmax.
+// e8m1: LMUL=1, element=8-bit → vl == VLEN/8 == vlenb.
+inline int64_t rvv_get_vlenb() {
+  return static_cast<int64_t>(__riscv_vsetvlmax_e8m1());
+}
+
 typedef vfloat32m1_t vf32m1_t __attribute__((riscv_rvv_vector_bits(256)));
 
 #ifndef MAX_HEAD_SIZE

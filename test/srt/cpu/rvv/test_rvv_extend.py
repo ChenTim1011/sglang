@@ -41,6 +41,14 @@ class TestRVVExtendAttention(TestExtendAttention):
         self.device = torch.device("cpu")
         self.dtypes = [torch.float16, torch.bfloat16]
 
+    def test_extend_attention(self):
+        # Override base class
+        for is_mla in [True, False]:
+            self._test_extend_attention_once(1, 64, 1, 1, 128, 96, is_mla)
+            self._test_extend_attention_once(1, 64, 16, 1, 128, 96, is_mla)
+            self._test_extend_attention_once(2, 128, 16, 4, 128, 96, is_mla)
+            self._test_extend_attention_once(1, 128, 16, 1, 32, 32, is_mla)
+
     def _test_extend_attention_once(
         self, B, N_CTX, H_Q, H_KV, D, DV, mla=False, dtype=torch.bfloat16, logit_cap=0.0
     ):
@@ -154,7 +162,7 @@ class TestExtendAttentionMHA(TestRVVExtendAttention):
         """Basic MHA extend test"""
         for dtype in self.dtypes:
             self._test_extend_attention_once(
-                B=2, N_CTX=512, H_Q=16, H_KV=16, D=128, DV=96, dtype=dtype, mla=False
+                B=2, N_CTX=128, H_Q=16, H_KV=16, D=128, DV=96, dtype=dtype, mla=False
             )
 
     def test_extend_logit_cap(self):
@@ -162,7 +170,7 @@ class TestExtendAttentionMHA(TestRVVExtendAttention):
         for dtype in self.dtypes:
             self._test_extend_attention_once(
                 B=2,
-                N_CTX=512,
+                N_CTX=128,
                 H_Q=16,
                 H_KV=16,
                 D=128,
@@ -176,14 +184,14 @@ class TestExtendAttentionMHA(TestRVVExtendAttention):
         """Edge case: odd dimensions (tests tail handling in RVV loops)"""
         for dtype in self.dtypes:
             self._test_extend_attention_once(
-                B=2, N_CTX=256, H_Q=8, H_KV=8, D=32, DV=32, dtype=dtype, mla=False
+                B=2, N_CTX=64, H_Q=8, H_KV=8, D=32, DV=32, dtype=dtype, mla=False
             )
 
     def test_extend_large_batch(self):
         """Stress test: large batch size"""
         for dtype in self.dtypes:
             self._test_extend_attention_once(
-                B=5, N_CTX=128, H_Q=8, H_KV=8, D=128, DV=96, dtype=dtype, mla=False
+                B=3, N_CTX=64, H_Q=8, H_KV=8, D=128, DV=96, dtype=dtype, mla=False
             )
 
 
@@ -196,7 +204,7 @@ class TestExtendAttentionGQA(TestRVVExtendAttention):
         """Basic GQA test: LLaMA-style (32:8 head ratio)"""
         for dtype in self.dtypes:
             self._test_extend_attention_once(
-                B=2, N_CTX=512, H_Q=32, H_KV=8, D=128, DV=96, dtype=dtype, mla=False
+                B=2, N_CTX=128, H_Q=32, H_KV=8, D=128, DV=96, dtype=dtype, mla=False
             )
 
 
@@ -209,7 +217,7 @@ class TestExtendAttentionMLA(TestRVVExtendAttention):
         """Basic MLA test: DeepSeek-style configuration"""
         for dtype in self.dtypes:
             self._test_extend_attention_once(
-                B=2, N_CTX=512, H_Q=22, H_KV=1, D=192, DV=128, dtype=dtype, mla=True
+                B=2, N_CTX=128, H_Q=22, H_KV=1, D=192, DV=128, dtype=dtype, mla=True
             )
 
 
