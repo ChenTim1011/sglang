@@ -24,13 +24,19 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.rvv_utils import (
+    _rvv_process_weight_after_loading,
+    rvv_linear_forward,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    cpu_has_rvv_support,
     is_cpu,
     is_cuda,
     is_host_cpu_arm64,
     set_weight_attrs,
     use_intel_amx_backend,
+    use_riscv_rvv_backend,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
@@ -41,7 +47,7 @@ _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
-
+_is_cpu_rvv_available = cpu_has_rvv_support()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
@@ -165,8 +171,12 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 _amx_process_weight_after_loading(layer, ["weight"])
             elif _is_cpu_arm64:
                 layer.weight = Parameter(layer.weight.data, requires_grad=False)
+            elif _is_cpu_rvv_available:
+                _rvv_process_weight_after_loading(layer, ["weight"])
             else:
-                assert False, "W8A8Int8LinearMethod on CPU only works on AMX or Arm64"
+                raise RuntimeError(
+                    "W8A8Int8LinearMethod on CPU requires Intel AMX, Arm64, or RISC-V RVV support"
+                )
         else:
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
@@ -217,6 +227,8 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
+        elif use_riscv_rvv_backend(layer):
+            return rvv_linear_forward(x, layer, bias)
         x_q, x_scale = per_token_quant_int8(x)
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
@@ -314,8 +326,13 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_cpu_amx_available:
-            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+        if _is_cpu:
+            if _is_cpu_amx_available:
+                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            elif _is_cpu_rvv_available:
+                _rvv_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            else:
+                assert False, "W8A8Int8MoEMethod on CPU only works on AMX or RISC-V"
         else:
             layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
             layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
