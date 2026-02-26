@@ -30,10 +30,12 @@ include_directories(
 # Platform-specific library directory
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(PLAT_LIB_DIR "/usr/lib/x86_64-linux-gnu")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(PLAT_LIB_DIR "/usr/lib/aarch64-linux-gnu")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le|ppc64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le|ppc64")
     set(PLAT_LIB_DIR "/usr/lib/powerpc64le-linux-gnu")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+    include(${CMAKE_CURRENT_SOURCE_DIR}/riscv64/CMakeLists.riscv64.cmake)
 else()
     set(PLAT_LIB_DIR "/usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu")
 endif()
@@ -47,13 +49,16 @@ if(DEFINED ENV{CONDA_PREFIX})
     set(CONDA_INCLUDE_DIR "$ENV{CONDA_PREFIX}/include")
     include_directories(${CONDA_INCLUDE_DIR})
 
-    # Look for libnuma in Conda's lib directory
     find_library(NUMA_LIB numa HINTS "${CONDA_LIB_DIR}")
     if(NUMA_LIB)
         message(STATUS "Found libnuma: ${NUMA_LIB}")
     else()
-        message(FATAL_ERROR "libnuma not found in Conda environment at ${CONDA_LIB_DIR}\n"
-                            "Please install it using: conda install libnuma numactl\n")
+        if(RISCV64_SKIP_NUMA)
+            message(STATUS "Skipping libnuma for RISC-V.")
+        else()
+            message(FATAL_ERROR "libnuma not found in Conda environment at ${CONDA_LIB_DIR}\n"
+                "Please install it using: conda install libnuma numactl\n")
+        endif()
     endif()
 else()
     if(DEFINED ENV{VIRTUAL_ENV})
@@ -63,17 +68,23 @@ else()
         set(VENV_INCLUDE_DIR "$ENV{VIRTUAL_ENV}/include")
         include_directories(${VENV_INCLUDE_DIR})
     endif()
-    # Look for libnuma in system env paths
     find_library(NUMA_LIB numa)
     if(NUMA_LIB)
         message(STATUS "Found libnuma: ${NUMA_LIB}")
     else()
-        message(FATAL_ERROR "libnuma not found in system environment\n"
-                            "Please install it using: apt-get install libnuma numactl\n")
+        if(RISCV64_SKIP_NUMA)
+            message(STATUS "Skipping libnuma for RISC-V.")
+        else()
+            message(FATAL_ERROR "libnuma not found in system environment\n"
+                "Please install it using: apt-get install libnuma numactl\n")
+        endif()
     endif()
 endif()
 
 file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+    riscv64_filter_sources(SOURCES)
+endif()
 
 if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
     set(ENV{SGLANG_CPU_FP8_CVT_FTZ} "1")
@@ -84,17 +95,17 @@ if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
     add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
 endif()
 
-add_compile_options(
-    -O3
-    -Wno-unknown-pragmas
-    -march=native
-    -fopenmp
-)
+add_compile_options(-O3 -Wno-unknown-pragmas -fopenmp)
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+    add_compile_options(-march=native)
+endif()
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+    target_link_libraries(common_ops PRIVATE ${ARCH_LINK_LIBS})
+else()
+    target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})
+endif()
 target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 
-install(TARGETS common_ops
-    LIBRARY DESTINATION sgl_kernel
-)
+install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
