@@ -181,9 +181,23 @@ def is_host_cpu_arm64() -> bool:
     )
 
 
+def is_host_cpu_riscv() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("riscv64", "riscv32", "riscv")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
+
+
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
+    is_host_cpu_supported = (
+        is_host_cpu_x86() or is_host_cpu_arm64() or is_host_cpu_riscv()
+    )
+    # RISC-V: CPU engine is enabled by default
+    if is_host_cpu_riscv():
+        return os.getenv("SGLANG_USE_CPU_ENGINE", "1") == "1" and is_host_cpu_supported
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
@@ -292,6 +306,27 @@ def use_intel_amx_backend(layer):
     return getattr(layer, "use_intel_amx_backend", False)
 
 
+try:
+    # Check if RVV kernel is available in sgl_kernel
+    _is_riscv = is_host_cpu_riscv()
+    _has_sgl = hasattr(torch.ops, "sgl_kernel")
+    _has_linear = (
+        hasattr(torch.ops.sgl_kernel, "weight_packed_linear") if _has_sgl else False
+    )
+
+    _is_rvv_kernel_available = _is_riscv and _has_sgl and _has_linear
+except Exception:
+    _is_rvv_kernel_available = False
+
+
+def cpu_has_rvv_support():
+    return _is_rvv_kernel_available
+
+
+def use_riscv_rvv_backend(layer):
+    return getattr(layer, "use_riscv_rvv_backend", False)
+
+
 def xpu_has_xmx_support():
     # TODO: update with XPU capalibity query
     if is_xpu():
@@ -375,7 +410,7 @@ def get_float_env_var(name: str, default: float = 0.0) -> float:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "rvv"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -2017,6 +2052,8 @@ def get_device(device_id: Optional[int] = None) -> str:
     if is_cpu():
         if cpu_has_amx_support():
             logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        elif cpu_has_rvv_support():
+            logger.info("RISC-V RVV is detected, using CPU with RVV support.")
         else:
             logger.warning(
                 "CPU device enabled, using torch native backend, low performance expected."
@@ -3376,9 +3413,29 @@ def parse_lscpu_topology():
     # Parse only data lines (skip comments)
     cpu_info = []
     for line in output.splitlines():
-        if not line.startswith("#"):
-            cpu, core, socket, node = map(int, line.strip().split(","))
+        line = line.strip()
+        # Skip comments and empty lines
+        if not line or line.startswith("#"):
+            continue
+
+        # Split and validate
+        parts = line.split(",")
+        if len(parts) != 4:
+            # Skip malformed lines
+            continue
+
+        try:
+            cpu = int(parts[0])
+            core = int(parts[1])
+            socket = int(parts[2])
+            # RISC-V lscpu output format: CPU,Core,Socket,Node
+            # [(0,0,0,),(1,1,0,),(2,2,0,),(3,3,0,),(4,4,0,),(5,5,0,),(6,6,0,),(7,7,0,)]
+            # Handle empty Node field and treat empty as NUMA node 0
+            node = int(parts[3]) if parts[3].strip() else 0
             cpu_info.append((cpu, core, socket, node))
+        except ValueError:
+            # Skip lines with non-integer values
+            continue
 
     # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
     return cpu_info

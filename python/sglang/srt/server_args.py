@@ -38,6 +38,7 @@ from sglang.srt.utils.common import (
     check_pkg_version_at_least,
     configure_ipv6,
     cpu_has_amx_support,
+    cpu_has_rvv_support,
     get_bool_env_var,
     get_device,
     get_device_memory_capacity,
@@ -141,6 +142,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "rvv",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
@@ -886,7 +888,12 @@ class ServerArgs:
     def _handle_cpu_backends(self):
         if self.device == "cpu":
             if self.attention_backend is None:
-                self.attention_backend = "intel_amx"
+                if cpu_has_amx_support():
+                    self.attention_backend = "intel_amx"
+                elif cpu_has_rvv_support():
+                    self.attention_backend = "rvv"
+                else:
+                    self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
     def _handle_npu_backends(self):
