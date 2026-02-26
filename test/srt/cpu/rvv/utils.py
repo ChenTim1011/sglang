@@ -1,5 +1,19 @@
+import importlib.util
+
 import torch
 from torch.nn.functional import scaled_dot_product_attention
+
+
+def has_op(op_name: str) -> bool:
+    """Check if a specific operator is available in sgl_kernel."""
+    if not importlib.util.find_spec("sgl_kernel"):
+        return False
+    try:
+        getattr(torch.ops.sgl_kernel, op_name)
+        return True
+    except (AttributeError, RuntimeError):
+        return False
+
 
 # Precision tolerances for RVV tests
 precision = {
