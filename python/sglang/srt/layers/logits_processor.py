@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.rvv_utils import rvv_linear_forward
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     compute_temp_top_p_normalized_logprobs,
@@ -55,7 +56,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import (
+    is_npu,
+    use_intel_amx_backend,
+    use_riscv_rvv_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -885,6 +890,8 @@ class LogitsProcessor(nn.Module):
                     None,  # bias
                     True,  # is_vnni
                 )
+            elif use_riscv_rvv_backend(lm_head):
+                logits = rvv_linear_forward(hidden_states, lm_head)
             elif get_global_server_args().rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
                 logits = torch.matmul(
