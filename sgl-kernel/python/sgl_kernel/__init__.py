@@ -67,6 +67,7 @@ else:
         sgl_per_token_group_quant_int8,
         sgl_per_token_quant_fp8,
         shuffle_rows,
+        weight_packed_linear,
     )
     from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
     from sgl_kernel.kvcacheio import (
@@ -201,6 +202,7 @@ else:
         "tree_speculative_sampling_target_only",
         "verify_tree_greedy",
         "weak_ref_tensor",
+        "weight_packed_linear",
     ]
 
     if torch.version.hip is not None:
