@@ -11,6 +11,12 @@
 
 #include "vector_math.h"
 
+// Type trait to detect INT8-quantized KV types (used by decode and extend kernels).
+template <typename T>
+struct is_quantized : std::false_type {};
+template <>
+struct is_quantized<int8_t> : std::true_type {};
+
 namespace rvv_constants {
 inline constexpr int64_t BLOCK_N = 64;
 inline constexpr size_t MAX_VL_ELEMENTS_M4 = 32;
@@ -505,12 +511,15 @@ inline void quantize_row_int8_symmetric_auto(
 }
 
 template <typename scalar_t>
-inline void quantize_and_copy(int8_t* __restrict__ dst, const scalar_t* __restrict__ src, int64_t size, float scale) {
+inline void quantize_and_copy(
+    int8_t* __restrict__ dst, const scalar_t* __restrict__ src, int64_t size, float scale, float* scale_out = nullptr) {
   if (scale != 1.0f && scale > 0.0f) {
     quantize_row_int8_symmetric<scalar_t>(dst, src, size, scale);
+    if (scale_out) *scale_out = scale;
   } else {
     float computed_scale;
     quantize_row_int8_symmetric_auto<scalar_t>(dst, computed_scale, src, size);
+    if (scale_out) *scale_out = computed_scale;
   }
 }
 
