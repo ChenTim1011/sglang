@@ -112,6 +112,8 @@ void decode_attention_int8_cpu(
     at::Tensor& seq_lens,
     double sm_scale,
     double logit_cap,
+    at::Tensor k_scale_buf,
+    at::Tensor v_scale_buf,
     double k_scale,
     double v_scale);
 #endif
@@ -149,6 +151,8 @@ void extend_attention_int8_cpu(
     int64_t max_len_extend,
     double sm_scale,
     double logit_cap,
+    at::Tensor k_scale_buf,
+    at::Tensor v_scale_buf,
     double k_scale,
     double v_scale);
 #endif
@@ -449,7 +453,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "decode_attention_int8_cpu(Tensor query, Tensor k_cache, Tensor v_cache, Tensor(a!) output, Tensor key, "
       "Tensor value, Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, "
-      "float sm_scale, float logit_cap, float k_scale, float v_scale) -> ()");
+      "float sm_scale, float logit_cap, "
+      "Tensor k_scale_buf, Tensor v_scale_buf, float k_scale=1.0, float v_scale=1.0) -> ()");
   m.impl("decode_attention_int8_cpu", torch::kCPU, &decode_attention_int8_cpu);
 #endif  // CPU_CAPABILITY_RVV
 
@@ -465,8 +470,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "extend_attention_int8_cpu(Tensor q_extend, Tensor k_extend, Tensor v_extend, Tensor(a!) o_extend, Tensor "
       "k_buffer, Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor "
       "extend_seq_lens, "
-      "Tensor extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, float k_scale=1.0, "
-      "float v_scale=1.0) -> ()");
+      "Tensor extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, "
+      "Tensor k_scale_buf, Tensor v_scale_buf, float k_scale=1.0, float v_scale=1.0) -> ()");
   m.impl("extend_attention_int8_cpu", torch::kCPU, &extend_attention_int8_cpu);
 #endif  // CPU_CAPABILITY_RVV
 
