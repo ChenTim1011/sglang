@@ -951,6 +951,10 @@ class ServerArgs:
                 elif cpu_has_rvv_support():
                     self.attention_backend = "rvv"
                 else:
+                    logger.info(
+                        "No specialized CPU backend detected (AMX/RVV), using torch_native. "
+                        "Performance may be limited."
+                    )
                     self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
@@ -3379,8 +3383,16 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "bf16",
+                "bfloat16",
+                "fp4_e2m1",
+                "int8",
+            ],
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+. "int8" for INT8 KV cache (RVV/CPU only).',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
@@ -5657,6 +5669,13 @@ class ServerArgs:
         if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
+            )
+
+        # Check RVV-specific flags: int8 KV cache requires RVV hardware
+        if self.kv_cache_dtype == "int8" and not cpu_has_rvv_support():
+            raise ValueError(
+                "--kv-cache-dtype=int8 requires RISC-V hardware with RVV support. "
+                "This option is not supported on the current platform."
             )
 
     def check_torch_2_9_1_cudnn_compatibility(self):
