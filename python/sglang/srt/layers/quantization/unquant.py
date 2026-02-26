@@ -22,9 +22,14 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.rvv_utils import (
+    _rvv_process_weight_after_loading,
+    rvv_linear_forward,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    cpu_has_rvv_support,
     get_bool_env_var,
     is_cpu,
     is_hip,
@@ -33,6 +38,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
     use_intel_xpu_backend,
+    use_riscv_rvv_backend,
 )
 
 if TYPE_CHECKING:
@@ -43,6 +49,7 @@ if TYPE_CHECKING:
 
 
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu_rvv_available = cpu_has_rvv_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -129,6 +136,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        elif _is_cpu and _is_cpu_rvv_available:
+            _rvv_process_weight_after_loading(layer, ["weight"])
 
     def apply(
         self,
@@ -149,6 +158,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+        elif use_riscv_rvv_backend(layer):
+            return rvv_linear_forward(x, layer, bias)
 
         return F.linear(x, layer.weight, bias)
 
@@ -243,6 +254,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+        elif _is_cpu and _is_cpu_rvv_available:
+            _rvv_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
