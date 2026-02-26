@@ -19,6 +19,9 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 #include "shm.h"
+#if defined(CPU_CAPABILITY_RVV)
+#include "riscv64/vector_helpers.h"
+#endif
 
 // silu_and_mul
 at::Tensor silu_and_mul_cpu(at::Tensor& input);
@@ -93,6 +96,26 @@ void decode_attention_cpu(
     double sm_scale,
     double logit_cap);
 
+// decode_int8 - RVV only
+#if defined(CPU_CAPABILITY_RVV)
+void decode_attention_int8_cpu(
+    at::Tensor& query,
+    at::Tensor& k_cache,
+    at::Tensor& v_cache,
+    at::Tensor& output,
+    at::Tensor& key,
+    at::Tensor& value,
+    at::Tensor& loc,
+    at::Tensor& attn_logits,
+    at::Tensor& req_to_token,
+    at::Tensor& req_pool_indices,
+    at::Tensor& seq_lens,
+    double sm_scale,
+    double logit_cap,
+    double k_scale,
+    double v_scale);
+#endif
+
 void extend_attention_cpu(
     at::Tensor& q_extend,
     at::Tensor& k_extend,
@@ -109,7 +132,29 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap);
 
-// flash attention
+// extend_int8 - RVV only
+#if defined(CPU_CAPABILITY_RVV)
+void extend_attention_int8_cpu(
+    at::Tensor& q_extend,
+    at::Tensor& k_extend,
+    at::Tensor& v_extend,
+    at::Tensor& o_extend,
+    at::Tensor& k_buffer,
+    at::Tensor& v_buffer,
+    at::Tensor& req_to_token,
+    at::Tensor& req_pool_indices,
+    at::Tensor& seq_lens,
+    at::Tensor& extend_seq_lens,
+    at::Tensor& extend_start_loc,
+    int64_t max_len_extend,
+    double sm_scale,
+    double logit_cap,
+    double k_scale,
+    double v_scale);
+#endif
+
+// flash attention (not supported on RISC-V)
+#if !defined(CPU_CAPABILITY_RVV)
 at::Tensor flash_attn_varlen_func(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -119,6 +164,7 @@ at::Tensor flash_attn_varlen_func(
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
     bool causal);
+#endif
 
 // linear attention
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
@@ -181,13 +227,15 @@ at::Tensor int8_scaled_mm_with_quant(
     at::ScalarType out_dtype,
     bool is_vnni);
 
-// int4 gemm
+// int4 gemm (not supported on RISC-V)
+#if !defined(CPU_CAPABILITY_RVV)
 at::Tensor int4_scaled_mm_cpu(
     at::Tensor& x, at::Tensor& w, at::Tensor& w_zeros, at::Tensor& w_scales, std::optional<at::Tensor> bias);
 
 // weight prepack for int4 weights
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales);
+#endif
 
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
@@ -289,6 +337,7 @@ at::Tensor causal_conv1d_update_cpu(
     bool is_vnni);
 
 // shared memory init
+#if !defined(SGLANG_RISCV_NO_SHM)
 void initialize(int64_t size, int64_t rank);
 
 // shared mmeory all_reduce
@@ -296,6 +345,7 @@ void shm_allreduce(at::Tensor& data, int64_t op);
 
 // shared memory all_gather
 at::Tensor shm_allgather(at::Tensor& data, int64_t dim);
+#endif
 
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
@@ -307,7 +357,9 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     bool is_neox);
 
 // CPU and memory binding
+#if !defined(SGLANG_RISCV_NO_NUMA)
 std::string init_cpu_threads_env(const std::string& cpu_ids);
+#endif
 
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
@@ -386,10 +438,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor key, Tensor value, "
+      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cache, Tensor(a!) output, Tensor key, Tensor value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
       "float logit_cap) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
+
+#if defined(CPU_CAPABILITY_RVV)
+  m.def(
+      "decode_attention_int8_cpu(Tensor query, Tensor k_cache, Tensor v_cache, Tensor(a!) output, Tensor key, "
+      "Tensor value, Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, "
+      "float sm_scale, float logit_cap, float k_scale, float v_scale) -> ()");
+  m.impl("decode_attention_int8_cpu", torch::kCPU, &decode_attention_int8_cpu);
+#endif  // CPU_CAPABILITY_RVV
 
   // extend
   m.def(
@@ -398,11 +458,29 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
-  // flash attn
+#if defined(CPU_CAPABILITY_RVV)
+  m.def(
+      "extend_attention_int8_cpu(Tensor q_extend, Tensor k_extend, Tensor v_extend, Tensor(a!) o_extend, Tensor "
+      "k_buffer, Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor "
+      "extend_seq_lens, "
+      "Tensor extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, float k_scale=1.0, "
+      "float v_scale=1.0) -> ()");
+  m.impl("extend_attention_int8_cpu", torch::kCPU, &extend_attention_int8_cpu);
+#endif  // CPU_CAPABILITY_RVV
+
+#if defined(CPU_CAPABILITY_RVV)
+  // Hardware VLEN detection: returns vlenb (= VLEN/8) at runtime.
+  m.def("get_rvv_vlenb() -> int");
+  m.impl("get_rvv_vlenb", torch::kCPU, []() -> int64_t { return rvv_get_vlenb(); });
+#endif  // CPU_CAPABILITY_RVV
+
+  // flash attn (not supported on RISC-V)
+#if !defined(CPU_CAPABILITY_RVV)
   m.def(
       "flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
       "int max_seqlen_q, int max_seqlen_k, bool causal) -> Tensor");
   m.impl("flash_attn_varlen_func", torch::kCPU, &flash_attn_varlen_func);
+#endif
 
   // linear attn
   m.def(
@@ -446,7 +524,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "is_vnni) -> Tensor");
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
 
-  // int4 gemm
+  // int4 gemm (not supported on RISC-V)
+#if !defined(CPU_CAPABILITY_RVV)
   m.def("int4_scaled_mm_cpu(Tensor x, Tensor w, Tensor w_zeros, Tensor w_scales, Tensor? bias) -> Tensor");
   m.impl("int4_scaled_mm_cpu", torch::kCPU, &int4_scaled_mm_cpu);
 
@@ -455,6 +534,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales) -> (Tensor, Tensor, "
       "Tensor)");
   m.impl("convert_weight_packed_scale_zp", torch::kCPU, &convert_weight_packed_scale_zp);
+#endif
 
   // bmm
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");
@@ -507,11 +587,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
 
   // all reduce
+#if !defined(SGLANG_RISCV_NO_SHM)
   m.def("initialize(int size, int rank) -> ()");
   m.def("shm_allreduce(Tensor(a!) data, int reduce_op) -> ()");
   m.impl("shm_allreduce", torch::kCPU, &shm_allreduce);
   m.def("shm_allgather(Tensor data, int dim) -> Tensor");
   m.impl("shm_allgather", torch::kCPU, &shm_allgather);
+#endif
 
   // rope
   m.def(
@@ -520,7 +602,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
 
   // CPU and memory binding
+#if !defined(SGLANG_RISCV_NO_NUMA)
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
+#endif
 
   // fused_sigmoid_gating_delta_rule_update
   m.def(
@@ -539,8 +623,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
+#if !defined(SGLANG_RISCV_NO_NUMA)
   m.impl("init_cpu_threads_env", init_cpu_threads_env);
+#endif
+#if !defined(SGLANG_RISCV_NO_SHM)
   m.impl("initialize", &initialize);
+#endif
 }
 
 REGISTER_EXTENSION(common_ops)
