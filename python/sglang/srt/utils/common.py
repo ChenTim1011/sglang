@@ -178,8 +178,24 @@ def is_host_cpu_arm64() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_host_cpu_riscv() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("riscv64", "riscv32", "riscv")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
+
+
+@lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
+    is_host_cpu_supported = (
+        is_host_cpu_x86() or is_host_cpu_arm64() or is_host_cpu_riscv()
+    )
+    # RISC-V has no GPU, so CPU engine defaults to enabled ("1").
+    # x86/arm default to disabled ("0") because GPU backends are typical.
+    if is_host_cpu_riscv():
+        return os.getenv("SGLANG_USE_CPU_ENGINE", "1") == "1" and is_host_cpu_supported
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
@@ -293,6 +309,30 @@ def use_intel_amx_backend(layer):
     return getattr(layer, "use_intel_amx_backend", False)
 
 
+_is_rvv_kernel_available: "bool | None" = None
+
+
+def cpu_has_rvv_support() -> bool:
+    global _is_rvv_kernel_available
+    if get_bool_env_var("SGLANG_DISABLE_RVV_KERNELS"):
+        _is_rvv_kernel_available = False
+        return False
+    if _is_rvv_kernel_available is None:
+        try:
+            if not is_host_cpu_riscv():
+                _is_rvv_kernel_available = False
+            else:
+                _probe = torch.ops.sgl_kernel.weight_packed_linear  # noqa: F841
+                _is_rvv_kernel_available = True
+        except Exception:
+            _is_rvv_kernel_available = False
+    return bool(_is_rvv_kernel_available)
+
+
+def use_riscv_rvv_backend(layer):
+    return getattr(layer, "use_riscv_rvv_backend", False)
+
+
 def xpu_has_xmx_support():
     # TODO: update with XPU capability query
     if is_xpu():
@@ -365,7 +405,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx", "ascend"]
+    return backend not in ["torch_native", "intel_amx", "ascend", "rvv"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -1806,6 +1846,8 @@ def get_device(device_id: Optional[int] = None) -> str:
     if is_cpu():
         if cpu_has_amx_support():
             logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        elif cpu_has_rvv_support():
+            logger.info("RISC-V RVV is detected, using CPU with RVV support.")
         else:
             logger.warning(
                 "CPU device enabled, using torch native backend, low performance expected."
@@ -3057,9 +3099,15 @@ def parse_lscpu_topology():
             if len(parts) != 4:
                 logger.warning("Skipping malformed lscpu line: %s", line.strip())
                 continue
-            cpu = int(parts[0])  # CPU id must always be present
-            core, socket, node = [int(p) if p else 0 for p in parts[1:]]
-            cpu_info.append((cpu, core, socket, node))
+            try:
+                cpu = int(parts[0])  # CPU id must always be present
+                core = int(parts[1])
+                socket = int(parts[2])
+                # RISC-V lscpu may have empty Node field; treat as NUMA node 0
+                node = int(parts[3]) if parts[3].strip() else 0
+                cpu_info.append((cpu, core, socket, node))
+            except ValueError:
+                continue
 
     # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
     return cpu_info
