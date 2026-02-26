@@ -1,0 +1,876 @@
+#if defined(CPU_CAPABILITY_RVV) && defined(__clang__)
+#pragma clang riscv intrinsic vector
+#endif
+
+#include "common.h"
+#include "vec.h"
+#include "vector_math.h"
+
+#if defined(CPU_CAPABILITY_RVV)
+// Clang 19+ version check
+#if !defined(__clang__) || !defined(__clang_major__) || __clang_major__ < 19
+#error "RVV backend requires Clang 19 or later. Please use Clang 19 or later to compile this file."
+#endif
+
+#include <riscv_vector.h>
+
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include "riscv64/gemm.h"
+#include "vector_helpers.h"
+
+static int compute_buffer_size_per_thread(int head_size, int head_size_v) {
+  constexpr int BLOCK_M = 32;
+  constexpr int BLOCK_N = 32;
+  // Allocation order in AlignedArena:
+  // 1. s_i: float[BLOCK_M * BLOCK_N]
+  // 2. v_prime: float[BLOCK_M * head_size_v]
+  // 3. Btmp: scalar_t[BLOCK_N * max(head_size, head_size_v)]
+  // 4. k_trans: scalar_t[MAX_HEAD_SIZE * 64] (Shared FP/INT8)
+  // 5. v_buf: scalar_t[64 * MAX_HEAD_SIZE] (Shared FP/INT8)
+
+  int size = 0;
+  size += BLOCK_M * BLOCK_N * sizeof(float);
+  size += BLOCK_M * head_size_v * sizeof(float);
+  size += BLOCK_N * std::max(head_size, head_size_v) * 4;  // worst case sizeof(scalar_t)=4
+  size += MAX_HEAD_SIZE * 64 * 4;                          // worst case sizeof(scalar_t)=4
+  size += 64 * MAX_HEAD_SIZE * 4;                          // worst case sizeof(scalar_t)=4
+
+  // Add alignment overhead (64 bytes per allocation, worst case)
+  return size + 64 * 5;
+}
+
+inline void softmax_update_row(
+    float* row, float* vp_row, float& m_acc, float& l_acc, int n_size, int head_size_v, float logit_cap) {
+  // 1. Find max in current block (s_i)
+  size_t vl_max = __riscv_vsetvlmax_e32m8();
+  vfloat32m8_t v_max = __riscv_vfmv_v_f_f32m8(-INFINITY, vl_max);
+  for (int j = 0; j < n_size; j += vl_max) {
+    size_t vl = __riscv_vsetvl_e32m8(n_size - j);
+    vfloat32m8_t v_s = __riscv_vle32_v_f32m8(row + j, vl);
+    if (logit_cap > 0.0f) {
+      v_s = __riscv_vfmul_vf_f32m8(v_s, 1.0f / logit_cap, vl);
+      v_s = vftanh_f32m8(v_s, vl);
+      v_s = __riscv_vfmul_vf_f32m8(v_s, logit_cap, vl);
+    }
+    v_max = __riscv_vfmax_vv_f32m8(v_max, v_s, vl);
+    __riscv_vse32_v_f32m8(row + j, v_s, vl);  // Store back potentially capped values
+  }
+  float m_block =
+      __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m8_f32m1(v_max, __riscv_vfmv_s_f_f32m1(-INFINITY, 1), vl_max));
+
+  // 2. Update global max and rescaling factor
+  float m_new = std::max(m_acc, m_block);
+  float alpha = expf(m_acc - m_new);
+  m_acc = m_new;
+
+  // 3. Rescale existing v_prime
+  for (int d = 0; d < head_size_v; d += vl_max) {
+    size_t vl = __riscv_vsetvl_e32m8(head_size_v - d);
+    vfloat32m8_t v_vp = __riscv_vle32_v_f32m8(vp_row + d, vl);
+    v_vp = __riscv_vfmul_vf_f32m8(v_vp, alpha, vl);
+    __riscv_vse32_v_f32m8(vp_row + d, v_vp, vl);
+  }
+
+  // 4. Compute exp(s - m_new) and sum
+  vfloat32m8_t v_l_block = __riscv_vfmv_v_f_f32m8(0.0f, vl_max);
+  for (int j = 0; j < n_size; j += vl_max) {
+    size_t vl = __riscv_vsetvl_e32m8(n_size - j);
+    vfloat32m8_t v_s = __riscv_vle32_v_f32m8(row + j, vl);
+    v_s = __riscv_vfsub_vf_f32m8(v_s, m_new, vl);
+    vfloat32m8_t v_exp = vfexp_f32m8(v_s, vl);
+    __riscv_vse32_v_f32m8(row + j, v_exp, vl);  // Store exp values for Stage 2 usage
+    v_l_block = __riscv_vfadd_vv_f32m8(v_l_block, v_exp, vl);
+  }
+  float l_block =
+      __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m8_f32m1(v_l_block, __riscv_vfmv_s_f_f32m1(0.0f, 1), vl_max));
+
+  // 5. Update global sum
+  l_acc = l_acc * alpha + l_block;
+}
+
+template <typename scalar_t, typename kv_t, typename index_t>
+void extend_attention_kernel_impl(
+    scalar_t* __restrict__ o_extend,
+    const scalar_t* __restrict__ q_extend,
+    const scalar_t* __restrict__ k_extend,
+    const scalar_t* __restrict__ v_extend,
+    const kv_t* __restrict__ k_buffer,
+    const kv_t* __restrict__ v_buffer,
+    const index_t* __restrict__ req_to_token,
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ seq_lens,
+    const index_t* __restrict__ extend_seq_lens,
+    const index_t* __restrict__ extend_start_loc,
+    const void* __restrict__ buffer,
+    int batches,
+    int num_heads,
+    int num_heads_kv,
+    int head_size,
+    int head_size_v,
+    int o_strideM,
+    int o_strideH,
+    int q_strideM,
+    int q_strideH,
+    int ke_strideN,
+    int ke_strideH,
+    int ve_strideN,
+    int ve_strideH,
+    int k_strideN,
+    int k_strideH,
+    int v_strideN,
+    int v_strideH,
+    float scaling,
+    float logit_cap,
+    int max_num_reqs,
+    int max_context_len,
+    int max_total_num_tokens,
+    int max_len_extend,
+    int buffer_size_per_thread,
+    bool is_prefix_skipped,
+    float k_scale = 1.0f,
+    float v_scale = 1.0f,
+    const float* k_scale_buf = nullptr,    // [max_tokens * num_heads_kv]; per-token K scales
+    const float* v_scale_buf = nullptr) {  // [max_tokens * num_heads_kv]; per-token V scales
+  TORCH_CHECK(
+      head_size <= MAX_HEAD_SIZE && head_size_v <= MAX_HEAD_SIZE,
+      "extend_attention: head_size (",
+      head_size,
+      ") or head_size_v (",
+      head_size_v,
+      ") exceeds MAX_HEAD_SIZE (",
+      MAX_HEAD_SIZE,
+      ")");
+
+  constexpr bool IS_INT8 = is_quantized<kv_t>::value;
+
+  const int BLOCK_M = 32;
+  const int BLOCK_N = 32;
+
+  const int num_groups = num_heads / num_heads_kv;
+  int MB = div_up(max_len_extend, BLOCK_M);
+
+  at::parallel_for(0, batches * num_heads * MB, 0, [&](int64_t begin, int64_t end) {
+    int64_t b{0}, h{0}, mb{0};
+    int64_t batches_i64 = static_cast<int64_t>(batches);
+    int64_t num_heads_i64 = static_cast<int64_t>(num_heads);
+    int64_t MB_i64 = static_cast<int64_t>(MB);
+
+    data_index_init(begin, b, batches_i64, h, num_heads_i64, mb, MB_i64);
+
+    int tid = at::get_thread_num();
+    char* thread_buffer = reinterpret_cast<char*>(const_cast<void*>(buffer)) + tid * buffer_size_per_thread;
+
+    // Buffer allocation using AlignedArena
+    AlignedArena arena(thread_buffer);
+
+    // 1. Accumulation buffer (Score)
+    float* s_i = arena.alloc<float>(BLOCK_M * BLOCK_N);
+
+    // 2. Accumulation buffer (Value)
+    float* v_prime = arena.alloc<float>(BLOCK_M * head_size_v);
+
+    // 3. Temporary buffer for GEMM (B matrix)
+    // Size cover both head_size (for Q@K) and head_size_v (for S@V)
+    scalar_t* Btmp = arena.alloc<scalar_t>(BLOCK_N * std::max(head_size, head_size_v));
+
+    // 4. Transposed Key buffer (Shared implementation)
+    // If IS_INT8, we reuse this memory as int8_t*, otherwise strictly scalar_t*
+    scalar_t* k_trans_buf_fp = arena.alloc<scalar_t>(MAX_HEAD_SIZE * 64);
+    int8_t* k_trans_buf_int8 = reinterpret_cast<int8_t*>(k_trans_buf_fp);
+
+    // 5. Value buffer (Shared implementation)
+    scalar_t* v_buf_fp = arena.alloc<scalar_t>(64 * MAX_HEAD_SIZE);
+    int8_t* v_buf_int8 = reinterpret_cast<int8_t*>(v_buf_fp);
+
+    // Thread-local scalars
+    alignas(64) float l_acc[32];
+    alignas(64) float m_acc[32];
+
+    for (int64_t i = begin; i < end; ++i) {
+      int head_kv_id = h / num_groups;
+      int64_t seq_len = seq_lens[b];
+      int64_t extend_len = static_cast<int64_t>(extend_seq_lens[b]);
+      int64_t prefix_len = seq_len - extend_len;
+      int64_t start_loc = static_cast<int64_t>(extend_start_loc[b]);
+      int64_t req_idx = req_pool_indices[b];
+
+      if (is_prefix_skipped) {
+        TORCH_CHECK(
+            prefix_len == 0, "extend attention: expect prefix_len to be 0 when prefix is skipped, got ", prefix_len);
+      }
+
+      int m_start = mb * BLOCK_M;
+      int m_size = std::min((int64_t)BLOCK_M, extend_len - m_start);
+
+      if (m_size <= 0) {
+        data_index_step(b, batches_i64, h, num_heads_i64, mb, MB_i64);
+        continue;
+      }
+
+      const scalar_t* q_ptr = q_extend + h * q_strideH + (start_loc + m_start) * q_strideM;
+      scalar_t* o_ptr = o_extend + h * o_strideH + (start_loc + m_start) * o_strideM;
+
+      // Reset accumulators
+      fill_stub<float>(l_acc, 0.0f, m_size);
+      fill_stub<float>(m_acc, -std::numeric_limits<float>::infinity(), m_size);
+      fill_stub<float>(v_prime, 0.0f, m_size * head_size_v);
+
+      // STAGE 1: PREFIX (KV Cache)
+      if (prefix_len > 0) {
+        for (int n_start = 0; n_start < prefix_len; n_start += BLOCK_N) {
+          int n_size = std::min((int64_t)BLOCK_N, prefix_len - n_start);
+
+          // Prefetch next chunk
+          if (n_start + BLOCK_N < prefix_len) {
+            int next_idx = req_to_token[req_idx * max_context_len + n_start + BLOCK_N];
+            const kv_t* k_next = k_buffer + next_idx * k_strideN + head_kv_id * k_strideH;
+            __builtin_prefetch(k_next, 0, 1);
+          }
+
+          // 1. Pack/Transpose K
+          if constexpr (IS_INT8) {
+            float k_scales_block[BLOCK_N];
+            for (int j = 0; j < n_size; ++j) {
+              int token_idx = req_to_token[req_idx * max_context_len + n_start + j];
+              const int8_t* k_src =
+                  reinterpret_cast<const int8_t*>(k_buffer + token_idx * k_strideN + head_kv_id * k_strideH);
+
+              // Pre-gather per-token K scale (or fall back to global k_scale)
+              k_scales_block[j] = k_scale_buf ? k_scale_buf[token_idx * num_heads_kv + head_kv_id] : k_scale;
+
+              bool src_aligned = (reinterpret_cast<uintptr_t>(k_src) % 8 == 0);
+              bool dst_aligned = (reinterpret_cast<uintptr_t>(k_trans_buf_int8) % 8 == 0);
+              if (src_aligned && dst_aligned && (head_size % 8 == 0)) {
+                size_t vl_max = __riscv_vsetvlmax_e8m4();
+                for (int d = 0; d < head_size; d += vl_max) {
+                  size_t vl = __riscv_vsetvl_e8m4(head_size - d);
+                  vint8m4_t v = __riscv_vle8_v_i8m4(k_src + d, vl);
+                  __riscv_vsse8_v_i8m4(k_trans_buf_int8 + d * BLOCK_N + j, BLOCK_N, v, vl);
+                }
+              } else {
+                // Fallback: scalar copy for unaligned access
+                for (int d = 0; d < head_size; ++d) {
+                  k_trans_buf_int8[d * BLOCK_N + j] = k_src[d];
+                }
+              }
+            }
+            gemm_nt_tiled_transposed_int8(
+                q_ptr,
+                k_trans_buf_int8,
+                s_i,
+                m_size,
+                n_size,
+                head_size,
+                q_strideM,
+                BLOCK_N,
+                BLOCK_N,
+                scaling,
+                k_scale,
+                k_scales_block);
+          } else {
+            // 1. Load token indices
+            size_t vl_max = __riscv_vsetvlmax_e64m8();
+            size_t vl = __riscv_vsetvl_e64m8(n_size);
+            vuint64m8_t v_offsets;
+
+            if constexpr (sizeof(index_t) == 8) {
+              vint64m8_t v_idx =
+                  __riscv_vle64_v_i64m8((const int64_t*)&req_to_token[req_idx * max_context_len + n_start], vl);
+              v_offsets = __riscv_vreinterpret_v_i64m8_u64m8(v_idx);
+            } else {
+              // index_t is int32_t: Load 32-bit and zero-extend to 64-bit
+              size_t vl_32 = __riscv_vsetvl_e32m4(n_size);
+              vint32m4_t v_idx32 =
+                  __riscv_vle32_v_i32m4((const int32_t*)&req_to_token[req_idx * max_context_len + n_start], vl_32);
+              // Zero-extend: i32m4 -> u32m4 -> u64m8
+              vuint32m4_t v_u32 = __riscv_vreinterpret_v_i32m4_u32m4(v_idx32);
+              vuint64m8_t v_u64 = __riscv_vzext_vf2_u64m8(v_u32, vl);
+              v_offsets = v_u64;
+            }
+
+            // 2. Compute Base Offsets: token_idx * k_strideN + head_offset
+            size_t strideN_bytes = k_strideN * sizeof(kv_t);
+            size_t head_offset_bytes = head_kv_id * k_strideH * sizeof(kv_t);
+
+            v_offsets = __riscv_vmul_vx_u64m8(v_offsets, strideN_bytes, vl);
+            v_offsets = __riscv_vadd_vx_u64m8(v_offsets, head_offset_bytes, vl);
+
+            // 3. Gather Loop over 'd'
+            const kv_t* base_ptr = k_buffer;
+
+            for (int d = 0; d < head_size; ++d) {
+              if constexpr (sizeof(scalar_t) == 2) {
+                // FP16/BF16: Raw 16-bit gather+store (no widening needed)
+                // GEMM handles widening to FP32 internally)
+                vuint16m2_t v_val = __riscv_vluxei64_v_u16m2((const uint16_t*)base_ptr, v_offsets, vl);
+                __riscv_vse16_v_u16m2(reinterpret_cast<uint16_t*>(k_trans_buf_fp + d * BLOCK_N), v_val, vl);
+              } else {
+                // FP32 -> Direct Load
+                vfloat32m4_t v_val = __riscv_vluxei64_v_f32m4((const float*)base_ptr, v_offsets, vl);
+                __riscv_vse32_v_f32m4(k_trans_buf_fp + d * BLOCK_N, v_val, vl);
+              }
+
+              // Increment offsets for next element
+              v_offsets = __riscv_vadd_vx_u64m8(v_offsets, sizeof(kv_t), vl);
+            }
+
+            gemm_nt_tiled_transposed(
+                q_ptr, k_trans_buf_fp, s_i, m_size, n_size, head_size, q_strideM, BLOCK_N, BLOCK_N, scaling);
+          }
+
+          // 2. Softmax Update (Online) using helper
+          for (int r = 0; r < m_size; ++r) {
+            softmax_update_row(
+                s_i + r * BLOCK_N, v_prime + r * head_size_v, m_acc[r], l_acc[r], n_size, head_size_v, logit_cap);
+          }
+
+          // 3. GEMM: Score @ V
+          if constexpr (IS_INT8) {
+            float v_scales_block[BLOCK_N];
+            for (int j = 0; j < n_size; ++j) {
+              int token_idx = req_to_token[req_idx * max_context_len + n_start + j];
+              const int8_t* v_src =
+                  reinterpret_cast<const int8_t*>(v_buffer + token_idx * v_strideN + head_kv_id * v_strideH);
+
+              // Pre-gather per-token V scale (or fall back to global v_scale)
+              v_scales_block[j] = v_scale_buf ? v_scale_buf[token_idx * num_heads_kv + head_kv_id] : v_scale;
+
+              bool v_src_aligned = (reinterpret_cast<uintptr_t>(v_src) % 8 == 0);
+              bool v_dst_aligned = (reinterpret_cast<uintptr_t>(v_buf_int8) % 8 == 0);
+              if (v_src_aligned && v_dst_aligned && (head_size_v % 8 == 0)) {
+                size_t vl_max = __riscv_vsetvlmax_e8m4();
+                for (int d = 0; d < head_size_v; d += vl_max) {
+                  size_t vl = __riscv_vsetvl_e8m4(head_size_v - d);
+                  vint8m4_t v = __riscv_vle8_v_i8m4(v_src + d, vl);
+                  __riscv_vse8_v_i8m4(v_buf_int8 + j * head_size_v + d, v, vl);
+                }
+              } else {
+                // Fallback: memcpy for unaligned access
+                int8_t* v_dst = v_buf_int8 + j * head_size_v;
+                std::memcpy(v_dst, v_src, head_size_v * sizeof(int8_t));
+              }
+            }
+            gemm_nn_tiled_int8(
+                s_i, v_buf_int8, v_prime, m_size, n_size, head_size_v, BLOCK_N, head_size_v, v_scale, v_scales_block);
+          } else {
+            for (int j = 0; j < n_size; ++j) {
+              int token_idx = req_to_token[req_idx * max_context_len + n_start + j];
+              const kv_t* v_src = v_buffer + token_idx * v_strideN + head_kv_id * v_strideH;
+              scalar_t* v_dst = v_buf_fp + j * head_size_v;
+              copy_stub(v_dst, v_src, head_size_v);
+            }
+            gemm_nn_tiled(s_i, v_buf_fp, v_prime, m_size, n_size, head_size_v, BLOCK_N, head_size_v);
+          }
+        }
+      }  // End Prefix
+
+      // STAGE 2: EXTEND (Self-Attention)
+      int num_keys = std::min((int64_t)(m_start + BLOCK_M), extend_len);
+      for (int n_start = 0; n_start < num_keys; n_start += BLOCK_N) {
+        int n_size = std::min(BLOCK_N, num_keys - n_start);
+
+        // Prefetch next block
+        if (n_start + BLOCK_N < num_keys) {
+          const scalar_t* next_k =
+              k_extend + start_loc * ke_strideN + head_kv_id * ke_strideH + (n_start + BLOCK_N) * ke_strideN;
+          __builtin_prefetch(next_k, 0, 1);
+        }
+
+        const scalar_t* k_src_base = k_extend + start_loc * ke_strideN + head_kv_id * ke_strideH;
+
+        {
+          size_t stride_bytes = ke_strideN * sizeof(scalar_t);
+          if (head_size % 4 == 0) {
+            for (int d = 0; d < head_size; ++d) {
+              size_t vl = __riscv_vsetvl_e32m4(n_size);
+              const scalar_t* src_d = k_src_base + n_start * ke_strideN + d;
+
+              if constexpr (sizeof(scalar_t) == 2) {
+                size_t vl_16 = __riscv_vsetvl_e16m2(n_size);
+                vuint16m2_t v_16 = __riscv_vlse16_v_u16m2((const uint16_t*)src_d, stride_bytes, vl_16);
+                __riscv_vse16_v_u16m2(reinterpret_cast<uint16_t*>(k_trans_buf_fp + d * BLOCK_N), v_16, vl_16);
+              } else {
+                vfloat32m4_t v_col = __riscv_vlse32_v_f32m4((const float*)src_d, stride_bytes, vl);
+                __riscv_vse32_v_f32m4(k_trans_buf_fp + d * BLOCK_N, v_col, vl);
+              }
+            }
+          } else {
+            for (int j = 0; j < n_size; ++j) {
+              const scalar_t* src_tok = k_src_base + (n_start + j) * ke_strideN;
+              for (int d = 0; d < head_size; ++d) {
+                k_trans_buf_fp[d * BLOCK_N + j] = src_tok[d];
+              }
+            }
+          }
+        }
+
+        gemm_nt_tiled_transposed(
+            q_ptr, k_trans_buf_fp, s_i, m_size, n_size, head_size, q_strideM, BLOCK_N, BLOCK_N, scaling);
+
+        // Causal mask: key position must be <= query position
+        for (int r = 0; r < m_size; ++r) {
+          int m_pos = m_start + r;
+          float* row = s_i + r * BLOCK_N;
+
+          size_t vl_max = __riscv_vsetvlmax_e32m2();
+          for (int c = 0; c < n_size; c += vl_max) {
+            size_t vl = __riscv_vsetvl_e32m2(n_size - c);
+
+            // Key position within this batch's extend: n_start + c + lane_id
+            vuint32m2_t vid = __riscv_vid_v_u32m2(vl);
+            vuint32m2_t vn_pos = __riscv_vadd_vx_u32m2(vid, n_start + c, vl);
+
+            // Mask future keys: k_pos > q_pos → illegal (causal)
+            vbool16_t mask = __riscv_vmsgtu_vx_u32m2_b16(vn_pos, (uint32_t)m_pos, vl);
+
+            // Masked Store -inf
+            vfloat32m2_t v_inf = __riscv_vfmv_v_f_f32m2(-std::numeric_limits<float>::infinity(), vl);
+            vfloat32m2_t v_row = __riscv_vle32_v_f32m2(row + c, vl);
+            v_row = __riscv_vmerge_vvm_f32m2(v_row, v_inf, mask, vl);
+            __riscv_vse32_v_f32m2(row + c, v_row, vl);
+          }
+
+          // Softmax Update (Logit Cap + Max/Sum)
+          softmax_update_row(
+              s_i + r * BLOCK_N, v_prime + r * head_size_v, m_acc[r], l_acc[r], n_size, head_size_v, logit_cap);
+        }
+
+        const scalar_t* v_src_base = v_extend + start_loc * ve_strideN + head_kv_id * ve_strideH;
+        for (int j = 0; j < n_size; ++j) {
+          const scalar_t* v_src = v_src_base + (n_start + j) * ve_strideN;
+          scalar_t* v_dst = v_buf_fp + j * head_size_v;
+          copy_stub(v_dst, v_src, head_size_v);
+        }
+
+        gemm_nn_tiled(s_i, v_buf_fp, v_prime, m_size, n_size, head_size_v, BLOCK_N, head_size_v);
+      }  // End Extend
+
+      // Write Output - m2
+      for (int r = 0; r < m_size; ++r) {
+        float l_val = l_acc[r];
+        float inv_l = (l_val > 1e-6f) ? 1.0f / l_val : 0.0f;
+        float* vp_row = v_prime + r * head_size_v;
+        scalar_t* o_row = o_ptr + r * o_strideM;
+
+        size_t vl_max = __riscv_vsetvlmax_e32m2();
+        for (int d = 0; d < head_size_v; d += vl_max) {
+          size_t vl = __riscv_vsetvl_e32m2(head_size_v - d);
+          vfloat32m2_t v = __riscv_vle32_v_f32m2(vp_row + d, vl);
+          v = __riscv_vfmul_vf_f32m2(v, inv_l, vl);
+          store_from_float_m2(o_row + d, v, vl, reinterpret_cast<float*>(Btmp));
+        }
+      }
+
+      data_index_step(b, batches_i64, h, num_heads_i64, mb, MB_i64);
+    }
+  });
+}
+
+void extend_attention_cpu(
+    at::Tensor& q_extend,
+    at::Tensor& k_extend,
+    at::Tensor& v_extend,
+    at::Tensor& o_extend,
+    at::Tensor& k_buffer,
+    at::Tensor& v_buffer,
+    at::Tensor& req_to_token,
+    at::Tensor& req_pool_indices,
+    at::Tensor& seq_lens,
+    at::Tensor& extend_seq_lens,
+    at::Tensor& extend_start_loc,
+    int64_t max_len_extend,
+    double sm_scale,
+    double logit_cap) {
+  RECORD_FUNCTION(
+      "sgl-kernel::extend_attention_cpu",
+      std::vector<c10::IValue>(
+          {q_extend,
+           k_extend,
+           v_extend,
+           o_extend,
+           k_buffer,
+           v_buffer,
+           req_to_token,
+           req_pool_indices,
+           seq_lens,
+           extend_seq_lens,
+           extend_start_loc}));
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_extend);
+  CHECK_INPUT(o_extend);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_extend);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_extend);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
+
+  int num_seqs = seq_lens.size(0);
+  int64_t max_num_reqs = req_to_token.size(0);
+  int64_t max_context_len = req_to_token.size(1);
+  int64_t max_total_num_tokens = k_buffer.size(0);
+
+  int num_heads = q_extend.size(1);
+  int num_heads_kv = k_extend.size(1);
+  int head_size = q_extend.size(2);
+  int head_size_v = v_extend.size(2);
+
+  int q_strideM = q_extend.stride(0);
+  int q_strideH = q_extend.stride(1);
+  int o_strideM = o_extend.stride(0);
+  int o_strideH = o_extend.stride(1);
+  int ke_strideN = k_extend.stride(0);
+  int ke_strideH = k_extend.stride(1);
+  int ve_strideN = v_extend.stride(0);
+  int ve_strideH = v_extend.stride(1);
+
+  int k_strideN = k_buffer.stride(0);
+  int k_strideH = k_buffer.stride(1);
+  int v_strideN = v_buffer.stride(0);
+  int v_strideH = v_buffer.stride(1);
+
+  // check sizes
+  CHECK_EQ(req_pool_indices.size(0), num_seqs);
+  CHECK_EQ(extend_seq_lens.size(0), num_seqs);
+  CHECK_EQ(extend_start_loc.size(0), num_seqs);
+  CHECK_EQ(v_extend.size(1), num_heads_kv);
+  CHECK_EQ(k_buffer.size(1), v_buffer.size(1));
+
+  // MLA will skip prefix part
+  const bool is_prefix_skipped = k_buffer.size(1) != num_heads_kv;
+
+  // check index data types
+  const auto index_dtype = req_to_token.scalar_type();
+  TORCH_CHECK(
+      index_dtype == at::kInt || index_dtype == at::kLong,
+      "extend: expect req_to_token to be int32 or int64, got ",
+      index_dtype);
+  TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "extend: expect req_lens to be int64, got ", seq_lens.scalar_type());
+  TORCH_CHECK(
+      req_pool_indices.scalar_type() == at::kLong,
+      "extend: expect req_pool_indices to be int64, got ",
+      req_pool_indices.scalar_type());
+  TORCH_CHECK(
+      extend_seq_lens.scalar_type() == index_dtype && extend_start_loc.scalar_type() == index_dtype,
+      "extend: expect extend_seq_lens and extend_start_loc to have same dtype as req_to_token.");
+
+  // D and DV need to be 32x as we transpose by 512-bit (or matching RVV constraints)
+  TORCH_CHECK(head_size % 32 == 0, "invalid head_size ", head_size);
+  TORCH_CHECK(head_size_v % 32 == 0, "invalid head_size_v ", head_size_v);
+
+  // block size for query seq length
+  constexpr int BLOCK_M = 32;
+  // block size for key/value seq length
+  constexpr int BLOCK_N = 32;
+
+  int buffer_size = compute_buffer_size_per_thread(head_size, head_size_v);
+
+  int num_threads = at::get_num_threads();
+  auto buffer = at::empty({num_threads, buffer_size}, q_extend.options().dtype(at::kChar));
+
+  AT_DISPATCH_RVV_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
+    AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_kernel_indices", [&] {
+      extend_attention_kernel_impl<scalar_t, scalar_t, index_t>(
+          o_extend.data_ptr<scalar_t>(),
+          q_extend.data_ptr<scalar_t>(),
+          k_extend.data_ptr<scalar_t>(),
+          v_extend.data_ptr<scalar_t>(),
+          k_buffer.data_ptr<scalar_t>(),
+          v_buffer.data_ptr<scalar_t>(),
+          req_to_token.data_ptr<index_t>(),
+          req_pool_indices.data_ptr<int64_t>(),
+          seq_lens.data_ptr<int64_t>(),
+          extend_seq_lens.data_ptr<index_t>(),
+          extend_start_loc.data_ptr<index_t>(),
+          buffer.data_ptr(),
+          num_seqs,
+          num_heads,
+          num_heads_kv,
+          head_size,
+          head_size_v,
+          o_strideM,
+          o_strideH,
+          q_strideM,
+          q_strideH,
+          ke_strideN,
+          ke_strideH,
+          ve_strideN,
+          ve_strideH,
+          k_strideN,
+          k_strideH,
+          v_strideN,
+          v_strideH,
+          sm_scale,
+          logit_cap,
+          max_num_reqs,
+          max_context_len,
+          max_total_num_tokens,
+          max_len_extend,
+          buffer_size,
+          is_prefix_skipped);
+    });
+  });
+}
+
+template <typename scalar_t, typename index_t>
+void extend_set_kv_buffer_int8_quantize(
+    int8_t* __restrict__ k_buffer,
+    int8_t* __restrict__ v_buffer,
+    const scalar_t* __restrict__ k_extend,
+    const scalar_t* __restrict__ v_extend,
+    const index_t* __restrict__ req_to_token,
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ seq_lens,
+    const index_t* __restrict__ extend_seq_lens,
+    const index_t* __restrict__ extend_start_loc,
+    int num_seqs,
+    int num_heads_kv,
+    int head_size,
+    int head_size_v,
+    int k_strideN,
+    int k_strideH,
+    int v_strideN,
+    int v_strideH,
+    int ke_strideN,
+    int ke_strideH,
+    int ve_strideN,
+    int ve_strideH,
+    int max_context_len,
+    float k_scale,
+    float v_scale,
+    float* k_scale_buf = nullptr,    // [max_tokens * num_heads_kv]; written when k_scale==1.0
+    float* v_scale_buf = nullptr) {  // [max_tokens * num_heads_kv]; written when v_scale==1.0
+  at::parallel_for(0, num_seqs * num_heads_kv, 0, [&](int64_t begin, int64_t end) {
+    int64_t seq_idx{0}, head_kv_id{0};
+    int64_t num_seqs_i64 = static_cast<int64_t>(num_seqs);
+    int64_t num_heads_kv_i64 = static_cast<int64_t>(num_heads_kv);
+    data_index_init(begin, seq_idx, num_seqs_i64, head_kv_id, num_heads_kv_i64);
+
+    for (int64_t i = begin; i < end; i++) {
+      int64_t req_idx = req_pool_indices[seq_idx];
+      int64_t extend_len = static_cast<int64_t>(extend_seq_lens[seq_idx]);
+      int64_t start_loc = static_cast<int64_t>(extend_start_loc[seq_idx]);
+      int64_t seq_len = seq_lens[seq_idx];
+
+      // Calculate constant offsets for this sequence/head
+      int64_t prefix_len = seq_len - extend_len;
+      int64_t req_token_base_offset = req_idx * max_context_len;
+
+      // Base pointers for this head
+      const scalar_t* k_extend_curr = k_extend + start_loc * ke_strideN + head_kv_id * ke_strideH;
+      const scalar_t* v_extend_curr = v_extend + start_loc * ve_strideN + head_kv_id * ve_strideH;
+
+      int8_t* k_buffer_head_base = k_buffer + head_kv_id * k_strideH;
+      int8_t* v_buffer_head_base = v_buffer + head_kv_id * v_strideH;
+
+      for (int64_t t = 0; t < extend_len; ++t) {
+        int64_t token_idx = req_to_token[req_token_base_offset + prefix_len + t];
+
+        int8_t* k_buffer_ptr = k_buffer_head_base + token_idx * k_strideN;
+        int8_t* v_buffer_ptr = v_buffer_head_base + token_idx * v_strideN;
+
+        // On-the-fly quantization; write computed scale to side-buffer when available
+        float* k_scale_out = k_scale_buf ? (k_scale_buf + token_idx * num_heads_kv + head_kv_id) : nullptr;
+        float* v_scale_out = v_scale_buf ? (v_scale_buf + token_idx * num_heads_kv + head_kv_id) : nullptr;
+        quantize_and_copy<scalar_t>(k_buffer_ptr, k_extend_curr, head_size, k_scale, k_scale_out);
+        quantize_and_copy<scalar_t>(v_buffer_ptr, v_extend_curr, head_size_v, v_scale, v_scale_out);
+
+        // Pointer bump
+        k_extend_curr += ke_strideN;
+        v_extend_curr += ve_strideN;
+      }
+
+      data_index_step(seq_idx, num_seqs_i64, head_kv_id, num_heads_kv_i64);
+    }
+  });
+}
+
+void extend_attention_int8_cpu(
+    at::Tensor& q_extend,
+    at::Tensor& k_extend,
+    at::Tensor& v_extend,
+    at::Tensor& o_extend,
+    at::Tensor& k_buffer,
+    at::Tensor& v_buffer,
+    at::Tensor& req_to_token,
+    at::Tensor& req_pool_indices,
+    at::Tensor& seq_lens,
+    at::Tensor& extend_seq_lens,
+    at::Tensor& extend_start_loc,
+    int64_t max_len_extend,
+    double sm_scale,
+    double logit_cap,
+    at::Tensor k_scale_buf,  // float32 [max_tokens, num_kv_heads]; per-token K scales
+    at::Tensor v_scale_buf,  // float32 [max_tokens, num_kv_heads]; per-token V scales
+    double k_scale,
+    double v_scale) {
+  RECORD_FUNCTION(
+      "sgl-kernel::extend_attention_int8_cpu",
+      std::vector<c10::IValue>(
+          {q_extend,
+           k_extend,
+           v_extend,
+           o_extend,
+           k_buffer,
+           v_buffer,
+           req_to_token,
+           req_pool_indices,
+           seq_lens,
+           extend_seq_lens,
+           extend_start_loc}));
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_extend);
+  CHECK_INPUT(o_extend);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_extend);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_extend);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
+
+  int num_seqs = seq_lens.size(0);
+  int64_t max_num_reqs = req_to_token.size(0);
+  int64_t max_context_len = req_to_token.size(1);
+  int64_t max_total_num_tokens = k_buffer.size(0);
+
+  int num_heads = q_extend.size(1);
+  int num_heads_kv = k_extend.size(1);
+  int head_size = q_extend.size(2);
+  int head_size_v = v_extend.size(2);
+
+  int q_strideM = q_extend.stride(0);
+  int q_strideH = q_extend.stride(1);
+  int ke_strideN = k_extend.stride(0);
+  int ke_strideH = k_extend.stride(1);
+  int ve_strideN = v_extend.stride(0);
+  int ve_strideH = v_extend.stride(1);
+
+  int o_strideM = o_extend.stride(0);
+  int o_strideH = o_extend.stride(1);
+
+  int k_strideN = k_buffer.stride(0);
+  int k_strideH = k_buffer.stride(1);
+  int v_strideN = v_buffer.stride(0);
+  int v_strideH = v_buffer.stride(1);
+
+  // check sizes
+  CHECK_EQ(req_pool_indices.size(0), num_seqs);
+  CHECK_EQ(extend_seq_lens.size(0), num_seqs);
+  CHECK_EQ(extend_start_loc.size(0), num_seqs);
+  CHECK_EQ(v_extend.size(1), num_heads_kv);
+  CHECK_EQ(k_buffer.size(1), v_buffer.size(1));
+
+  // MLA will skip prefix part
+  bool is_prefix_skipped = k_buffer.size(1) != num_heads_kv;
+
+  // check index data types
+  const auto index_dtype = req_to_token.scalar_type();
+  TORCH_CHECK(
+      index_dtype == at::kInt || index_dtype == at::kLong,
+      "extend: expect req_to_token to be int32 or int64, got ",
+      index_dtype);
+  TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "extend: expect req_lens to be int64, got ", seq_lens.scalar_type());
+  TORCH_CHECK(
+      req_pool_indices.scalar_type() == at::kLong,
+      "extend: expect req_pool_indices to be int64, got ",
+      req_pool_indices.scalar_type());
+  TORCH_CHECK(
+      extend_seq_lens.scalar_type() == index_dtype && extend_start_loc.scalar_type() == index_dtype,
+      "extend: expect extend_seq_lens and extend_start_loc to have same dtype as req_to_token.");
+
+  // D and DV need to be 32x as we transpose by 512-bit (or matching RVV constraints)
+  TORCH_CHECK(head_size % 32 == 0, "invalid head_size ", head_size);
+  TORCH_CHECK(head_size_v % 32 == 0, "invalid head_size_v ", head_size_v);
+
+  // block size for query seq length
+  constexpr int BLOCK_M = 32;
+  // block size for key/value seq length
+  constexpr int BLOCK_N = 32;
+
+  int buffer_size = compute_buffer_size_per_thread(head_size, head_size_v);
+
+  int num_threads = at::get_num_threads();
+  auto buffer = at::empty({num_threads, buffer_size}, q_extend.options().dtype(at::kChar));
+
+  float* k_scale_buf_ptr = k_scale_buf.defined() ? k_scale_buf.data_ptr<float>() : nullptr;
+  float* v_scale_buf_ptr = v_scale_buf.defined() ? v_scale_buf.data_ptr<float>() : nullptr;
+
+  AT_DISPATCH_RVV_TYPES(q_extend.scalar_type(), "extend_attention_int8_cpu", [&] {
+    AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_int8_cpu_indices", [&] {
+      if (k_extend.scalar_type() != at::kChar) {
+        extend_set_kv_buffer_int8_quantize<scalar_t, index_t>(
+            (int8_t*)k_buffer.data_ptr(),
+            (int8_t*)v_buffer.data_ptr(),
+            k_extend.data_ptr<scalar_t>(),
+            v_extend.data_ptr<scalar_t>(),
+            req_to_token.data_ptr<index_t>(),
+            req_pool_indices.data_ptr<int64_t>(),
+            seq_lens.data_ptr<int64_t>(),
+            extend_seq_lens.data_ptr<index_t>(),
+            extend_start_loc.data_ptr<index_t>(),
+            num_seqs,
+            num_heads_kv,
+            head_size,
+            head_size_v,
+            k_strideN,
+            k_strideH,
+            v_strideN,
+            v_strideH,
+            ke_strideN,
+            ke_strideH,
+            ve_strideN,
+            ve_strideH,
+            max_context_len,
+            k_scale,
+            v_scale,
+            k_scale_buf_ptr,
+            v_scale_buf_ptr);
+      }
+
+      extend_attention_kernel_impl<scalar_t, int8_t, index_t>(
+          o_extend.data_ptr<scalar_t>(),
+          q_extend.data_ptr<scalar_t>(),
+          k_extend.data_ptr<scalar_t>(),
+          v_extend.data_ptr<scalar_t>(),
+          reinterpret_cast<const int8_t*>(k_buffer.data_ptr()),
+          reinterpret_cast<const int8_t*>(v_buffer.data_ptr()),
+          req_to_token.data_ptr<index_t>(),
+          req_pool_indices.data_ptr<int64_t>(),
+          seq_lens.data_ptr<int64_t>(),
+          extend_seq_lens.data_ptr<index_t>(),
+          extend_start_loc.data_ptr<index_t>(),
+          buffer.data_ptr(),
+          num_seqs,
+          num_heads,
+          num_heads_kv,
+          head_size,
+          head_size_v,
+          o_strideM,
+          o_strideH,
+          q_strideM,
+          q_strideH,
+          ke_strideN,
+          ke_strideH,
+          ve_strideN,
+          ve_strideH,
+          k_strideN,
+          k_strideH,
+          v_strideN,
+          v_strideH,
+          sm_scale,
+          logit_cap,
+          max_num_reqs,
+          max_context_len,
+          max_total_num_tokens,
+          max_len_extend,
+          buffer_size,
+          is_prefix_skipped,
+          k_scale,
+          v_scale,
+          k_scale_buf_ptr,
+          v_scale_buf_ptr);
+    });
+  });
+}
+
+#endif  // CPU_CAPABILITY_RVV
