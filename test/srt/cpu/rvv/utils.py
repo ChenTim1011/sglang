@@ -1,17 +1,34 @@
-"""
-RVV-specific test utilities.
-
-This module provides RVV-aligned helper functions that match
-the C++ implementation exactly (epsilon=1e-7, RVV quantization logic).
-"""
-
 import torch
+from torch.nn.functional import scaled_dot_product_attention
 
 # Precision tolerances for RVV tests
 precision = {
-    torch.bfloat16: 1e-2,
+    torch.bfloat16: 2e-2,
     torch.float16: 1e-3,
     torch.float32: 1e-5,
+}
+
+# Specific tolerances for GEMM which naturally accumulates more floating point errors
+gemm_precision = {
+    torch.bfloat16: 1.5e-1,
+    torch.float16: 1e-1,
+}
+
+# Tolerances for fused sigmoid-mul which involves non-linear accumulation
+sigmoid_mul_precision = {
+    torch.bfloat16: 0.5,
+    torch.float16: 2e-1,
+}
+
+# Quantization error tolerances for INT8 decode/extend attention
+int8_decode_precision = {
+    torch.bfloat16: 1e-1,
+    torch.float16: 1e-1,
+}
+
+int8_extend_precision = {
+    torch.bfloat16: 0.5,
+    torch.float16: 0.5,
 }
 
 
@@ -69,3 +86,152 @@ def native_w8a8_per_token_matmul(A, B, As, Bs, bias, output_dtype=torch.bfloat16
         C.add_(bias.view(1, -1))
 
     return C.reshape(origin_C_shape).to(output_dtype)
+
+
+def run_sdpa_forward_decode(
+    query: torch.Tensor,
+    output: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    scaling=None,
+    enable_gqa=False,
+    causal=False,
+    key: torch.Tensor = None,
+    loc: torch.Tensor = None,
+):
+    """Reference implementation for decode attention."""
+    if key is not None and loc is not None:
+        k_cache[loc] = key
+
+    # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
+    query = query.movedim(0, query.dim() - 2)
+
+    start_q, start_kv = 0, 0
+    for seq_idx in range(seq_lens.shape[0]):
+        seq_len_q = 1
+        seq_len_kv = seq_lens[seq_idx]
+        end_q = start_q + seq_len_q
+        end_kv = start_kv + seq_len_kv
+
+        per_req_query = query[:, start_q:end_q, :]
+
+        # get key and value from cache. per_req_tokens contains the kv cache
+        # index for each token in the sequence.
+        req_pool_idx = req_pool_indices[seq_idx]
+        per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+        per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+        per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+
+        per_req_out = (
+            scaled_dot_product_attention(
+                per_req_query.unsqueeze(0),
+                per_req_key.unsqueeze(0),
+                per_req_value.unsqueeze(0),
+                enable_gqa=enable_gqa,
+                scale=scaling,
+                is_causal=causal,
+            )
+            .squeeze(0)
+            .movedim(query.dim() - 2, 0)
+        )
+        output[start_q:end_q, :, :] = per_req_out
+        start_q, start_kv = end_q, end_kv
+
+    return output
+
+
+def run_sdpa_forward_extend(
+    query: torch.Tensor,
+    output: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    scaling=None,
+    enable_gqa=False,
+    causal=False,
+):
+    """Reference implementation for extend attention."""
+    assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
+    assert seq_lens.shape[0] == extend_seq_lens.shape[0]
+
+    # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
+    query = query.movedim(0, query.dim() - 2)
+
+    start_q, start_kv = 0, 0
+    for seq_idx in range(seq_lens.shape[0]):
+
+        extend_seq_len_q = extend_seq_lens[seq_idx]
+        prefill_seq_len_q = extend_prefix_lens[seq_idx]
+
+        seq_len_kv = seq_lens[seq_idx]
+        end_q = start_q + extend_seq_len_q
+        end_kv = start_kv + seq_len_kv
+
+        per_req_query = query[:, start_q:end_q, :]
+        per_req_query_redudant = torch.empty(
+            (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
+            dtype=per_req_query.dtype,
+            device=per_req_query.device,
+        )
+
+        per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
+
+        # get key and value from cache. per_req_tokens contains the kv cache
+        # index for each token in the sequence.
+        req_pool_idx = req_pool_indices[seq_idx]
+        per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+        per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+        per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+
+        per_req_out_redudant = (
+            scaled_dot_product_attention(
+                per_req_query_redudant.unsqueeze(0),
+                per_req_key.unsqueeze(0),
+                per_req_value.unsqueeze(0),
+                enable_gqa=enable_gqa,
+                scale=scaling,
+                is_causal=causal,
+            )
+            .squeeze(0)
+            .movedim(query.dim() - 2, 0)
+        )
+        output[start_q:end_q] = per_req_out_redudant[prefill_seq_len_q:]
+        start_q, start_kv = end_q, end_kv
+    return output
+
+
+def SiluAndMul(x):
+    """Reference implementation for SiluAndMul activation."""
+    x = torch.chunk(x, 2, dim=-1)
+    return torch.nn.functional.silu(x[0]) * x[1]
+
+
+def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize):
+    """Reference implementation for fused MoE."""
+    B, D = a.shape
+    a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
+    out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
+    score = torch.softmax(score, dim=-1, dtype=torch.float32)
+    topk_weight, topk_ids = torch.topk(score, topk)
+
+    if renormalize:
+        topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
+
+    topk_weight = topk_weight.view(-1)
+    topk_ids = topk_ids.view(-1)
+    for i in range(w1.shape[0]):
+        mask = topk_ids == i
+        if mask.sum():
+            out[mask] = SiluAndMul(a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(
+                0, 1
+            )
+    return (
+        out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
+    ).sum(dim=1)

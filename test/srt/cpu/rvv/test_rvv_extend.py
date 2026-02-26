@@ -2,7 +2,6 @@
 This file tests the RVV-optimized extend (prefill) attention kernel.
 Extend attention is used during the initial prompt processing phase.
 
-
 Features tested:
 - MHA (Multi-Head Attention): num_heads == num_heads_kv
 - GQA (Grouped Query Attention): num_heads != num_heads_kv
@@ -14,47 +13,24 @@ Usage:
     python3 test_rvv_extend.py -v                      # Run all tests
 """
 
-import sys
 import unittest
 
 import torch
 
-# Add parent directory to path to import test utilities
-sys.path.insert(0, "/workspace/sglang/test/srt/cpu")
-
-# Import existing test class to reuse reference implementation
-try:
-    from test_extend import TestExtendAttention
-except ImportError:
-    # Fallback for local development
-    import os
-
-    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, parent_dir)
-    from test_extend import TestExtendAttention
+from .utils import precision, run_sdpa_forward_extend
 
 torch.manual_seed(1234)
 
 
-class TestRVVExtendAttention(TestExtendAttention):
+class RVVExtendTestBase(unittest.TestCase):
     def setUp(self):
         self.device = torch.device("cpu")
         self.dtypes = [torch.float16, torch.bfloat16]
-
-    def test_extend_attention(self):
-        # Override base class
-        for is_mla in [True, False]:
-            self._test_extend_attention_once(1, 64, 1, 1, 128, 96, is_mla)
-            self._test_extend_attention_once(1, 64, 16, 1, 128, 96, is_mla)
-            self._test_extend_attention_once(2, 128, 16, 4, 128, 96, is_mla)
-            self._test_extend_attention_once(1, 128, 16, 1, 32, 32, is_mla)
 
     def _test_extend_attention_once(
         self, B, N_CTX, H_Q, H_KV, D, DV, mla=False, dtype=torch.bfloat16, logit_cap=0.0
     ):
         b_seq_len_prefix = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
-        if mla:
-            b_seq_len_prefix.zero_()
         b_seq_len_extend = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
         b_seq_len = b_seq_len_prefix + b_seq_len_extend
         max_len_in_batch = torch.max(b_seq_len, 0)[0].item()
@@ -98,11 +74,11 @@ class TestRVVExtendAttention(TestExtendAttention):
             )
 
         # q_extend, k_extend, v_extend, k_buffer and v_buffer supports non-contiguous tensors
-        q_extend = q_extend.transpose(0, 1).contiguous().transpose(0, 1)
-        k_extend = k_extend.transpose(0, 1).contiguous().transpose(0, 1)
-        v_extend = v_extend.transpose(0, 1).contiguous().transpose(0, 1)
-        k_buffer = k_buffer.transpose(0, 1).contiguous().transpose(0, 1)
-        v_buffer = v_buffer.transpose(0, 1).contiguous().transpose(0, 1)
+        q_extend_k = q_extend.transpose(0, 1).contiguous().transpose(0, 1)
+        k_extend_k = k_extend.transpose(0, 1).contiguous().transpose(0, 1)
+        v_extend_k = v_extend.transpose(0, 1).contiguous().transpose(0, 1)
+        k_buffer_k = k_buffer.transpose(0, 1).contiguous().transpose(0, 1)
+        v_buffer_k = v_buffer.transpose(0, 1).contiguous().transpose(0, 1)
 
         b_seq_len_extend = b_seq_len - b_seq_len_prefix
         b_start_loc_extend = torch.zeros_like(b_seq_len)
@@ -117,7 +93,7 @@ class TestRVVExtendAttention(TestExtendAttention):
 
         enable_gqa = H_Q != H_KV
         o_ref = torch.empty((extend_token_num, H_Q, DV), dtype=dtype)
-        self._run_sdpa_forward_extend(
+        run_sdpa_forward_extend(
             q_extend,
             o_ref,
             k_buffer,
@@ -134,12 +110,12 @@ class TestRVVExtendAttention(TestExtendAttention):
 
         o_extend = torch.empty((extend_token_num, H_Q, DV), dtype=dtype)
         torch.ops.sgl_kernel.extend_attention_cpu(
-            q_extend,
-            k_extend,
-            v_extend,
+            q_extend_k,
+            k_extend_k,
+            v_extend_k,
             o_extend,
-            k_buffer,
-            v_buffer,
+            k_buffer_k,
+            v_buffer_k,
             req_to_tokens,
             b_req_idx,
             b_seq_len,
@@ -150,75 +126,109 @@ class TestRVVExtendAttention(TestExtendAttention):
             logit_cap,
         )
 
-        torch.testing.assert_close(o_ref, o_extend, atol=1e-2, rtol=1e-2)
+        atol = rtol = precision[dtype]
+        if logit_cap > 0.0 and dtype == torch.float16:
+            atol = rtol = 1e-2
+        torch.testing.assert_close(o_ref, o_extend, atol=atol, rtol=rtol)
 
 
-class TestExtendAttentionMHA(TestRVVExtendAttention):
+class TestExtendAttentionMHA(RVVExtendTestBase):
     """
     Test RVV extend attention for MHA (Multi-Head Attention) path.
     """
 
-    def test_extend_basic(self):
-        """Basic MHA extend test"""
-        for dtype in self.dtypes:
-            self._test_extend_attention_once(
-                B=2, N_CTX=128, H_Q=16, H_KV=16, D=128, DV=96, dtype=dtype, mla=False
-            )
-
-    def test_extend_logit_cap(self):
-        """Edge case: logit_cap > 0 to test clamping logic"""
-        for dtype in self.dtypes:
-            self._test_extend_attention_once(
-                B=2,
-                N_CTX=128,
-                H_Q=16,
-                H_KV=16,
-                D=128,
-                DV=96,
-                dtype=dtype,
-                logit_cap=50.0,
-                mla=False,
-            )
-
-    def test_extend_odd_dimensions(self):
-        """Edge case: odd dimensions (tests tail handling in RVV loops)"""
-        for dtype in self.dtypes:
-            self._test_extend_attention_once(
-                B=2, N_CTX=64, H_Q=8, H_KV=8, D=32, DV=32, dtype=dtype, mla=False
-            )
-
-    def test_extend_large_batch(self):
-        """Stress test: large batch size"""
-        for dtype in self.dtypes:
-            self._test_extend_attention_once(
-                B=3, N_CTX=64, H_Q=8, H_KV=8, D=128, DV=96, dtype=dtype, mla=False
-            )
+    def test_mha_configs(self):
+        # Config format: (B, N_CTX, H_Q, H_KV, D, DV, logit_cap)
+        configs = [
+            (2, 128, 16, 16, 128, 96, 0.0),  # Basic MHA
+            (2, 64, 8, 8, 32, 32, 0.0),  # Odd dimensions tail handling
+            (4, 64, 8, 8, 128, 96, 0.0),  # Stress test: large batch
+            (2, 128, 16, 16, 128, 96, 50.0),  # Logit cap > 0
+            (1, 256, 4, 4, 64, 64, 0.0),  # Longer prompt context
+        ]
+        for B, N_CTX, H_Q, H_KV, D, DV, logit_cap in configs:
+            for dtype in self.dtypes:
+                with self.subTest(
+                    B=B,
+                    N_CTX=N_CTX,
+                    H_Q=H_Q,
+                    H_KV=H_KV,
+                    D=D,
+                    DV=DV,
+                    logit_cap=logit_cap,
+                    dtype=dtype,
+                ):
+                    self._test_extend_attention_once(
+                        B=B,
+                        N_CTX=N_CTX,
+                        H_Q=H_Q,
+                        H_KV=H_KV,
+                        D=D,
+                        DV=DV,
+                        mla=False,
+                        dtype=dtype,
+                        logit_cap=logit_cap,
+                    )
 
 
-class TestExtendAttentionGQA(TestRVVExtendAttention):
+class TestExtendAttentionGQA(RVVExtendTestBase):
     """
     Test RVV extend attention for GQA (Grouped Query Attention) path.
     """
 
-    def test_gqa_llama_style(self):
-        """Basic GQA test: LLaMA-style (32:8 head ratio)"""
-        for dtype in self.dtypes:
-            self._test_extend_attention_once(
-                B=2, N_CTX=128, H_Q=32, H_KV=8, D=128, DV=96, dtype=dtype, mla=False
-            )
+    def test_gqa_configs(self):
+        # Config format: (B, N_CTX, H_Q, H_KV, D, DV)
+        configs = [
+            (2, 128, 32, 8, 128, 96),  # LLaMA-style GQA (4:1)
+            (4, 128, 24, 4, 64, 64),  # 6:1 ratio
+            (1, 256, 16, 2, 128, 128),  # 8:1 ratio
+            (2, 64, 18, 3, 32, 32),  # Non-power-of-2 ratio
+        ]
+        for B, N_CTX, H_Q, H_KV, D, DV in configs:
+            for dtype in self.dtypes:
+                with self.subTest(
+                    B=B, N_CTX=N_CTX, H_Q=H_Q, H_KV=H_KV, D=D, DV=DV, dtype=dtype
+                ):
+                    self._test_extend_attention_once(
+                        B=B,
+                        N_CTX=N_CTX,
+                        H_Q=H_Q,
+                        H_KV=H_KV,
+                        D=D,
+                        DV=DV,
+                        mla=False,
+                        dtype=dtype,
+                    )
 
 
-class TestExtendAttentionMLA(TestRVVExtendAttention):
+class TestExtendAttentionMLA(RVVExtendTestBase):
     """
     Test RVV extend attention for MLA (Multi-Latent Attention) path - DeepSeek architecture.
     """
 
-    def test_mla_deepseek_style(self):
-        """Basic MLA test: DeepSeek-style configuration"""
-        for dtype in self.dtypes:
-            self._test_extend_attention_once(
-                B=2, N_CTX=128, H_Q=22, H_KV=1, D=192, DV=128, dtype=dtype, mla=True
-            )
+    def test_mla_configs(self):
+        """Exhaustive (carpet-search) test over multiple MLA configs."""
+        # Config format: (B, N_CTX, H_Q, H_KV, D, DV)
+        configs = [
+            (2, 128, 22, 1, 192, 128),  # DeepSeek-style typical config
+            (4, 256, 16, 1, 192, 128),  # Larger batch/seq
+            (1, 128, 17, 1, 192, 128),  # Odd number of heads
+        ]
+        for B, N_CTX, H_Q, H_KV, D, DV in configs:
+            for dtype in self.dtypes:
+                with self.subTest(
+                    B=B, N_CTX=N_CTX, H_Q=H_Q, H_KV=H_KV, D=D, DV=DV, dtype=dtype
+                ):
+                    self._test_extend_attention_once(
+                        B=B,
+                        N_CTX=N_CTX,
+                        H_Q=H_Q,
+                        H_KV=H_KV,
+                        D=D,
+                        DV=DV,
+                        mla=True,
+                        dtype=dtype,
+                    )
 
 
 if __name__ == "__main__":

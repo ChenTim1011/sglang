@@ -13,6 +13,11 @@ import sgl_kernel  # noqa: F401
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
+try:
+    from .utils import int8_extend_precision
+except ImportError:
+    from test.srt.cpu.rvv.utils import int8_extend_precision
+
 
 def has_op(op_name: str) -> bool:
     """Check if a specific operator is available in sgl_kernel."""
@@ -41,7 +46,13 @@ def naive_attention_extend(
     v_scale: float = 1.0,
     enable_gqa: bool = False,
 ) -> torch.Tensor:
-    """Reference implementation of extend attention using PyTorch SDPA."""
+    """Reference implementation of extend attention using PyTorch SDPA.
+
+    Mirrors the kernel's two-stage behavior:
+      Stage 1 (prefix): keys/values come from the INT8 KV cache buffer (dequantized).
+      Stage 2 (extend):  keys/values come from k_extend/v_extend directly (FP),
+                         because the kernel bypasses the INT8 buffer for new tokens.
+    """
     num_seqs = seq_lens.shape[0]
     num_heads = q_extend.shape[1]
     head_dim_v = v_extend.shape[2]
@@ -71,19 +82,31 @@ def naive_attention_extend(
         per_req_query_padded[:, prefix_len:, :] = per_req_query
 
         req_pool_idx = req_pool_indices[seq_idx].item()
-        per_req_tokens = req_to_token[req_pool_idx, :seq_len]
-        per_req_key = k_buffer[per_req_tokens].movedim(0, 1)
-        per_req_value = v_buffer[per_req_tokens].movedim(0, 1)
 
-        if per_req_key.dtype == torch.int8:
-            per_req_key = per_req_key.to(torch.float32) * k_scale
-        if per_req_value.dtype == torch.int8:
-            per_req_value = per_req_value.to(torch.float32) * v_scale
+        # Stage 2: extend keys/values — use FP tensors directly (kernel does not
+        # read the INT8 buffer for new tokens; req_to_token extend slots are unused).
+        per_req_key_ext = k_extend[start_loc : start_loc + extend_len].movedim(0, 1)
+        per_req_val_ext = v_extend[start_loc : start_loc + extend_len].movedim(0, 1)
 
-        if per_req_key.dtype != per_req_query.dtype:
-            per_req_key = per_req_key.to(per_req_query.dtype)
-        if per_req_value.dtype != per_req_query.dtype:
-            per_req_value = per_req_value.to(per_req_query.dtype)
+        if prefix_len > 0:
+            # Stage 1: prefix keys/values — read from INT8 buffer and dequantize.
+            per_req_tokens_prefix = req_to_token[req_pool_idx, :prefix_len]
+            per_req_key_pre = k_buffer[per_req_tokens_prefix].movedim(0, 1)
+            per_req_val_pre = v_buffer[per_req_tokens_prefix].movedim(0, 1)
+
+            if per_req_key_pre.dtype == torch.int8:
+                per_req_key_pre = per_req_key_pre.to(torch.float32) * k_scale
+            if per_req_val_pre.dtype == torch.int8:
+                per_req_val_pre = per_req_val_pre.to(torch.float32) * v_scale
+
+            per_req_key_pre = per_req_key_pre.to(per_req_query.dtype)
+            per_req_val_pre = per_req_val_pre.to(per_req_query.dtype)
+
+            per_req_key = torch.cat([per_req_key_pre, per_req_key_ext], dim=1)
+            per_req_value = torch.cat([per_req_val_pre, per_req_val_ext], dim=1)
+        else:
+            per_req_key = per_req_key_ext
+            per_req_value = per_req_val_ext
 
         per_req_out_padded = scaled_dot_product_attention(
             per_req_query_padded.unsqueeze(0),
@@ -259,8 +282,9 @@ class TestExtendAttentionInt8CPU(unittest.TestCase):
             enable_gqa=enable_gqa,
         )
 
-        # Tolerance: Int8 has larger quantization error
-        torch.testing.assert_close(o_extend, ref_output, atol=1.5, rtol=0.5)
+        # Tolerance: small accumulated fp16/bf16 rounding vs reference float32 dequant path.
+        atol = rtol = int8_extend_precision[dtype]
+        torch.testing.assert_close(o_extend, ref_output, atol=atol, rtol=rtol)
 
     # Test cases
     def test_extend_int8_batching(self):
@@ -333,6 +357,23 @@ class TestExtendAttentionInt8CPU(unittest.TestCase):
                 dtype=dtype,
                 k_scale=0.05,
                 v_scale=0.05,
+            )
+
+    def test_extend_int8_no_prefix(self):
+        """INT8 extend-only test: no cached prefix (prefix_len=0, pure Stage 2 path).
+
+        All other tests have seq_len > extend_len (prefix_len > 0), which exercises
+        the Stage 1 INT8 buffer path. This test uses seq_len == extend_len so
+        prefix_len = 0 and only Stage 2 (FP k_extend) runs.
+        """
+        for dtype in [torch.float16, torch.bfloat16]:
+            self._run_extend_int8_test(
+                num_heads=4,
+                head_dim=64,
+                seq_len=32,  # seq_len == extend_len → prefix_len = 0
+                extend_len=32,
+                num_requests=2,
+                dtype=dtype,
             )
 
 

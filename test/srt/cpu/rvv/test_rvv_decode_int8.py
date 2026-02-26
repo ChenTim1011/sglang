@@ -17,6 +17,11 @@ import unittest
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
+try:
+    from .utils import int8_decode_precision
+except ImportError:
+    from test.srt.cpu.rvv.utils import int8_decode_precision
+
 
 def has_op(op_name: str) -> bool:
     """Check if a specific operator is available in sgl_kernel."""
@@ -250,7 +255,8 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
             v_scale,
         )
 
-        torch.testing.assert_close(output, ref_output, atol=1e-1, rtol=1e-1)
+        atol = rtol = int8_decode_precision[dtype]
+        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
     def _run_decode_int8_mla_test(
         self,
@@ -364,7 +370,8 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
             v_scale,
         )
 
-        torch.testing.assert_close(output, ref_output, atol=0.2, rtol=0.2)
+        atol = rtol = int8_decode_precision[dtype]
+        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
     def test_decode_int8_gqa(self):
         """INT8 GQA test: LLaMA-style H_Q=32, H_KV=8"""
@@ -560,13 +567,8 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
             v_scale,
         )
 
-        # Relaxed tolerance for INT8 + different scales
-        # For large scale (k_scale/v_scale < 0.1), use even more relaxed tolerance
-        if k_scale <= 0.1:
-            tolerance = 0.35  # More relaxed for very small scales
-        else:
-            tolerance = 0.15 if k_scale > 0.05 else 0.1
-        torch.testing.assert_close(output, ref_output, atol=tolerance, rtol=tolerance)
+        atol = rtol = int8_decode_precision[dtype]
+        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":

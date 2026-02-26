@@ -4,10 +4,8 @@ Tests BF16 and INT8 GEMM operations on RISC-V Vector architecture.
 """
 
 import itertools
-import os
 
 # Use RVV-specific utils (not Intel utils)
-import sys
 import unittest
 
 # Import sgl_kernel to register custom ops
@@ -16,19 +14,12 @@ import torch
 
 from sglang.test.test_utils import CustomTestCase
 
-# Add workspace root to path for imports
-script_dir = os.path.dirname(os.path.abspath(__file__))
-workspace_root = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.dirname(script_dir)))
+from .utils import (
+    gemm_precision,
+    native_w8a8_per_token_matmul,
+    precision,
+    sigmoid_mul_precision,
 )
-if workspace_root not in sys.path:
-    sys.path.insert(0, workspace_root)
-
-try:
-    from .utils import native_w8a8_per_token_matmul, precision
-except ImportError:
-    # Fallback for when running as script
-    from test.srt.cpu.rvv.utils import native_w8a8_per_token_matmul, precision
 
 torch.manual_seed(1234)
 
@@ -75,10 +66,7 @@ class TestGemm(CustomTestCase):
             mat1, packed_mat2, bias if has_bias else None, True
         )
 
-        if dtype == torch.bfloat16:
-            atol, rtol = 1.5e-1, 1.5e-1
-        else:
-            atol, rtol = 1e-1, 1e-1
+        atol = rtol = gemm_precision[dtype]
 
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
         torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
@@ -167,14 +155,9 @@ class TestGemm(CustomTestCase):
             True,  # is_vnni=True for packed
         )
 
-        # Compare int8_scaled_mm_cpu and int8_scaled_mm_with_quant (they should match)
-        torch.testing.assert_close(out, fused_out, atol=atol, rtol=rtol)
-
-        # For validation, check that outputs are finite and have reasonable magnitude
-        assert torch.isfinite(out).all(), "int8_scaled_mm_cpu output contains NaN/Inf"
-        assert torch.isfinite(
-            fused_out
-        ).all(), "int8_scaled_mm_with_quant output contains NaN/Inf"
+        # Validate mathematical correctness against the reference implementation
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(ref_out, fused_out, atol=atol, rtol=rtol)
 
     def test_int8_gemm(self):
         for params in itertools.product(
@@ -232,11 +215,7 @@ class TestGemm(CustomTestCase):
             ref = torch.nn.functional.sigmoid(ref) * mat_mul[:, :1].float()
             ref = ref.to(dtype)
             out = out[:, :1]
-            # For fused_linear_sigmoid_mul with BF16/FP16, use relaxed tolerance
-            if dtype == torch.bfloat16:
-                atol, rtol = 2.0, 2.5
-            else:
-                atol, rtol = 2e-1, 2e-1
+            atol = rtol = sigmoid_mul_precision[dtype]
         else:
             ref = ref.to(dtype)
 
@@ -246,10 +225,7 @@ class TestGemm(CustomTestCase):
                 bias if has_bias else None,
                 True,
             )
-            if dtype == torch.bfloat16:
-                atol, rtol = 1.5e-1, 1.5e-1
-            else:
-                atol, rtol = 1e-1, 1e-1
+            atol = rtol = gemm_precision[dtype]
 
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 

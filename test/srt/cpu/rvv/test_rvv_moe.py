@@ -5,8 +5,6 @@ N must be a multiple of BLOCK_N=64 for the RVV kernel.
 """
 
 import itertools
-import os
-import sys
 import unittest
 
 import sgl_kernel  # noqa: F401
@@ -15,26 +13,7 @@ import torch.nn.functional as F
 
 from sglang.test.test_utils import CustomTestCase
 
-# Add workspace root to path for imports
-script_dir = os.path.dirname(os.path.abspath(__file__))
-workspace_root = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.dirname(script_dir)))
-)
-if workspace_root not in sys.path:
-    sys.path.insert(0, workspace_root)
-
-try:
-    from .utils import precision
-except ImportError:
-    from test.srt.cpu.rvv.utils import precision
-
-try:
-    from test.srt.cpu.utils import torch_naive_fused_moe
-except ImportError:
-    cpu_test_dir = os.path.dirname(script_dir)
-    if cpu_test_dir not in sys.path:
-        sys.path.insert(0, cpu_test_dir)
-    from utils import torch_naive_fused_moe  # noqa: E402
+from .utils import precision, torch_naive_fused_moe
 
 try:
     from sglang.srt.layers.amx_utils import CPUQuantMethod
