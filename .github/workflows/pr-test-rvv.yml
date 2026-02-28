@@ -14,11 +14,30 @@ on:
           - full
         default: 'basic'
   pull_request:
-    branches: [ main, rvv_backend ]
+    branches: [ main ]
     paths:
+      # RVV attention backend and weight utilities
       - 'python/sglang/srt/layers/attention/rvv_backend.py'
       - 'python/sglang/srt/layers/rvv_utils.py'
+      # Shared CPU layers that contain RVV dispatch branches
+      - 'python/sglang/srt/layers/activation.py'
+      - 'python/sglang/srt/layers/layernorm.py'
+      - 'python/sglang/srt/layers/rotary_embedding/base.py'
+      - 'python/sglang/srt/layers/rotary_embedding/rope_variant.py'
+      - 'python/sglang/srt/layers/logits_processor.py'
+      - 'python/sglang/srt/layers/vocab_parallel_embedding.py'
+      - 'python/sglang/srt/layers/quantization/unquant.py'
+      - 'python/sglang/srt/layers/quantization/w8a8_int8.py'
+      - 'python/sglang/srt/layers/utils/multi_platform.py'
+      # RVV server configuration and utility functions
+      - 'python/sglang/srt/server_args.py'
+      - 'python/sglang/srt/utils/common.py'
+      # Model executor (torch.compile guard, INT8 KV dtype)
+      - 'python/sglang/srt/model_executor/forward_batch_info.py'
+      - 'python/sglang/srt/model_executor/model_runner.py'
+      # C++ RVV kernels
       - 'sgl-kernel/csrc/cpu/riscv64/**'
+      # Tests, CI scripts, Docker
       - 'test/srt/cpu/rvv/**'
       - 'scripts/ci/rvv/**'
       - '.github/workflows/pr-test-rvv.yml'
@@ -46,6 +65,19 @@ jobs:
             rvv_code:
               - 'python/sglang/srt/layers/attention/rvv_backend.py'
               - 'python/sglang/srt/layers/rvv_utils.py'
+              - 'python/sglang/srt/layers/activation.py'
+              - 'python/sglang/srt/layers/layernorm.py'
+              - 'python/sglang/srt/layers/rotary_embedding/base.py'
+              - 'python/sglang/srt/layers/rotary_embedding/rope_variant.py'
+              - 'python/sglang/srt/layers/logits_processor.py'
+              - 'python/sglang/srt/layers/vocab_parallel_embedding.py'
+              - 'python/sglang/srt/layers/quantization/unquant.py'
+              - 'python/sglang/srt/layers/quantization/w8a8_int8.py'
+              - 'python/sglang/srt/layers/utils/multi_platform.py'
+              - 'python/sglang/srt/server_args.py'
+              - 'python/sglang/srt/utils/common.py'
+              - 'python/sglang/srt/model_executor/forward_batch_info.py'
+              - 'python/sglang/srt/model_executor/model_runner.py'
               - 'sgl-kernel/csrc/cpu/riscv64/**'
               - 'test/srt/cpu/rvv/**'
               - 'scripts/ci/rvv/**'
@@ -86,6 +118,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.rvv-basic-test.result == 'success' &&
       (
         (github.event_name == 'workflow_dispatch' && (inputs.test_level == 'kernel' || inputs.test_level == 'full')) ||
         (github.event_name == 'pull_request' && needs.check-changes.outputs.run_tests == 'true')
@@ -110,7 +143,9 @@ jobs:
               test.srt.cpu.rvv.test_rvv_decode_int8 \
               test.srt.cpu.rvv.test_rvv_extend \
               test.srt.cpu.rvv.test_rvv_extend_int8 \
-              test.srt.cpu.rvv.test_rvv_moe \
+              test.srt.cpu.rvv.test_rvv_activation \
+              test.srt.cpu.rvv.test_rvv_norm \
+              test.srt.cpu.rvv.test_rvv_rope \
               -v
 
       - name: Cleanup container
@@ -124,6 +159,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.rvv-kernel-unit-test.result == 'success' &&
       (
         (github.event_name == 'workflow_dispatch' && (inputs.test_level == 'integration' || inputs.test_level == 'full')) ||
         (github.event_name == 'pull_request' && needs.check-changes.outputs.run_tests == 'true')
@@ -158,6 +194,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.rvv-backend-integration-test.result == 'success' &&
       (github.event_name == 'workflow_dispatch' && inputs.test_level == 'full')
     runs-on: rvv-bpi-f3
     steps:
@@ -169,20 +206,22 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Run E2E inference test (Llama 1B)
+      - name: Run E2E inference test (Qwen2.5-1.5B)
         timeout-minutes: 40
         run: |
           bash scripts/ci/rvv/rvv_ci_exec.sh python3 -c "
           from sglang import Engine
           print('Creating Engine with RVV backend...')
           engine = Engine(
-              model_path='meta-llama/Llama-3.2-1B',
-              backend='rvv',
+              model_path='Qwen/Qwen2.5-1.5B',
+              attention_backend='rvv',
               device='cpu'
           )
           print('Running inference...')
           result = engine.generate('Hello, world! Tell me a joke.')
           print(f'Result: {result}')
+          assert result is not None, 'E2E test failed: got None result'
+          print('E2E test passed.')
           "
 
       - name: Cleanup container
