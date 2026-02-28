@@ -227,6 +227,12 @@ def SiluAndMul(x):
     return torch.nn.functional.silu(x[0]) * x[1]
 
 
+def GeluAndMul(x, approximate="tanh"):
+    """Reference implementation for GELU*mul activation (matches test/srt/cpu/utils.py)."""
+    d = x.shape[-1] // 2
+    return torch.nn.functional.gelu(x[..., :d], approximate=approximate) * x[..., d:]
+
+
 def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize):
     """Reference implementation for fused MoE."""
     B, D = a.shape

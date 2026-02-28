@@ -107,25 +107,109 @@ inline vfloat32m8_t vfexp_f32m8(vfloat32m8_t vx, size_t vl) {
   return RVVExpImpl<8>::compute(vx, vl);
 }
 
+// Fast reciprocal: ~1/vd via vfrec7 + one Newton-Raphson step (~14-bit accuracy).
+// NR: r <- r * (2 - d * r).  Safe for any d > 0 (which holds for all our use sites).
+inline vfloat32m4_t vrec_f32m4(vfloat32m4_t vd, size_t vl) {
+  vfloat32m4_t vr = __riscv_vfrec7_v_f32m4(vd, vl);
+  vfloat32m4_t vdr = __riscv_vfmul_vv_f32m4(vd, vr, vl);
+  vfloat32m4_t vcorr = __riscv_vfrsub_vf_f32m4(vdr, 2.0f, vl);  // 2 - d*r
+  return __riscv_vfmul_vv_f32m4(vr, vcorr, vl);
+}
+
+inline vfloat32m8_t vrec_f32m8(vfloat32m8_t vd, size_t vl) {
+  vfloat32m8_t vr = __riscv_vfrec7_v_f32m8(vd, vl);
+  vfloat32m8_t vdr = __riscv_vfmul_vv_f32m8(vd, vr, vl);
+  vfloat32m8_t vcorr = __riscv_vfrsub_vf_f32m8(vdr, 2.0f, vl);
+  return __riscv_vfmul_vv_f32m8(vr, vcorr, vl);
+}
+
+// tanh(x) = (e^2x - 1) / (e^2x + 1).  Clamped to ±9 (tanh saturates beyond that).
+// Replace vfdiv with vrec_f32m4: saves ~10-20 cycle division latency.
 inline vfloat32m4_t vftanh_f32m4(vfloat32m4_t vx, size_t vl) {
   vx = __riscv_vfmax_vf_f32m4(vx, -9.0f, vl);
   vx = __riscv_vfmin_vf_f32m4(vx, 9.0f, vl);
   vfloat32m4_t v2x = __riscv_vfmul_vf_f32m4(vx, 2.0f, vl);
   vfloat32m4_t vex = vfexp_f32m4(v2x, vl);
-  vfloat32m4_t v_numerator = __riscv_vfsub_vf_f32m4(vex, 1.0f, vl);
+  vfloat32m4_t v_num = __riscv_vfsub_vf_f32m4(vex, 1.0f, vl);
   vfloat32m4_t v_denom = __riscv_vfadd_vf_f32m4(vex, 1.0f, vl);
-  return __riscv_vfdiv_vv_f32m4(v_numerator, v_denom, vl);
+  return __riscv_vfmul_vv_f32m4(v_num, vrec_f32m4(v_denom, vl), vl);
 }
 
 inline vfloat32m8_t vftanh_f32m8(vfloat32m8_t vx, size_t vl) {
   vx = __riscv_vfmax_vf_f32m8(vx, -9.0f, vl);
   vx = __riscv_vfmin_vf_f32m8(vx, 9.0f, vl);
-
   vfloat32m8_t v2x = __riscv_vfmul_vf_f32m8(vx, 2.0f, vl);
   vfloat32m8_t vex = vfexp_f32m8(v2x, vl);
-  vfloat32m8_t v_numerator = __riscv_vfsub_vf_f32m8(vex, 1.0f, vl);
+  vfloat32m8_t v_num = __riscv_vfsub_vf_f32m8(vex, 1.0f, vl);
   vfloat32m8_t v_denom = __riscv_vfadd_vf_f32m8(vex, 1.0f, vl);
-  return __riscv_vfdiv_vv_f32m8(v_numerator, v_denom, vl);
+  return __riscv_vfmul_vv_f32m8(v_num, vrec_f32m8(v_denom, vl), vl);
+}
+
+// Polynomial approximation: erf(x)
+// Abramowitz & Stegun 7.1.26, max error 1.5e-7
+// erf(x) = sign(x) * (1 - poly(t) * exp(-x^2))
+// where t = 1 / (1 + 0.3275911 * |x|)
+// poly(t) = ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t  (Horner form)
+// erf saturates to ±1 for |x| >= 4; |x| is clamped to 4 to avoid exp underflow.
+constexpr float RVV_ERF_P = 0.3275911f;
+constexpr float RVV_ERF_A1 = 0.254829592f;
+constexpr float RVV_ERF_A2 = -0.284496736f;
+constexpr float RVV_ERF_A3 = 1.421413741f;
+constexpr float RVV_ERF_A4 = -1.453152027f;
+constexpr float RVV_ERF_A5 = 1.061405429f;
+
+inline vfloat32m4_t vferf_f32m4(vfloat32m4_t vx, size_t vl) {
+  // |x|, clamped to 4 (erf saturates to ±1 beyond this)
+  vfloat32m4_t vabs = __riscv_vfabs_v_f32m4(vx, vl);
+  vabs = __riscv_vfmin_vf_f32m4(vabs, 4.0f, vl);
+
+  // t = 1 / (1 + p * |x|)
+  vfloat32m4_t vone = __riscv_vfmv_v_f_f32m4(1.0f, vl);
+  vfloat32m4_t vdenom = __riscv_vfmacc_vf_f32m4(vone, RVV_ERF_P, vabs, vl);
+  vfloat32m4_t vt = vrec_f32m4(vdenom, vl);  // ~1/(1 + p*|x|), replaces vfdiv
+
+  // Horner's method: ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t
+  // vfmadd(vd, vs1, vs2) = vd * vs1 + vs2
+  vfloat32m4_t vpoly = __riscv_vfmv_v_f_f32m4(RVV_ERF_A5, vl);
+  vpoly = __riscv_vfmadd_vv_f32m4(vpoly, vt, __riscv_vfmv_v_f_f32m4(RVV_ERF_A4, vl), vl);
+  vpoly = __riscv_vfmadd_vv_f32m4(vpoly, vt, __riscv_vfmv_v_f_f32m4(RVV_ERF_A3, vl), vl);
+  vpoly = __riscv_vfmadd_vv_f32m4(vpoly, vt, __riscv_vfmv_v_f_f32m4(RVV_ERF_A2, vl), vl);
+  vpoly = __riscv_vfmadd_vv_f32m4(vpoly, vt, __riscv_vfmv_v_f_f32m4(RVV_ERF_A1, vl), vl);
+  vpoly = __riscv_vfmul_vv_f32m4(vpoly, vt, vl);  // final *t gives a1*t + ... + a5*t^5
+
+  // exp(-x^2)
+  vfloat32m4_t vx2 = __riscv_vfmul_vv_f32m4(vabs, vabs, vl);
+  vfloat32m4_t vexp = vfexp_f32m4(__riscv_vfneg_v_f32m4(vx2, vl), vl);
+
+  // result = 1 - poly * exp(-x^2); vfnmsac(vd, vs1, vs2) = vd - vs1 * vs2
+  vfloat32m4_t vresult = __riscv_vfnmsac_vv_f32m4(vone, vpoly, vexp, vl);
+
+  // Apply sign: erf(x) has the same sign as x.
+  // vfsgnjx(vd, vs) = vd with sign = sign(vd) XOR sign(vs).
+  // vresult >= 0 (sign bit = 0), so result sign = sign(vx).
+  return __riscv_vfsgnjx_vv_f32m4(vresult, vx, vl);
+}
+
+inline vfloat32m8_t vferf_f32m8(vfloat32m8_t vx, size_t vl) {
+  vfloat32m8_t vabs = __riscv_vfabs_v_f32m8(vx, vl);
+  vabs = __riscv_vfmin_vf_f32m8(vabs, 4.0f, vl);
+
+  vfloat32m8_t vone = __riscv_vfmv_v_f_f32m8(1.0f, vl);
+  vfloat32m8_t vdenom = __riscv_vfmacc_vf_f32m8(vone, RVV_ERF_P, vabs, vl);
+  vfloat32m8_t vt = vrec_f32m8(vdenom, vl);  // ~1/(1 + p*|x|), replaces vfdiv
+
+  vfloat32m8_t vpoly = __riscv_vfmv_v_f_f32m8(RVV_ERF_A5, vl);
+  vpoly = __riscv_vfmadd_vv_f32m8(vpoly, vt, __riscv_vfmv_v_f_f32m8(RVV_ERF_A4, vl), vl);
+  vpoly = __riscv_vfmadd_vv_f32m8(vpoly, vt, __riscv_vfmv_v_f_f32m8(RVV_ERF_A3, vl), vl);
+  vpoly = __riscv_vfmadd_vv_f32m8(vpoly, vt, __riscv_vfmv_v_f_f32m8(RVV_ERF_A2, vl), vl);
+  vpoly = __riscv_vfmadd_vv_f32m8(vpoly, vt, __riscv_vfmv_v_f_f32m8(RVV_ERF_A1, vl), vl);
+  vpoly = __riscv_vfmul_vv_f32m8(vpoly, vt, vl);
+
+  vfloat32m8_t vx2 = __riscv_vfmul_vv_f32m8(vabs, vabs, vl);
+  vfloat32m8_t vexp = vfexp_f32m8(__riscv_vfneg_v_f32m8(vx2, vl), vl);
+
+  vfloat32m8_t vresult = __riscv_vfnmsac_vv_f32m8(vone, vpoly, vexp, vl);
+  return __riscv_vfsgnjx_vv_f32m8(vresult, vx, vl);
 }
 
 // Softmax helper: in-place exp and sum (no normalization)
