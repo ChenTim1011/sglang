@@ -221,6 +221,64 @@ def run_sdpa_forward_extend(
     return output
 
 
+def rmsnorm_native(x, weight, eps, residual=None):
+    """Reference RMSNorm: out = x * rsqrt(mean(x^2) + eps) * weight."""
+    orig_dtype = x.dtype
+    x = x.to(torch.float32)
+    if residual is not None:
+        x = x + residual.to(torch.float32)
+        residual = x.to(orig_dtype)
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    x = x.to(orig_dtype) * weight
+    return x if residual is None else (x, residual)
+
+
+def gemma_rmsnorm_native(x, weight, eps, residual=None):
+    """Reference Gemma RMSNorm: scale = (1 + weight)."""
+    orig_dtype = x.dtype
+    if residual is not None:
+        x = x + residual
+        residual = x
+    x = x.float()
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    x = x * (1.0 + weight.float())
+    x = x.to(orig_dtype)
+    return x if residual is None else (x, residual)
+
+
+def gemma3_rmsnorm_native(x, weight, eps):
+    """Reference Gemma3 RMSNorm: supports 2D and 4D inputs."""
+    output = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+    output = output * (1.0 + weight.float())
+    return output.type_as(x)
+
+
+def fused_rmsnorm_gated_native(x, weight, gate, eps):
+    """Reference fused gated RMSNorm: rms_norm(x) * weight * silu(gate)."""
+    input_dtype = x.dtype
+    x = x.to(torch.float32)
+    variance = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    x = weight * x.to(input_dtype)
+    x = x * torch.nn.functional.silu(gate.to(torch.float32))
+    return x.to(input_dtype)
+
+
+def layernorm_native(x, weight, eps, residual=None):
+    """Reference LayerNorm: mean+var two pass."""
+    orig_dtype = x.dtype
+    x = x.to(torch.float32)
+    if residual is not None:
+        x = x + residual.to(torch.float32)
+        residual = x.to(orig_dtype)
+    variance, mean = torch.var_mean(x, dim=-1, keepdim=True, correction=0)
+    x = (x - mean) * torch.rsqrt(variance + eps)
+    x = x.to(orig_dtype) * weight
+    return x if residual is None else (x, residual)
+
+
 def SiluAndMul(x):
     """Reference implementation for SiluAndMul activation."""
     x = torch.chunk(x, 2, dim=-1)
