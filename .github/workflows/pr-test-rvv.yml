@@ -1,0 +1,230 @@
+name: PR Test (RVV)
+
+on:
+  workflow_dispatch:  # Manual trigger only for initial testing
+    inputs:
+      test_level:
+        description: 'Test level to run'
+        required: false
+        type: choice
+        options:
+          - basic
+          - kernel
+          - integration
+          - full
+        default: 'basic'
+  pull_request:
+    branches: [ main ]
+    paths:
+      # RVV attention backend and weight utilities
+      - 'python/sglang/srt/layers/attention/rvv_backend.py'
+      - 'python/sglang/srt/layers/rvv_utils.py'
+      # Shared CPU layers that contain RVV dispatch branches
+      - 'python/sglang/srt/layers/activation.py'
+      - 'python/sglang/srt/layers/layernorm.py'
+      - 'python/sglang/srt/layers/rotary_embedding/base.py'
+      - 'python/sglang/srt/layers/rotary_embedding/rope_variant.py'
+      - 'python/sglang/srt/layers/logits_processor.py'
+      - 'python/sglang/srt/layers/vocab_parallel_embedding.py'
+      - 'python/sglang/srt/layers/quantization/unquant.py'
+      - 'python/sglang/srt/layers/quantization/w8a8_int8.py'
+      - 'python/sglang/srt/layers/utils/multi_platform.py'
+      # RVV server configuration and utility functions
+      - 'python/sglang/srt/server_args.py'
+      - 'python/sglang/srt/utils/common.py'
+      # Model executor (torch.compile guard, INT8 KV dtype)
+      - 'python/sglang/srt/model_executor/forward_batch_info.py'
+      - 'python/sglang/srt/model_executor/model_runner.py'
+      # C++ RVV kernels
+      - 'sgl-kernel/csrc/cpu/riscv64/**'
+      # Tests, CI scripts, Docker
+      - 'test/srt/cpu/rvv/**'
+      - 'scripts/ci/rvv/**'
+      - '.github/workflows/pr-test-rvv.yml'
+      - 'docker/rvv.Dockerfile'
+
+concurrency:
+  group: pr-test-rvv-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run_tests: ${{ steps.filter.outputs.rvv_code }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect RVV-related changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rvv_code:
+              - 'python/sglang/srt/layers/attention/rvv_backend.py'
+              - 'python/sglang/srt/layers/rvv_utils.py'
+              - 'python/sglang/srt/layers/activation.py'
+              - 'python/sglang/srt/layers/layernorm.py'
+              - 'python/sglang/srt/layers/rotary_embedding/base.py'
+              - 'python/sglang/srt/layers/rotary_embedding/rope_variant.py'
+              - 'python/sglang/srt/layers/logits_processor.py'
+              - 'python/sglang/srt/layers/vocab_parallel_embedding.py'
+              - 'python/sglang/srt/layers/quantization/unquant.py'
+              - 'python/sglang/srt/layers/quantization/w8a8_int8.py'
+              - 'python/sglang/srt/layers/utils/multi_platform.py'
+              - 'python/sglang/srt/server_args.py'
+              - 'python/sglang/srt/utils/common.py'
+              - 'python/sglang/srt/model_executor/forward_batch_info.py'
+              - 'python/sglang/srt/model_executor/model_runner.py'
+              - 'sgl-kernel/csrc/cpu/riscv64/**'
+              - 'test/srt/cpu/rvv/**'
+              - 'scripts/ci/rvv/**'
+              - '.github/workflows/pr-test-rvv.yml'
+
+  # ==================== Basic Verification ==================== #
+  rvv-basic-test:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.check-changes.outputs.run_tests == 'true'
+      )
+    runs-on: rvv-bpi-f3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start Podman container
+        run: bash scripts/ci/rvv/rvv_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Verify RVV support
+        timeout-minutes: 5
+        run: |
+          podman exec ci_sglang_rvv python3 /workspace/sglang/scripts/ci/rvv/verify_rvv_support.py
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          podman rm -f ci_sglang_rvv || true
+
+  # ==================== Kernel Unit Tests ==================== #
+  rvv-kernel-unit-test:
+    needs: [check-changes, rvv-basic-test]
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.rvv-basic-test.result == 'success' &&
+      (
+        (github.event_name == 'workflow_dispatch' && (inputs.test_level == 'kernel' || inputs.test_level == 'full')) ||
+        (github.event_name == 'pull_request' && needs.check-changes.outputs.run_tests == 'true')
+      )
+    runs-on: rvv-bpi-f3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start Podman container
+        run: bash scripts/ci/rvv/rvv_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Run kernel unit tests
+        timeout-minutes: 40
+        run: |
+          bash scripts/ci/rvv/rvv_ci_exec.sh -w /workspace/sglang \
+            python3 -m unittest \
+              test.srt.cpu.rvv.test_rvv_gemm \
+              test.srt.cpu.rvv.test_rvv_decode \
+              test.srt.cpu.rvv.test_rvv_decode_int8 \
+              test.srt.cpu.rvv.test_rvv_extend \
+              test.srt.cpu.rvv.test_rvv_extend_int8 \
+              test.srt.cpu.rvv.test_rvv_activation \
+              test.srt.cpu.rvv.test_rvv_norm \
+              test.srt.cpu.rvv.test_rvv_rope \
+              -v
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          podman rm -f ci_sglang_rvv || true
+
+  # ==================== Backend Integration Tests ==================== #
+  rvv-backend-integration-test:
+    needs: [check-changes, rvv-kernel-unit-test]
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.rvv-kernel-unit-test.result == 'success' &&
+      (
+        (github.event_name == 'workflow_dispatch' && (inputs.test_level == 'integration' || inputs.test_level == 'full')) ||
+        (github.event_name == 'pull_request' && needs.check-changes.outputs.run_tests == 'true')
+      )
+    runs-on: rvv-bpi-f3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start Podman container
+        run: bash scripts/ci/rvv/rvv_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Run RVV backend tests
+        timeout-minutes: 40
+        run: |
+          bash scripts/ci/rvv/rvv_ci_exec.sh -w /workspace/sglang \
+            python3 -m unittest \
+              test.srt.cpu.rvv.test_rvv_backend_registration \
+              test.srt.cpu.rvv.test_rvv_attention_backend \
+              -v
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          podman rm -f ci_sglang_rvv || true
+
+  # ==================== End-to-End Inference Test ==================== #
+  rvv-e2e-test:
+    needs: [check-changes, rvv-backend-integration-test]
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.rvv-backend-integration-test.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' && inputs.test_level == 'full')
+    runs-on: rvv-bpi-f3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start Podman container
+        run: bash scripts/ci/rvv/rvv_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Run E2E inference test (Qwen2.5-1.5B-Instruct)
+        timeout-minutes: 40
+        run: |
+          bash scripts/ci/rvv/rvv_ci_exec.sh python3 -c "
+          from sglang import Engine
+          print('Creating Engine with RVV backend...')
+          engine = Engine(
+              model_path='Qwen/Qwen2.5-1.5B-Instruct',
+              attention_backend='rvv',
+              device='cpu'
+          )
+          print('Running inference...')
+          result = engine.generate('Hello, world! Tell me a joke.')
+          print(f'Result: {result}')
+          assert result is not None, 'E2E test failed: got None result'
+          print('E2E test passed.')
+          "
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          podman rm -f ci_sglang_rvv || true
