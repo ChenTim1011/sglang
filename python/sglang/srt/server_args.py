@@ -37,6 +37,7 @@ from sglang.srt.utils.common import (
     SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
     cpu_has_amx_support,
+    cpu_has_rvv_support,
     get_bool_env_var,
     get_device,
     get_device_memory_capacity,
@@ -141,6 +142,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "rvv",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
@@ -169,7 +171,7 @@ NSA_CHOICES = [
     "trtllm",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -376,7 +378,6 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
-    use_ray: bool = False
     custom_sigquit_handler: Optional[Callable] = None
 
     # Logging
@@ -466,7 +467,7 @@ class ServerArgs:
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
-    fp4_gemm_runner_backend: str = "auto"
+    fp4_gemm_runner_backend: str = "flashinfer_cutlass"
     nsa_prefill_backend: Optional[str] = (
         None  # None = auto-detect based on hardware/kv_cache_dtype
     )
@@ -686,7 +687,6 @@ class ServerArgs:
     language_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
-    enable_adaptive_dispatch_to_encoder: bool = False
 
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
@@ -889,14 +889,6 @@ class ServerArgs:
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
-        if self.enable_nan_detection:
-            logger.warning(
-                "--enable-nan-detection is deprecated. "
-                "Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead."
-            )
-            envs.SGLANG_SPEC_NAN_DETECTION.set(True)
-            envs.SGLANG_SPEC_OOB_DETECTION.set(True)
-
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
             self.enable_prefill_delayer = True
@@ -919,7 +911,18 @@ class ServerArgs:
 
         # Handle ModelScope model downloads
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
-            self._handle_modelscope_paths()
+            if not os.path.exists(self.model_path):
+                from modelscope import snapshot_download
+
+                self.model_path = snapshot_download(
+                    self.model_path, cache_dir=self.download_dir, revision=self.revision
+                )
+                self.tokenizer_path = snapshot_download(
+                    self.tokenizer_path,
+                    cache_dir=self.download_dir,
+                    revision=self.revision,
+                    ignore_patterns=["*.bin", "*.safetensors"],
+                )
 
         # Mamba scheduler strategy
         if self.mamba_scheduler_strategy == "auto":
@@ -935,70 +938,6 @@ class ServerArgs:
         elif self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
-    def _handle_modelscope_paths(self):
-        """Resolve model / tokenizer / speculative-draft paths from the local
-        ModelScope cache when possible, falling back to ``snapshot_download``
-        for any path that is not already present on disk.
-
-        Note: ``speculative_token_map`` is intentionally NOT handled here
-        because its value uses ``repo_id/filename`` semantics rather than a
-        plain repo ID.  That resolution lives in
-        :func:`sglang.srt.speculative.spec_utils.load_token_map`.
-        """
-
-        ms_root = None
-        ms_snapshot_download = None
-
-        def _resolve_or_download(
-            path: Optional[str],
-            ignore_patterns: Optional[list] = None,
-            revision: Optional[str] = None,
-        ) -> Optional[str]:
-            nonlocal ms_root, ms_snapshot_download
-            if path is None:
-                return None
-            if not path or os.path.exists(path):
-                return path
-
-            if ms_snapshot_download is None:
-                from modelscope.hub.snapshot_download import (
-                    snapshot_download as _ms_snapshot_download,
-                )
-                from modelscope.utils.file_utils import get_model_cache_root
-
-                ms_snapshot_download = _ms_snapshot_download
-                ms_root = get_model_cache_root()
-
-            # Check ModelScope default cache
-            cached = os.path.join(ms_root, path)
-            if os.path.exists(cached):
-                return cached
-            # Check user-specified download dir
-            if self.download_dir:
-                alt = os.path.join(self.download_dir, path)
-                if os.path.exists(alt):
-                    return alt
-
-            # Cache miss — download from ModelScope hub
-            return ms_snapshot_download(
-                path,
-                cache_dir=self.download_dir,
-                revision=revision,
-                **({"ignore_patterns": ignore_patterns} if ignore_patterns else {}),
-            )
-
-        self.model_path = _resolve_or_download(self.model_path, revision=self.revision)
-        self.tokenizer_path = _resolve_or_download(
-            self.tokenizer_path,
-            ignore_patterns=["*.bin", "*.safetensors"],
-            revision=self.revision,
-        )
-        if self.speculative_draft_model_path:
-            self.speculative_draft_model_path = _resolve_or_download(
-                self.speculative_draft_model_path,
-                revision=self.speculative_draft_model_revision or "main",
-            )
-
     def _handle_hpu_backends(self):
         if self.device == "hpu":
             self.attention_backend = "torch_native"
@@ -1007,7 +946,16 @@ class ServerArgs:
     def _handle_cpu_backends(self):
         if self.device == "cpu":
             if self.attention_backend is None:
-                self.attention_backend = "intel_amx"
+                if cpu_has_amx_support():
+                    self.attention_backend = "intel_amx"
+                elif cpu_has_rvv_support():
+                    self.attention_backend = "rvv"
+                else:
+                    logger.info(
+                        "No specialized CPU backend detected (AMX/RVV), using torch_native. "
+                        "Performance may be limited."
+                    )
+                    self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
     def _handle_npu_backends(self):
@@ -1332,9 +1280,7 @@ class ServerArgs:
             )
 
         if self.kv_cache_dtype == "auto":
-            self.kv_cache_dtype = (
-                "fp8_e4m3" if (major >= 10 and self.dp_size > 1) else "bfloat16"
-            )
+            self.kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
             logger.warning(
                 f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
             )
@@ -1353,18 +1299,11 @@ class ServerArgs:
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
-            if self.dp_size == 1 and major >= 10:
-                self.nsa_prefill_backend = "trtllm"
-                self.nsa_decode_backend = "trtllm"
-                logger.warning(
-                    "Flashmla is not supported on Blackwell device without DP attention. Set NSA prefill/decode backends to trtllm, which runs fast but loses a little accuracy."
-                )
-            else:
-                # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
-                if not user_set_prefill:
-                    self.nsa_prefill_backend = "flashmla_auto"
-                if not user_set_decode:
-                    self.nsa_decode_backend = "flashmla_kv"
+            # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+            if not user_set_prefill:
+                self.nsa_prefill_backend = "flashmla_auto"
+            if not user_set_decode:
+                self.nsa_decode_backend = "flashmla_kv"
         else:
             # set prefill/decode backends based on hardware architecture.
             if major >= 10:
@@ -1406,35 +1345,12 @@ class ServerArgs:
             "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
-            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2/GLM 5
+            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2, GlmMoeDsaForCausalLM
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
-                    envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
+                    envs.SGLANG_NSA_FORCE_MLA.set(True)
                     logger.warning(
-                        "Force NSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
+                        "Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
                     )
-                else:
-                    if envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
-                        logger.warning(
-                            f"Dense attention kv len threshold is manually set to {envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."
-                        )
-                    else:
-                        # When threshold is not manually set, set it to the index topk of model
-                        from sglang.srt.configs.model_config import get_nsa_index_topk
-
-                        envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
-                            get_nsa_index_topk(hf_config)
-                        )
-                        logger.warning(
-                            f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
-                        )
-                    if self.nsa_prefill_backend == "trtllm":
-                        # We temporarily set the threshold to 128k to avoid IMA error. Should be removed after supporting flashmla prefill impl with trtllm decode impl.
-                        envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
-                            128 * 1024
-                        )
-                        logger.warning(
-                            "TRTLLM sparse MLA kernel requires MHA as prefill impl, the threshold for dense attention is overridden. This will be fixed in the future."
-                        )
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
@@ -3147,12 +3063,6 @@ class ServerArgs:
                     "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
                 )
                 self.attention_backend = "triton"
-        elif is_npu():
-            if self.attention_backend != "ascend":
-                logger.warning(
-                    "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
-                )
-                self.attention_backend = "ascend"
         elif not self.disable_cuda_graph:
             if self.attention_backend != "flashinfer":
                 logger.warning(
@@ -3473,8 +3383,16 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "bf16",
+                "bfloat16",
+                "fp4_e2m1",
+                "int8",
+            ],
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+. "int8" for INT8 KV cache (RVV/CPU only).',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
@@ -3662,7 +3580,7 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",
@@ -3827,11 +3745,6 @@ class ServerArgs:
             help="Reduce CPU usage when sglang is idle.",
         )
         parser.add_argument(
-            "--use-ray",
-            action="store_true",
-            help="Use Ray actors for scheduler process management.",
-        )
-        parser.add_argument(
             "--custom-sigquit-handler",
             help="Register a custom sigquit handler so you can do additional cleanup after the server is shutdown. This is only available for Engine, not for CLI.",
         )
@@ -3987,7 +3900,7 @@ class ServerArgs:
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
-            help="The log and metrics reporting interval (in decode iterations) for decode batches.",
+            help="The log interval of decode batch.",
         )
         parser.add_argument(
             "--enable-request-time-stats-logging",
@@ -4331,8 +4244,8 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
-            "'flashinfer_cutlass' (CUTLASS backend), "
+            "Options: 'flashinfer_cutlass' (default), "
+            "'auto' (auto-selects between flashinfer_cudnn/flashinfer_cutlass based on CUDA/cuDNN version), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
             "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). "
             "NOTE: This replaces the deprecated environment variable "
@@ -5112,7 +5025,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-nan-detection",
             action="store_true",
-            help="[Deprecated] Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead.",
+            help="Enable the NaN detection for debugging purposes.",
         )
         parser.add_argument(
             "--enable-p2p-check",
@@ -5384,12 +5297,6 @@ class ServerArgs:
             type=str,
             default=[],
             help="List of encoder server urls.",
-        )
-        parser.add_argument(
-            "--enable-adaptive-dispatch-to-encoder",
-            default=ServerArgs.enable_adaptive_dispatch_to_encoder,
-            action="store_true",
-            help="When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
         )
 
         # Custom weight loader
@@ -5724,21 +5631,6 @@ class ServerArgs:
                 "fcfs",
                 "lof",
             ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
-            if self.default_priority_value is None:
-                logger.warning(
-                    "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
-                    "Requests without explicit priority will have priority=None, "
-                    "resulting in priority='None' string labels in Prometheus metrics."
-                )
-        else:
-            if self.disable_priority_preemption:
-                logger.warning(
-                    "--disable-priority-preemption has no effect without --enable-priority-scheduling"
-                )
-            if self.default_priority_value is not None:
-                logger.warning(
-                    "--default-priority-value has no effect without --enable-priority-scheduling"
-                )
 
         # Check multi-item scoring
         if self.multi_item_scoring_delimiter is not None:
@@ -5777,6 +5669,13 @@ class ServerArgs:
         if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
+            )
+
+        # Check RVV-specific flags: int8 KV cache requires RVV hardware
+        if self.kv_cache_dtype == "int8" and not cpu_has_rvv_support():
+            raise ValueError(
+                "--kv-cache-dtype=int8 requires RISC-V hardware with RVV support. "
+                "This option is not supported on the current platform."
             )
 
     def check_torch_2_9_1_cudnn_compatibility(self):
