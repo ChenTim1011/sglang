@@ -1,6 +1,7 @@
-"""
+"""Unit tests for RVV attention backend runtime behavior.
+
 Usage:
-python3 -m unittest test_rvv_benchmark.TestRVVBackend.test_latency_default_model
+    python3 -m unittest test.srt.cpu.rvv.test_rvv_attention_backend -v
 """
 
 import os
@@ -13,9 +14,12 @@ from sglang.test.test_utils import (
 )
 
 
-class TestRVVBackend(CustomTestCase):
+class TestRVVAttentionBackendBenchmark(CustomTestCase):
+    """Test suite for RVV attention backend benchmark wiring."""
+
     @classmethod
     def setUpClass(cls):
+        """Prepare environment warnings before benchmark execution."""
         super().setUpClass()
 
         if "HF_TOKEN" not in os.environ:
@@ -41,7 +45,8 @@ class TestRVVBackend(CustomTestCase):
         ],
         min_throughput=0.0,
     )
-    def test_latency_default_model(self):
+    def test_case_latency_default_model(self):
+        """Case: run the default small model via RVV benchmark decorator."""
         return DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 

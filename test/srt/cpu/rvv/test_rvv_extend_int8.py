@@ -1,21 +1,19 @@
-"""
-Unit Test for extend_attention_cpu kernel (RVV optimized, INT8).
+"""Unit tests for RVV extend attention kernel (INT8 KV cache).
 
 Usage:
-    python3 test_rvv_extend_int8.py -v
+    python3 -m unittest test.srt.cpu.rvv.test_rvv_extend_int8 -v
 """
 
 import unittest
 
-# Import sgl_kernel to register operators
 import sgl_kernel  # noqa: F401
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 try:
-    from .utils import has_op, int8_extend_precision
+    from .rvv_utils import has_sgl_kernel_op, int8_extend_precision
 except ImportError:
-    from test.srt.cpu.rvv.utils import has_op, int8_extend_precision
+    from test.srt.cpu.rvv.rvv_utils import has_sgl_kernel_op, int8_extend_precision
 
 
 def naive_attention_extend(
@@ -43,7 +41,6 @@ def naive_attention_extend(
                          because the kernel bypasses the INT8 buffer for new tokens.
     """
     num_seqs = seq_lens.shape[0]
-    num_heads = q_extend.shape[1]
     head_dim_v = v_extend.shape[2]
 
     query = q_extend.movedim(0, 1)
@@ -113,34 +110,33 @@ def naive_attention_extend(
     return output
 
 
-class TestExtendAttentionInt8CPU(unittest.TestCase):
-    """Test extend_attention_int8_cpu kernel correctness"""
+class TestRVVExtendInt8(unittest.TestCase):
+    """Test suite for RVV extend attention with INT8 KV cache."""
 
     @classmethod
     def setUpClass(cls):
         """Setup once before all tests"""
         cls.device = "cpu"
-        import sgl_kernel  # noqa: F401
 
-        if not has_op("extend_attention_int8_cpu"):
+        if not has_sgl_kernel_op("extend_attention_int8_cpu"):
             raise unittest.SkipTest("extend_attention_int8_cpu not available")
 
-    def _run_extend_int8_test(
+    def run_case_extend_int8_attention(
         self,
         num_heads,
         head_dim,
         seq_len,
         extend_len,
         num_requests,
-        dtype,
         num_heads_kv=None,
         head_dim_v=None,
         mla=False,
         logit_cap=0.0,
         k_scale=0.01,
         v_scale=0.01,
+        dtype=torch.float16,
     ):
-        """Test extend_attention_int8_cpu with various configurations."""
+        """Run one INT8 extend case and compare against the reference path."""
         device = self.device
 
         if num_heads_kv is None:
@@ -211,9 +207,14 @@ class TestExtendAttentionInt8CPU(unittest.TestCase):
         k_buffer_int8 = (
             (k_buffer_float / k_scale).round().clamp(-128, 127).to(torch.int8)
         )
-        v_buffer_int8 = (
-            (v_buffer_float / v_scale).round().clamp(-128, 127).to(torch.int8)
-        )
+        if mla:
+            # MLA: v_buffer is a narrow view inside k_buffer (same physical memory).
+            # This matches the actual MLA memory layout used at runtime.
+            v_buffer_int8 = k_buffer_int8.narrow(2, 0, head_dim_v)
+        else:
+            v_buffer_int8 = (
+                (v_buffer_float / v_scale).round().clamp(-128, 127).to(torch.int8)
+            )
 
         # Request to token mapping
         req_to_token = torch.zeros(
@@ -286,15 +287,22 @@ class TestExtendAttentionInt8CPU(unittest.TestCase):
         torch.testing.assert_close(o_extend, ref_output, atol=atol, rtol=rtol)
 
     # Test cases
-    def test_extend_int8_batching(self):
-        """INT8 extend attention test with batching (Verifies offsets/strides)"""
+    def test_case_extend_int8_batching(self):
+        """Case: batching layout validates offsets and strides."""
         for dtype in [torch.float16, torch.bfloat16]:
-            self._run_extend_int8_test(4, 64, 64, 16, 4, dtype)
+            self.run_case_extend_int8_attention(
+                num_heads=4,
+                head_dim=64,
+                seq_len=64,
+                extend_len=16,
+                num_requests=4,
+                dtype=dtype,
+            )
 
-    def test_extend_int8_gqa(self):
-        """INT8 GQA extend test: LLaMA-style H_Q=32, H_KV=8"""
+    def test_case_extend_int8_gqa(self):
+        """Case: GQA extend layout with H_Q=32 and H_KV=8."""
         for dtype in [torch.float16, torch.bfloat16]:
-            self._run_extend_int8_test(
+            self.run_case_extend_int8_attention(
                 num_heads=32,
                 head_dim=64,
                 seq_len=128,
@@ -304,10 +312,10 @@ class TestExtendAttentionInt8CPU(unittest.TestCase):
                 num_heads_kv=8,
             )
 
-    def test_extend_int8_mla(self):
-        """INT8 MLA extend test: DeepSeek-style num_heads_kv=1 and shared buffer"""
+    def test_case_extend_int8_mla(self):
+        """Case: MLA extend layout with shared KV storage."""
         for dtype in [torch.float16, torch.bfloat16]:
-            self._run_extend_int8_test(
+            self.run_case_extend_int8_attention(
                 num_heads=16,
                 head_dim=192,
                 seq_len=128,
@@ -319,10 +327,10 @@ class TestExtendAttentionInt8CPU(unittest.TestCase):
                 mla=True,
             )
 
-    def test_extend_int8_logit_cap(self):
-        """INT8 logit_cap extend functionality test"""
+    def test_case_extend_int8_logit_cap(self):
+        """Case: logit-cap path in INT8 extend."""
         for dtype in [torch.float16, torch.bfloat16]:
-            self._run_extend_int8_test(
+            self.run_case_extend_int8_attention(
                 num_heads=8,
                 head_dim=64,
                 seq_len=64,
@@ -332,10 +340,10 @@ class TestExtendAttentionInt8CPU(unittest.TestCase):
                 logit_cap=50.0,
             )
 
-    def test_extend_int8_odd_dimensions(self):
-        """INT8 extend with odd dimensions"""
+    def test_case_extend_int8_odd_dimensions(self):
+        """Case: odd dimension extend layout."""
         for dtype in [torch.float16, torch.bfloat16]:
-            self._run_extend_int8_test(
+            self.run_case_extend_int8_attention(
                 num_heads=4,
                 head_dim=32,
                 seq_len=50,
@@ -344,10 +352,10 @@ class TestExtendAttentionInt8CPU(unittest.TestCase):
                 dtype=dtype,
             )
 
-    def test_extend_int8_scale(self):
-        """INT8 extend test with larger quantization scale"""
+    def test_case_extend_int8_scale(self):
+        """Case: extend with larger quantization scales."""
         for dtype in [torch.float16, torch.bfloat16]:
-            self._run_extend_int8_test(
+            self.run_case_extend_int8_attention(
                 num_heads=4,
                 head_dim=64,
                 seq_len=64,
@@ -358,7 +366,7 @@ class TestExtendAttentionInt8CPU(unittest.TestCase):
                 v_scale=0.05,
             )
 
-    def test_extend_int8_no_prefix(self):
+    def test_case_extend_int8_no_prefix(self):
         """INT8 extend-only test: no cached prefix (prefix_len=0, pure Stage 2 path).
 
         All other tests have seq_len > extend_len (prefix_len > 0), which exercises
@@ -366,7 +374,7 @@ class TestExtendAttentionInt8CPU(unittest.TestCase):
         prefix_len = 0 and only Stage 2 (FP k_extend) runs.
         """
         for dtype in [torch.float16, torch.bfloat16]:
-            self._run_extend_int8_test(
+            self.run_case_extend_int8_attention(
                 num_heads=4,
                 head_dim=64,
                 seq_len=32,  # seq_len == extend_len → prefix_len = 0

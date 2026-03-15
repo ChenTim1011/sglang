@@ -1,8 +1,5 @@
-"""
-This file tests the RVV-optimized extend (prefill) attention kernel.
-Extend attention is used during the initial prompt processing phase.
+"""Unit tests for RVV extend attention kernel (BF16/FP16).
 
-Features tested:
 - MHA (Multi-Head Attention): num_heads == num_heads_kv
 - GQA (Grouped Query Attention): num_heads != num_heads_kv
 - MLA (Multi-Latent Attention): shared KV buffer with num_heads_kv=1
@@ -10,7 +7,7 @@ Features tested:
 - Different head dimensions and extend lengths
 
 Usage:
-    python3 test_rvv_extend.py -v                      # Run all tests
+    python3 -m unittest test.srt.cpu.rvv.test_rvv_extend -v
 """
 
 import importlib.util
@@ -18,7 +15,7 @@ import unittest
 
 import torch
 
-from .utils import precision, run_sdpa_forward_extend
+from .rvv_utils import precision, run_sdpa_forward_extend
 
 try:
     import sgl_kernel  # noqa: F401
@@ -28,7 +25,7 @@ except ImportError:
 torch.manual_seed(1234)
 
 
-def _has_extend_attention_cpu() -> bool:
+def has_sgl_kernel_extend_attention() -> bool:
     if not importlib.util.find_spec("sgl_kernel"):
         return False
     try:
@@ -39,14 +36,17 @@ def _has_extend_attention_cpu() -> bool:
 
 
 @unittest.skipUnless(
-    _has_extend_attention_cpu(), "extend_attention_cpu not available (non-RISC-V build)"
+    has_sgl_kernel_extend_attention(),
+    "extend_attention_cpu not available (non-RISC-V build)",
 )
-class RVVExtendTestBase(unittest.TestCase):
+class TestRVVExtendBase(unittest.TestCase):
+    """Shared fixtures and helpers for RVV extend attention tests."""
+
     def setUp(self):
         self.device = torch.device("cpu")
         self.dtypes = [torch.float16, torch.bfloat16]
 
-    def _test_extend_attention_once(
+    def run_case_extend_attention(
         self,
         B,
         N_CTX,
@@ -55,9 +55,9 @@ class RVVExtendTestBase(unittest.TestCase):
         D,
         DV,
         mla=False,
-        dtype=torch.bfloat16,
         logit_cap=0.0,
         force_prefix_zero=False,
+        dtype=torch.bfloat16,
     ):
         if force_prefix_zero:
             b_seq_len_prefix = torch.zeros(B, dtype=torch.int32)
@@ -165,19 +165,18 @@ class RVVExtendTestBase(unittest.TestCase):
         torch.testing.assert_close(o_ref, o_extend, atol=atol, rtol=rtol)
 
 
-class TestExtendAttentionMHA(RVVExtendTestBase):
-    """
-    Test RVV extend attention for MHA (Multi-Head Attention) path.
-    """
+class TestRVVExtendMHA(TestRVVExtendBase):
+    """Test suite for RVV extend attention MHA path."""
 
-    def test_mha_configs(self):
+    def test_case_mha_cases(self):
+        """Case: MHA extend across representative shapes and dtypes."""
         # Config format: (B, N_CTX, H_Q, H_KV, D, DV, logit_cap)
         configs = [
-            (2, 128, 16, 16, 128, 96, 0.0),  # Basic MHA
-            (2, 64, 8, 8, 32, 32, 0.0),  # Odd dimensions tail handling
-            (4, 64, 8, 8, 128, 96, 0.0),  # Stress test: large batch
-            (2, 128, 16, 16, 128, 96, 50.0),  # Logit cap > 0
-            (1, 256, 4, 4, 64, 64, 0.0),  # Longer prompt context
+            (2, 128, 16, 16, 128, 96, 0.0),
+            (2, 64, 8, 8, 32, 32, 0.0),
+            (4, 64, 8, 8, 128, 96, 0.0),
+            (2, 128, 16, 16, 128, 96, 50.0),
+            (1, 256, 4, 4, 64, 64, 0.0),
         ]
         for B, N_CTX, H_Q, H_KV, D, DV, logit_cap in configs:
             for dtype in self.dtypes:
@@ -191,7 +190,7 @@ class TestExtendAttentionMHA(RVVExtendTestBase):
                     logit_cap=logit_cap,
                     dtype=dtype,
                 ):
-                    self._test_extend_attention_once(
+                    self.run_case_extend_attention(
                         B=B,
                         N_CTX=N_CTX,
                         H_Q=H_Q,
@@ -203,8 +202,8 @@ class TestExtendAttentionMHA(RVVExtendTestBase):
                         logit_cap=logit_cap,
                     )
 
-    def test_mha_extend_only(self):
-        """Pure Stage 2 path: prefix_len=0 for all requests (no cached prefix tokens)."""
+    def test_case_mha_extend_only(self):
+        """Case: pure extend stage with zero prefix lengths."""
         configs = [
             (2, 128, 16, 16, 128, 96, 0.0),
             (1, 64, 8, 8, 64, 64, 0.0),
@@ -215,7 +214,7 @@ class TestExtendAttentionMHA(RVVExtendTestBase):
                 with self.subTest(
                     B=B, N_CTX=N_CTX, H_Q=H_Q, H_KV=H_KV, D=D, DV=DV, dtype=dtype
                 ):
-                    self._test_extend_attention_once(
+                    self.run_case_extend_attention(
                         B=B,
                         N_CTX=N_CTX,
                         H_Q=H_Q,
@@ -229,15 +228,14 @@ class TestExtendAttentionMHA(RVVExtendTestBase):
                     )
 
 
-class TestExtendAttentionGQA(RVVExtendTestBase):
-    """
-    Test RVV extend attention for GQA (Grouped Query Attention) path.
-    """
+class TestRVVExtendGQA(TestRVVExtendBase):
+    """Test suite for RVV extend attention GQA path."""
 
-    def test_gqa_configs(self):
+    def test_case_gqa_cases(self):
+        """Case: GQA extend across representative shapes and dtypes."""
         # Config format: (B, N_CTX, H_Q, H_KV, D, DV)
         configs = [
-            (2, 128, 32, 8, 128, 96),  # LLaMA-style GQA (4:1)
+            (2, 128, 32, 8, 128, 96),  # GQA (4:1)
             (4, 128, 24, 4, 64, 64),  # 6:1 ratio
             (1, 256, 16, 2, 128, 128),  # 8:1 ratio
             (2, 64, 18, 3, 32, 32),  # Non-power-of-2 ratio
@@ -247,7 +245,7 @@ class TestExtendAttentionGQA(RVVExtendTestBase):
                 with self.subTest(
                     B=B, N_CTX=N_CTX, H_Q=H_Q, H_KV=H_KV, D=D, DV=DV, dtype=dtype
                 ):
-                    self._test_extend_attention_once(
+                    self.run_case_extend_attention(
                         B=B,
                         N_CTX=N_CTX,
                         H_Q=H_Q,
@@ -259,17 +257,15 @@ class TestExtendAttentionGQA(RVVExtendTestBase):
                     )
 
 
-class TestExtendAttentionMLA(RVVExtendTestBase):
-    """
-    Test RVV extend attention for MLA (Multi-Latent Attention) path - DeepSeek architecture.
-    """
+class TestRVVExtendMLA(TestRVVExtendBase):
+    """Test suite for RVV extend attention MLA path."""
 
-    def test_mla_configs(self):
-        """Exhaustive (carpet-search) test over multiple MLA configs."""
+    def test_case_mla_cases(self):
+        """Case: MLA extend across representative shapes and dtypes."""
         # Config format: (B, N_CTX, H_Q, H_KV, D, DV)
         configs = [
-            (2, 128, 22, 1, 192, 128),  # DeepSeek-style typical config
-            (4, 256, 16, 1, 192, 128),  # Larger batch/seq
+            (2, 128, 22, 1, 192, 128),
+            (4, 256, 16, 1, 192, 128),
             (1, 128, 17, 1, 192, 128),  # Odd number of heads
         ]
         for B, N_CTX, H_Q, H_KV, D, DV in configs:
@@ -277,7 +273,7 @@ class TestExtendAttentionMLA(RVVExtendTestBase):
                 with self.subTest(
                     B=B, N_CTX=N_CTX, H_Q=H_Q, H_KV=H_KV, D=D, DV=DV, dtype=dtype
                 ):
-                    self._test_extend_attention_once(
+                    self.run_case_extend_attention(
                         B=B,
                         N_CTX=N_CTX,
                         H_Q=H_Q,

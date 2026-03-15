@@ -1,6 +1,4 @@
-"""
-This file tests INT8-quantized decode attention for RVV backend.
-INT8 quantization reduces memory bandwidth and can improve performance on CPU.
+"""Unit tests for RVV decode attention kernel (INT8 KV cache).
 
 Key differences from FP16/BF16 tests:
 - Uses int8 buffers with scale factors (k_scale, v_scale)
@@ -8,7 +6,7 @@ Key differences from FP16/BF16 tests:
 - Tests include quantization and dequantization in reference path
 
 Usage:
-    python3 test_rvv_decode_int8.py -v
+    python3 -m unittest test.srt.cpu.rvv.test_rvv_decode_int8 -v
 """
 
 import unittest
@@ -17,9 +15,9 @@ import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 try:
-    from .utils import has_op, int8_decode_precision
+    from .rvv_utils import has_sgl_kernel_op, int8_decode_precision
 except ImportError:
-    from test.srt.cpu.rvv.utils import has_op, int8_decode_precision
+    from test.srt.cpu.rvv.rvv_utils import has_sgl_kernel_op, int8_decode_precision
 
 
 def naive_attention_decode(
@@ -83,11 +81,8 @@ def naive_attention_decode(
     return output
 
 
-class TestDecodeAttentionInt8CPU(unittest.TestCase):
-    """
-    Test INT8-quantized decode attention for RVV backend.
-
-    """
+class TestRVVDecodeInt8(unittest.TestCase):
+    """Test suite for RVV decode attention with INT8 KV cache."""
 
     @classmethod
     def setUpClass(cls):
@@ -96,30 +91,21 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
         # Import sgl_kernel to ensure it's loaded
         import sgl_kernel  # noqa: F401
 
-        if not has_op("decode_attention_int8_cpu"):
+        if not has_sgl_kernel_op("decode_attention_int8_cpu"):
             raise unittest.SkipTest("decode_attention_int8_cpu not available")
 
-    def _run_decode_int8_test(
-        self, num_heads, head_dim, seq_len, num_requests, dtype, num_heads_kv=None
+    def run_case_decode_int8_attention(
+        self,
+        num_heads,
+        head_dim,
+        seq_len,
+        num_requests,
+        num_heads_kv=None,
+        k_scale=0.01,
+        v_scale=0.01,
+        dtype=torch.float16,
     ):
-        """
-        Test decode_attention_int8_cpu with various configurations.
-
-        Args:
-            num_heads: Number of query heads (H_Q)
-            head_dim: Dimension of each head
-            seq_len: Sequence length for existing tokens
-            num_requests: Number of requests (batch size)
-            dtype: Query/output dtype (torch.float16 or torch.bfloat16)
-            num_heads_kv: Number of KV heads (H_KV); None defaults to num_heads (MHA).
-                          Set num_heads_kv < num_heads to exercise the GQA path.
-
-        This test:
-        1. Creates random FP32 data and quantizes to INT8 with scale factors
-        2. Runs RVV INT8 kernel
-        3. Runs reference implementation (naive_attention_decode with INT8 support)
-        4. Compares results with relaxed tolerance (INT8 has quantization error)
-        """
+        """Run one INT8 decode case and compare against the reference path."""
         device = self.device
         if num_heads_kv is None:
             num_heads_kv = num_heads
@@ -127,11 +113,7 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
         head_dim_v = head_dim
         max_seq_len = seq_len + 16
 
-        # Quantization parameters
-        k_scale = 0.01
-        v_scale = 0.01
-
-        # Query in FP16/BF16 (not quantized in decode attention)
+        # Query in FP16/BF16
         query = torch.randn(
             num_requests, num_heads, head_dim, dtype=dtype, device=device
         )
@@ -170,12 +152,12 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
             [seq_len] * num_requests, dtype=torch.long, device=device
         )
 
-        # Initialize request-to-token mapping (each request has contiguous tokens)
-        for i in range(num_requests):
-            start_idx = i * max_seq_len
-            req_to_token[i, :seq_len] = torch.arange(
-                start_idx, start_idx + seq_len, dtype=torch.long
-            )
+        # Initialize request-to-token mapping with random memory pool indices to simulate Paged Attention
+        req_to_token = (
+            torch.randperm(max_tokens, device=device)
+            .reshape(num_requests, max_seq_len)
+            .to(torch.long)
+        )
 
         # New key/value for current decode step (FP32 -> INT8)
         key_float = torch.randn(
@@ -243,9 +225,9 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
         v_buffer_ref = v_buffer_int8.clone()
 
         for i in range(num_requests):
-            l = loc[i].item()
-            k_buffer_ref[l] = key_int8[i]
-            v_buffer_ref[l] = value_int8[i]
+            loc_idx = loc[i].item()
+            k_buffer_ref[loc_idx] = key_int8[i]
+            v_buffer_ref[loc_idx] = value_int8[i]
 
         # naive_attention_decode handles INT8 dequantization internally
         ref_output = naive_attention_decode(
@@ -265,7 +247,7 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
         atol = rtol = int8_decode_precision[dtype]
         torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
-    def _run_decode_int8_mla_test(
+    def run_case_decode_int8_attention_mla(
         self,
         head_dim=192,
         head_dim_v=128,
@@ -273,11 +255,7 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
         num_requests=2,
         dtype=torch.bfloat16,
     ):
-        """
-        Test decode_attention_int8_cpu specifically for MLA structure.
-        In MLA, v_buffer is a memory view inside k_buffer.
-        H_KV is typically 1.
-        """
+        """Run one INT8 decode MLA case with shared KV storage layout."""
         device = self.device
         num_heads = 16  # H_Q
         max_seq_len = seq_len + 16
@@ -308,11 +286,12 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
             [seq_len] * num_requests, dtype=torch.long, device=device
         )
 
-        for i in range(num_requests):
-            start_idx = i * max_seq_len
-            req_to_token[i, :seq_len] = torch.arange(
-                start_idx, start_idx + seq_len, dtype=torch.long
-            )
+        # Simulate actual Paged Attention memory fragmentation
+        req_to_token = (
+            torch.randperm(max_tokens, device=device)
+            .reshape(num_requests, max_seq_len)
+            .to(torch.long)
+        )
 
         key_float = torch.randn(
             num_requests, 1, head_dim, dtype=torch.float32, device=device
@@ -367,8 +346,8 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
         v_buffer_ref = k_buffer_ref.narrow(2, 0, head_dim_v)
 
         for i in range(num_requests):
-            l = loc[i].item()
-            k_buffer_ref[l] = key_int8[i]
+            loc_idx = loc[i].item()
+            k_buffer_ref[loc_idx] = key_int8[i]
 
         ref_output = naive_attention_decode(
             query,
@@ -386,13 +365,15 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
         atol = rtol = int8_decode_precision[dtype]
         torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
-    def test_decode_int8_gqa(self):
-        """INT8 GQA tests: exercises decode_attention_grouped_kernel_impl<scalar_t, int8_t>."""
+    def test_case_decode_int8_gqa(self):
+        """Case: GQA decode across representative INT8 configurations."""
         configs = [
             # (num_heads, num_heads_kv, head_dim, seq_len, num_requests)
-            (32, 8, 64, 256, 4),  # LLaMA-style 4:1 ratio
-            (16, 2, 64, 128, 2),  # 8:1 ratio
-            (12, 3, 64, 128, 2),  # 4:1 ratio, non-power-of-2 heads
+            (32, 8, 64, 63, 4),
+            (32, 8, 64, 129, 4),
+            (32, 8, 64, 256, 4),
+            (16, 2, 64, 128, 2),
+            (12, 3, 64, 128, 2),
         ]
         for num_heads, num_heads_kv, head_dim, seq_len, num_requests in configs:
             for dtype in [torch.float16, torch.bfloat16]:
@@ -403,7 +384,7 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
                     seq_len=seq_len,
                     dtype=dtype,
                 ):
-                    self._run_decode_int8_test(
+                    self.run_case_decode_int8_attention(
                         num_heads=num_heads,
                         head_dim=head_dim,
                         seq_len=seq_len,
@@ -412,224 +393,92 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
                         num_heads_kv=num_heads_kv,
                     )
 
-    def test_decode_int8_small_scale(self):
-        """INT8 test with small scale (higher quantization precision)"""
-        # Modify _run_decode_int8_test to accept custom scales
-        device = self.device
-        head_dim = 64
-        num_heads = 8
-        seq_len = 128
-        num_requests = 2
+    def test_case_decode_int8_small_scale(self):
+        """Case: decode with small quantization scales."""
+        configs = [
+            # (num_heads, head_dim, seq_len, num_requests, num_heads_kv)
+            (8, 64, 63, 2, None),  # MHA
+            (8, 64, 129, 2, None),  # MHA
+            (8, 64, 128, 2, None),  # MHA
+            (16, 64, 128, 2, 4),  # GQA 4:1
+        ]
+        for num_heads, head_dim, seq_len, num_requests, num_heads_kv in configs:
+            for dtype in [torch.float16, torch.bfloat16]:
+                with self.subTest(
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    num_heads_kv=num_heads_kv,
+                    dtype=dtype,
+                ):
+                    self.run_case_decode_int8_attention(
+                        num_heads=num_heads,
+                        head_dim=head_dim,
+                        seq_len=seq_len,
+                        num_requests=num_requests,
+                        dtype=dtype,
+                        num_heads_kv=num_heads_kv,
+                        k_scale=0.001,
+                        v_scale=0.001,
+                    )
 
-        # Small scale = less quantization error
-        k_scale = 0.001
-        v_scale = 0.001
+    def test_case_decode_int8_large_scale(self):
+        """Case: decode with large quantization scales."""
+        configs = [
+            # (num_heads, head_dim, seq_len, num_requests, num_heads_kv)
+            (16, 128, 129, 4, None),  # MHA VLEN + 1
+            (16, 128, 256, 4, None),  # MHA
+            (32, 128, 256, 4, 8),  # GQA 4:1
+        ]
+        for num_heads, head_dim, seq_len, num_requests, num_heads_kv in configs:
+            for dtype in [torch.float16, torch.bfloat16]:
+                with self.subTest(
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    num_heads_kv=num_heads_kv,
+                    dtype=dtype,
+                ):
+                    self.run_case_decode_int8_attention(
+                        num_heads=num_heads,
+                        head_dim=head_dim,
+                        seq_len=seq_len,
+                        num_requests=num_requests,
+                        dtype=dtype,
+                        num_heads_kv=num_heads_kv,
+                        k_scale=0.1,
+                        v_scale=0.1,
+                    )
 
+    def test_case_decode_int8_odd_dimensions(self):
+        """Case: odd dimension decode layout."""
         for dtype in [torch.float16, torch.bfloat16]:
-            self._run_decode_int8_with_custom_scale(
-                num_heads, head_dim, seq_len, num_requests, dtype, k_scale, v_scale
-            )
-
-    def test_decode_int8_large_scale(self):
-        """INT8 test with large scale (more quantization error)"""
-        device = self.device
-        head_dim = 128
-        num_heads = 16
-        seq_len = 256
-        num_requests = 4
-
-        # Large scale = more quantization error, tests robustness
-        k_scale = 0.1
-        v_scale = 0.1
-
-        for dtype in [torch.float16, torch.bfloat16]:
-            self._run_decode_int8_with_custom_scale(
-                num_heads, head_dim, seq_len, num_requests, dtype, k_scale, v_scale
-            )
-
-    def test_decode_int8_odd_dimensions(self):
-        """Edge case: INT8 with odd dimensions"""
-        for dtype in [torch.float16, torch.bfloat16]:
-            self._run_decode_int8_test(
+            self.run_case_decode_int8_attention(
                 num_heads=17, head_dim=127, seq_len=255, num_requests=3, dtype=dtype
             )
 
-    def test_decode_int8_minimal(self):
-        """Edge case: INT8 minimal configuration"""
+    def test_case_decode_int8_minimal(self):
+        """Case: minimal decode configuration."""
         for dtype in [torch.float16, torch.bfloat16]:
-            self._run_decode_int8_test(
+            self.run_case_decode_int8_attention(
                 num_heads=1, head_dim=32, seq_len=1, num_requests=1, dtype=dtype
             )
 
-    def test_decode_int8_mla(self):
-        """MLA specific INT8 configuration: v_buffer is inside k_buffer"""
+    def test_case_decode_int8_mla(self):
+        """Case: MLA decode with shared KV storage."""
         for dtype in [torch.float16, torch.bfloat16]:
-            self._run_decode_int8_mla_test(
+            self.run_case_decode_int8_attention_mla(
                 head_dim=192, head_dim_v=128, seq_len=128, num_requests=2, dtype=dtype
             )
 
-    def _run_decode_int8_with_custom_scale(
-        self, num_heads, head_dim, seq_len, num_requests, dtype, k_scale, v_scale
-    ):
-        """
-        Helper method to run INT8 test with custom scale factors.
-        This is a copy of _run_decode_int8_test with parameterized scales.
-        """
-        device = self.device
-        head_dim_v = head_dim
-        max_seq_len = seq_len + 16
-
-        # Query in FP16/BF16 (not quantized in decode attention)
-        query = torch.randn(
-            num_requests, num_heads, head_dim, dtype=dtype, device=device
-        )
-
-        # Create KV cache: Float32 -> INT8 quantization
-        max_tokens = num_requests * max_seq_len
-
-        k_buffer_float = (
-            torch.randn(
-                max_tokens, num_heads, head_dim, dtype=torch.float32, device=device
-            )
-            * 5.0
-        )
-
-        v_buffer_float = (
-            torch.randn(
-                max_tokens, num_heads, head_dim_v, dtype=torch.float32, device=device
-            )
-            * 5.0
-        )
-
-        # Quantize with custom scales
-        k_buffer_int8 = (
-            (k_buffer_float / k_scale).round().clamp(-128, 127).to(torch.int8)
-        )
-        v_buffer_int8 = (
-            (v_buffer_float / v_scale).round().clamp(-128, 127).to(torch.int8)
-        )
-
-        # Metadata
-        req_to_token = torch.zeros(
-            num_requests, max_seq_len, dtype=torch.long, device=device
-        )
-        req_pool_indices = torch.arange(num_requests, dtype=torch.long, device=device)
-        seq_lens = torch.tensor(
-            [seq_len] * num_requests, dtype=torch.long, device=device
-        )
-
-        for i in range(num_requests):
-            start_idx = i * max_seq_len
-            req_to_token[i, :seq_len] = torch.arange(
-                start_idx, start_idx + seq_len, dtype=torch.long
-            )
-
-        # New key/value for current decode step
-        key_float = torch.randn(
-            num_requests, num_heads, head_dim, dtype=torch.float32, device=device
-        )
-        value_float = torch.randn(
-            num_requests, num_heads, head_dim_v, dtype=torch.float32, device=device
-        )
-
-        key_int8 = (key_float / k_scale).round().clamp(-128, 127).to(torch.int8)
-        value_int8 = (value_float / v_scale).round().clamp(-128, 127).to(torch.int8)
-
-        # Locations to write new key/value
-        loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
-        for i in range(num_requests):
-            loc[i] = req_to_token[i, seq_len - 1]
-
-        # Output buffers
-        output = torch.zeros(
-            num_requests, num_heads, head_dim_v, dtype=dtype, device=device
-        )
-        attn_logits = torch.zeros(
-            num_requests,
-            num_heads,
-            1,
-            head_dim_v + 1,
-            dtype=torch.float32,
-            device=device,
-        )
-
-        # Attention parameters
-        sm_scale = 1.0 / (head_dim**0.5)
-        logit_cap = 0.0  # Disable logit cap: reference doesn't implement it
-
-        # Per-token scale buffers (num_heads_kv == num_heads in this test path)
-        k_scale_buf = torch.full((max_tokens, num_heads), k_scale, dtype=torch.float32)
-        v_scale_buf = torch.full((max_tokens, num_heads), v_scale, dtype=torch.float32)
-
-        # Run RVV INT8 Kernel
-        torch.ops.sgl_kernel.decode_attention_int8_cpu(
-            query,
-            k_buffer_int8,
-            v_buffer_int8,
-            output,
-            key_int8,
-            value_int8,
-            loc,
-            attn_logits,
-            req_to_token,
-            req_pool_indices,
-            seq_lens,
-            sm_scale,
-            logit_cap,
-            k_scale_buf,
-            v_scale_buf,
-            k_scale,
-            v_scale,
-        )
-
-        # Reference
-        k_buffer_ref = k_buffer_int8.clone()
-        v_buffer_ref = v_buffer_int8.clone()
-
-        for i in range(num_requests):
-            l = loc[i].item()
-            k_buffer_ref[l] = key_int8[i]
-            v_buffer_ref[l] = value_int8[i]
-
-        ref_output = naive_attention_decode(
-            query,
-            k_buffer_ref,
-            v_buffer_ref,
-            req_to_token,
-            req_pool_indices,
-            seq_lens,
-            sm_scale,
-            logit_cap,
-            k_scale,
-            v_scale,
-        )
-
-        atol = rtol = int8_decode_precision[dtype]
-        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
-
-    def test_decode_int8_per_layer_scale_isolation(self):
-        """Per-layer scale isolation: each layer must use its own scale slot.
-        This test proves why per-layer isolation is necessary:
-          1. Quantize KV with scale_A (correct for Layer 0).
-          2. Run decode with k_scale_buf filled with scale_B (wrong — simulates
-             another layer overwriting the buffer before Layer 0 reads it).
-             → output MUST differ from reference (asserting the bug exists).
-          3. Run decode with k_scale_buf filled with scale_A (correct).
-             → output MUST match reference (asserting the fix works).
-        """
+    def test_case_decode_int8_per_layer_scale_isolation(self):
+        """Case: per-layer scale isolation preserves decode correctness."""
         num_heads = 8
         num_heads_kv = 2
         head_dim = 64
         seq_len = 32
         num_requests = 2
         dtype = torch.bfloat16
-        device = "cpu"
-
-        # scale_A: the correct scale used when quantizing KV for "Layer 0".
-        # scale_B: a different scale that "Layer 1" would write to the same buffer
-        #          slot, contaminating Layer 0's lookup.
         scale_A = 0.01  # Layer 0's quantization scale
-        scale_B = 0.50  # Layer 1's scale — 50× larger, produces a very different result
+        scale_B = 0.50  # Layer 1's scale (intentionally wrong for Layer 0)
 
         max_seq_len = seq_len + 16
         max_tokens = num_requests * max_seq_len
@@ -706,7 +555,6 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
 
         atol = rtol = int8_decode_precision[dtype]
 
-        # ── WRONG scale (scale_B): simulates another layer overwriting the buffer ──
         out_wrong = _run(scale_B)
         self.assertFalse(
             torch.allclose(out_wrong, ref_output, atol=atol, rtol=rtol),
@@ -714,7 +562,6 @@ class TestDecodeAttentionInt8CPU(unittest.TestCase):
             "if this assertion fails, scale_B is too close to scale_A.",
         )
 
-        # ── CORRECT scale (scale_A): per-layer isolation gives the right result ──
         out_correct = _run(scale_A)
         torch.testing.assert_close(out_correct, ref_output, atol=atol, rtol=rtol)
 

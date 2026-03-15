@@ -2,6 +2,9 @@
 
 Tests run against RotaryEmbedding.forward_native / DeepseekScalingRotaryEmbedding
 and are skipped automatically on non-RISC-V builds.
+
+Usage:
+    python3 -m unittest test.srt.cpu.rvv.test_rvv_rope -v
 """
 
 import unittest
@@ -15,12 +18,12 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
-from .utils import precision
+from .rvv_utils import rope_precision
 
 torch.manual_seed(1234)
 
 
-def _has_sgl_kernel_rope():
+def has_sgl_kernel_rope():
     """Return True only if the RVV rotary_embedding_cpu op is registered."""
     try:
         import sgl_kernel  # noqa: F401
@@ -32,37 +35,40 @@ def _has_sgl_kernel_rope():
 
 
 @unittest.skipUnless(
-    _has_sgl_kernel_rope(),
+    has_sgl_kernel_rope(),
     "sgl_kernel rotary_embedding_cpu not available (non-RISC-V build)",
 )
-class TestRVVRope(CustomTestCase):
-    """RVV RoPE tests — 2D/4D, neox/non-neox configs."""
+class TestRVVRopeCore(CustomTestCase):
+    """Test suite for RVV RoPE kernel compatibility checks."""
 
     # (head_size, rotary_dim, max_pos, base, is_neox, dtype, device, batch, seq, q_heads, kv_heads)
     test_config = [
         (64, 64, 32, 8000, True, torch.bfloat16, "cpu", 32, 32, 1, 1),
+        (64, 64, 32, 8000, True, torch.float16, "cpu", 32, 32, 1, 1),  # FP16 neox
         (256, 128, 4096, 10000, True, torch.bfloat16, "cpu", 2, 512, 32, 8),
         (512, 128, 311, 10000, True, torch.bfloat16, "cpu", 3, 39, 4, 2),
         (128, 128, 2048, 10000, False, torch.bfloat16, "cpu", 2, 512, 32, 8),
+        (128, 128, 2048, 10000, False, torch.float16, "cpu", 2, 512, 32, 8),
         (128, 128, 2048, 10000, False, torch.bfloat16, "cpu", 2, 512, 16, 4),
         (512, 128, 311, 10000, False, torch.bfloat16, "cpu", 3, 39, 4, 2),
     ]
 
-    def _single_test(
+    def run_case_rope_core(
         self,
         head_size,
         rotary_dim,
         max_position_embeddings,
         base,
-        is_neox_style,
-        dtype,
-        device,
         batch_size,
         seq_len,
         num_q_heads,
         num_kv_heads,
         dims,
+        is_neox_style,
+        device,
+        dtype,
     ):
+        """Run one RoPE case for either 2D or 4D tensor layout."""
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         torch.manual_seed(100)
         rope_ref = RotaryEmbedding(
@@ -103,39 +109,64 @@ class TestRVVRope(CustomTestCase):
             rope_ref.cos_sin_cache.to(query.dtype),
             rope_ref.is_neox_style,
         )
-        atol = rtol = 5e-2
+        atol = rtol = rope_precision[dtype]
         torch.testing.assert_close(query_ref_out, query_cpu_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(key_ref_out, key_cpu_out, atol=atol, rtol=rtol)
 
-    def test_rope_2d(self):
+    def test_case_rope_2d(self):
+        """Case: 2D RoPE across representative shape and dtype matrix."""
         for cfg in self.test_config:
             hs, rd, mp, base, neox, dt, dev, bs, sl, qh, kvh = cfg
             with self.subTest(
                 head_size=hs, rotary_dim=rd, is_neox=neox, batch=bs, seq=sl
             ):
-                self._single_test(
-                    hs, rd, mp, base, neox, dt, dev, bs, sl, qh, kvh, dims=2
+                self.run_case_rope_core(
+                    head_size=hs,
+                    rotary_dim=rd,
+                    max_position_embeddings=mp,
+                    base=base,
+                    batch_size=bs,
+                    seq_len=sl,
+                    num_q_heads=qh,
+                    num_kv_heads=kvh,
+                    dims=2,
+                    is_neox_style=neox,
+                    device=dev,
+                    dtype=dt,
                 )
 
-    def test_rope_4d(self):
+    def test_case_rope_4d(self):
+        """Case: 4D RoPE across representative shape and dtype matrix."""
         for cfg in self.test_config:
             hs, rd, mp, base, neox, dt, dev, bs, sl, qh, kvh = cfg
             with self.subTest(
                 head_size=hs, rotary_dim=rd, is_neox=neox, batch=bs, seq=sl
             ):
-                self._single_test(
-                    hs, rd, mp, base, neox, dt, dev, bs, sl, qh, kvh, dims=4
+                self.run_case_rope_core(
+                    head_size=hs,
+                    rotary_dim=rd,
+                    max_position_embeddings=mp,
+                    base=base,
+                    batch_size=bs,
+                    seq_len=sl,
+                    num_q_heads=qh,
+                    num_kv_heads=kvh,
+                    dims=4,
+                    is_neox_style=neox,
+                    device=dev,
+                    dtype=dt,
                 )
 
 
 @unittest.skipUnless(
-    _has_sgl_kernel_rope(),
+    has_sgl_kernel_rope(),
     "sgl_kernel rotary_embedding_cpu not available (non-RISC-V build)",
 )
-class TestRVVDeepseekV2Rope(CustomTestCase):
-    """RVV RoPE 3D test — DeepSeek V2 style (num_kv_heads=1)."""
+class TestRVVRopeDeepseekV2(CustomTestCase):
+    """Test suite for RVV DeepSeek V2 RoPE variant."""
 
-    def test_deepseek_v2_rope(self):
+    def test_case_deepseek_v2_rope(self):
+        """Case: DeepSeek V2 RoPE path with shared KV-head layout."""
         num_head = 16
         seq_len = 1024
         q_head_dim = 192
@@ -193,7 +224,7 @@ class TestRVVDeepseekV2Rope(CustomTestCase):
                     False,
                 )
 
-                atol = rtol = precision[q_pe.dtype]
+                atol = rtol = rope_precision[q_pe.dtype]
                 torch.testing.assert_close(q_pe, q_pe_clone, atol=atol, rtol=rtol)
                 torch.testing.assert_close(k_pe, k_pe_clone, atol=atol, rtol=rtol)
 
