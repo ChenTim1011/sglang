@@ -1,13 +1,11 @@
-"""
-Test for decode_attention_cpu kernel (RVV optimized, FP16/BF16).
+"""Unit tests for RVV decode attention kernel (FP16/BF16).
 
-This file tests all three attention paths implemented in rvv/decode.cpp:
 1. MHA (Multi-Head Attention): num_heads == num_heads_kv
 2. GQA/MQA (Grouped/Multi-Query Attention): num_heads != num_heads_kv
 3. MLA (Multi-Latent Attention): shared KV buffer, num_heads_kv=1, head_size=head_size_v+64
 
 Usage:
-    python3 test_rvv_decode.py -v                         # Run all tests
+    python3 -m unittest test.srt.cpu.rvv.test_rvv_decode -v
 """
 
 import importlib.util
@@ -15,7 +13,7 @@ import unittest
 
 import torch
 
-from .utils import precision, run_sdpa_forward_decode
+from .rvv_utils import precision, run_sdpa_forward_decode
 
 try:
     import sgl_kernel  # noqa: F401
@@ -25,7 +23,7 @@ except ImportError:
 torch.manual_seed(1234)
 
 
-def _has_decode_attention_cpu() -> bool:
+def has_sgl_kernel_decode_attention() -> bool:
     if not importlib.util.find_spec("sgl_kernel"):
         return False
     try:
@@ -36,15 +34,18 @@ def _has_decode_attention_cpu() -> bool:
 
 
 @unittest.skipUnless(
-    _has_decode_attention_cpu(), "decode_attention_cpu not available (non-RISC-V build)"
+    has_sgl_kernel_decode_attention(),
+    "decode_attention_cpu not available (non-RISC-V build)",
 )
-class RVVDecodeTestBase(unittest.TestCase):
+class TestRVVDecodeBase(unittest.TestCase):
+    """Shared fixtures and helpers for RVV decode attention tests."""
+
     def setUp(self):
         self.device = torch.device("cpu")
         self.dtypes = [torch.float16, torch.bfloat16]
 
-    def _test_grouped_decode_attention_once(
-        self, B, H_Q, H_KV, D, D_V, seq_len=1024, dtype=torch.float16, is_mla=False
+    def run_case_decode_attention_grouped(
+        self, B, H_Q, H_KV, D, D_V, seq_len=1024, is_mla=False, dtype=torch.float16
     ):
         device = self.device
         total_tokens = B * seq_len
@@ -87,11 +88,10 @@ class RVVDecodeTestBase(unittest.TestCase):
         o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device)
         o_grouped = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device)
 
-        req_to_token = (
-            torch.arange(total_tokens, device=device)
-            .reshape(B, seq_len)
-            .to(torch.int32)
-        )
+        # Simulate true Paged Attention by fragmenting the memory pool indices
+        random_indices = torch.randperm(total_tokens, device=device)
+        req_to_token = random_indices.reshape(B, seq_len).to(torch.int32)
+
         b_req_idx = torch.arange(B, device=device).to(torch.int64)
         b_seq_len = torch.full((B,), seq_len, device=device).to(torch.int64)
 
@@ -141,85 +141,88 @@ class RVVDecodeTestBase(unittest.TestCase):
         cos_sim = torch.nn.functional.cosine_similarity(
             o.flatten(), o_grouped.flatten(), dim=0
         )
-        # Use precision tolerances mapped by dtype
-        atol = rtol = precision[q.dtype]
+        prec = precision[q.dtype]
         self.assertGreater(cos_sim.item(), 0.99)
-        torch.testing.assert_close(o, o_grouped, atol=atol, rtol=rtol)
+        torch.testing.assert_close(o, o_grouped, atol=prec, rtol=prec)
 
         if is_mla:
-            torch.testing.assert_close(k_buffer, k_buffer2, atol=atol, rtol=rtol)
-            torch.testing.assert_close(v_buffer, v_buffer2, atol=atol, rtol=rtol)
+            torch.testing.assert_close(k_buffer, k_buffer2, atol=prec, rtol=prec)
+            torch.testing.assert_close(v_buffer, v_buffer2, atol=prec, rtol=prec)
 
 
-class TestDecodeAttentionMHA(RVVDecodeTestBase):
-    """
-    Test RVV decode attention for MHA (Multi-Head Attention) path.
-    """
+class TestRVVDecodeMHA(TestRVVDecodeBase):
+    """Test suite for RVV decode attention MHA path."""
 
-    def test_mha_configs(self):
+    def test_case_mha_cases(self):
+        """Case: MHA decode across representative shapes and dtypes."""
         # Config format: (B, H_Q, H_KV, D, D_V, seq_len)
         configs = [
-            (1, 1, 1, 64, 64, 128),  # Minimal
-            (2, 8, 8, 128, 128, 256),  # Typical small
-            (4, 16, 16, 64, 64, 512),  # Med batch, med seq
-            (2, 17, 17, 127, 127, 128),  # Odd dimensions handling
-            (8, 8, 8, 128, 128, 128),  # Larger batch
+            (1, 1, 1, 64, 64, 128),
+            (2, 8, 8, 128, 128, 63),
+            (2, 8, 8, 128, 128, 65),
+            (2, 8, 8, 128, 128, 129),
+            (2, 8, 8, 128, 128, 256),
+            (4, 16, 16, 64, 64, 512),
+            (2, 17, 17, 127, 127, 128),
+            (8, 8, 8, 128, 128, 128),
         ]
         for B, H_Q, H_KV, D, D_V, seq_len in configs:
             for dtype in self.dtypes:
                 with self.subTest(
                     B=B, H_Q=H_Q, H_KV=H_KV, D=D, D_V=D_V, seq_len=seq_len, dtype=dtype
                 ):
-                    self._test_grouped_decode_attention_once(
+                    self.run_case_decode_attention_grouped(
                         B, H_Q, H_KV, D, D_V, seq_len=seq_len, dtype=dtype, is_mla=False
                     )
 
 
-class TestDecodeAttentionGQA(RVVDecodeTestBase):
-    """
-    Test RVV decode attention for GQA/MQA (Grouped Query Attention) path.
-    GQA: num_heads != num_heads_kv (e.g., LLaMA with H_Q=32, H_KV=8)
-    MQA: num_heads_kv=1
-    """
+class TestRVVDecodeGQA(TestRVVDecodeBase):
+    """Test suite for RVV decode attention GQA and MQA paths."""
 
-    def test_gqa_mqa_configs(self):
+    def test_case_gqa_mqa_cases(self):
+        """Case: GQA and MQA decode across representative shapes and dtypes."""
         # Config format: (B, H_Q, H_KV, D, D_V, seq_len)
         configs = [
-            (2, 32, 8, 128, 128, 256),  # LLaMA-style GQA (4:1)
-            (4, 16, 1, 128, 128, 128),  # MQA style (16:1)
-            (2, 18, 3, 128, 128, 128),  # 6x ratio, non-power-of-2
-            (2, 21, 7, 128, 128, 128),  # 3x ratio, odd head counts
-            (1, 12, 3, 64, 64, 512),  # 4x ratio, small odd KV heads
+            (2, 32, 8, 128, 128, 63),
+            (2, 32, 8, 128, 128, 129),
+            (2, 32, 8, 128, 128, 256),
+            (4, 16, 1, 128, 128, 128),
+            (2, 18, 3, 128, 128, 128),
+            (2, 21, 7, 128, 128, 128),
+            (1, 12, 3, 64, 64, 512),
         ]
         for B, H_Q, H_KV, D, D_V, seq_len in configs:
             for dtype in self.dtypes:
                 with self.subTest(
                     B=B, H_Q=H_Q, H_KV=H_KV, D=D, D_V=D_V, seq_len=seq_len, dtype=dtype
                 ):
-                    self._test_grouped_decode_attention_once(
+                    self.run_case_decode_attention_grouped(
                         B, H_Q, H_KV, D, D_V, seq_len=seq_len, dtype=dtype, is_mla=False
                     )
 
 
-class TestDecodeAttentionMLA(RVVDecodeTestBase):
-    """
-    Test RVV decode attention for MLA (Multi-Latent Attention) path.
-    """
+class TestRVVDecodeMLA(TestRVVDecodeBase):
+    """Test suite for RVV decode attention MLA path."""
 
-    def test_mla_configs(self):
+    def test_case_mla_cases(self):
+        """Case: MLA decode across representative shapes and dtypes."""
         # Config format: (B, H_Q, H_KV, D, D_V, seq_len)
         configs = [
-            (2, 16, 1, 192, 128, 256),  # DeepSeek-style typical config
-            (4, 8, 1, 192, 128, 512),  # Larger batch/seq
-            (1, 17, 1, 192, 128, 128),  # Odd number of heads
-            (2, 16, 1, 191, 127, 128),  # Odd head dimensions
+            (2, 16, 1, 192, 128, 63),
+            (2, 16, 1, 192, 128, 129),
+            (2, 16, 1, 192, 128, 256),
+            (4, 8, 1, 192, 128, 512),
+            (1, 17, 1, 192, 128, 128),
+            (2, 16, 1, 191, 127, 128),
+            (1, 22, 1, 576, 512, 128),
+            (1, 22, 1, 576, 512, 888),
         ]
         for B, H_Q, H_KV, D, D_V, seq_len in configs:
             for dtype in self.dtypes:
                 with self.subTest(
                     B=B, H_Q=H_Q, H_KV=H_KV, D=D, D_V=D_V, seq_len=seq_len, dtype=dtype
                 ):
-                    self._test_grouped_decode_attention_once(
+                    self.run_case_decode_attention_grouped(
                         B, H_Q, H_KV, D, D_V, seq_len=seq_len, dtype=dtype, is_mla=True
                     )
 

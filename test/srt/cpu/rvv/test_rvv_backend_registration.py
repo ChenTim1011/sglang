@@ -1,10 +1,10 @@
-"""
-Test RISC-V attention backend registration and runtime behavior.
+"""Unit tests for RVV attention backend registration.
 
-Verifies:
-- Backend registration in ATTENTION_BACKENDS
-- Correct backend selection on RISC-V vs non-RISC-V platforms
-- Runtime fallback behavior when sgl_kernel unavailable
+Verifies registry presence and runtime fallback selection behavior across
+RISC-V and non-RISC-V platforms.
+
+Usage:
+    python3 -m unittest test.srt.cpu.rvv.test_rvv_backend_registration -v
 """
 
 import platform
@@ -13,16 +13,16 @@ import unittest
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 
 
-class TestRVVBackend(unittest.TestCase):
-    """Test RVV backend registration and selection."""
+class TestRVVBackendRegistration(unittest.TestCase):
+    """Test suite for RVV backend registration and selection."""
 
-    def test_backend_registry_structure(self):
-        """Verify ATTENTION_BACKENDS has correct structure."""
+    def test_case_backend_registry_structure(self):
+        """Case: registry contains the RVV backend key."""
         self.assertIsInstance(ATTENTION_BACKENDS, dict)
         self.assertIn("rvv", ATTENTION_BACKENDS)
 
-    def test_backend_selection_on_current_platform(self):
-        """Test backend selection on actual hardware platform."""
+    def test_case_backend_selection_on_current_platform(self):
+        """Case: runtime backend selection matches platform capabilities."""
         import importlib.util
         from unittest.mock import Mock
 
