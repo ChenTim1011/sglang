@@ -1,10 +1,26 @@
+"""Shared helpers and numeric tolerances for RVV CPU unit tests."""
+
+# Module boundary:
+# - Shared helpers are imported from test.srt.cpu.utils and re-exported here
+#   for RVV tests (GeluAndMul, SiluAndMul, native_w8a8_per_token_matmul,
+#   torch_naive_fused_moe).
+# - RVV-only helpers stay local in this file (op availability checks,
+#   decode/extend references, norm references, and RVV-specific tolerances).
+
 import importlib.util
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
+from ..utils import (  # noqa: F401
+    GeluAndMul,
+    SiluAndMul,
+    native_w8a8_per_token_matmul,
+    torch_naive_fused_moe,
+)
 
-def has_op(op_name: str) -> bool:
+
+def has_sgl_kernel_op(op_name: str) -> bool:
     """Check if a specific operator is available in sgl_kernel."""
     if not importlib.util.find_spec("sgl_kernel"):
         return False
@@ -34,6 +50,12 @@ sigmoid_mul_precision = {
     torch.float16: 2e-1,
 }
 
+# Tolerances for rotary embedding (sin/cos accumulate more fp error than point-wise ops)
+rope_precision = {
+    torch.bfloat16: 3e-2,
+    torch.float16: 1e-2,
+}
+
 # Quantization error tolerances for INT8 decode/extend attention
 int8_decode_precision = {
     torch.bfloat16: 0.15,
@@ -44,62 +66,6 @@ int8_extend_precision = {
     torch.bfloat16: 0.5,
     torch.float16: 0.5,
 }
-
-
-def native_w8a8_per_token_matmul(A, B, As, Bs, bias, output_dtype=torch.bfloat16):
-    """
-    Reference INT8 GEMM implementation aligned with RVV kernel logic.
-
-    This implementation matches the calculation order in RVV C++ code:
-    - INT8 matrix multiplication
-    - Dequantization with combined scales: C * (As * Bs)
-    - Optional bias addition
-
-    Args:
-        A: Input tensor [M, K] int8
-        B: Weight tensor [N, K] int8
-        As: Per-token activation scales [M, 1] or [M] float32
-        Bs: Per-column weight scales [N, 1] or [N] float32
-        bias: Optional bias [N] float32
-        output_dtype: Output data type
-
-    Returns:
-        Output tensor [M, K] in output_dtype
-    """
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
-
-    # Handle scale shapes: ensure [M, 1] and [1, N] for broadcasting
-    # per_token_quant_int8 returns [M, 1], need to handle both [M] and [M, 1]
-    if As.dim() == 1:
-        As = As.unsqueeze(-1)  # [M] -> [M, 1]
-    # Bs can be [N] or [N, 1], need to convert to [1, N] for broadcasting
-    if Bs.dim() == 2:
-        Bs = Bs.squeeze(-1)  # [N, 1] -> [N]
-    Bs = Bs.unsqueeze(0)  # [N] -> [1, N]
-
-    assert A.shape[-1] == B.shape[-1], f"Dimension mismatch: A={A.shape}, B={B.shape}"
-    assert B.ndim == 2 and B.is_contiguous(), "B must be a 2D contiguous tensor"
-
-    # Reshape input
-    M = A.numel() // A.shape[-1]
-    B = B.t()  # Transpose weight matrix [N, K] -> [K, N]
-    N, K = B.shape[1], B.shape[0]
-    origin_C_shape = A.shape[:-1] + (N,)
-    A = A.reshape(M, -1)
-
-    # INT8 GEMM: [M, K] @ [K, N] = [M, N]
-    C = torch.matmul(A, B)  # [M, N] int32 accumulator
-
-    # Dequantize: C * (As * Bs)
-    # As: [M, 1], Bs: [1, N] -> broadcast to [M, N]
-    combined_scales = As * Bs  # [M, 1] * [1, N] = [M, N]
-    C = C * combined_scales
-
-    if bias is not None:
-        C.add_(bias.view(1, -1))
-
-    return C.reshape(origin_C_shape).to(output_dtype)
 
 
 def run_sdpa_forward_decode(
@@ -180,7 +146,6 @@ def run_sdpa_forward_extend(
 
     start_q, start_kv = 0, 0
     for seq_idx in range(seq_lens.shape[0]):
-
         extend_seq_len_q = extend_seq_lens[seq_idx]
         prefill_seq_len_q = extend_prefix_lens[seq_idx]
 
@@ -277,39 +242,3 @@ def layernorm_native(x, weight, eps, residual=None):
     x = (x - mean) * torch.rsqrt(variance + eps)
     x = x.to(orig_dtype) * weight
     return x if residual is None else (x, residual)
-
-
-def SiluAndMul(x):
-    """Reference implementation for SiluAndMul activation."""
-    x = torch.chunk(x, 2, dim=-1)
-    return torch.nn.functional.silu(x[0]) * x[1]
-
-
-def GeluAndMul(x, approximate="tanh"):
-    """Reference implementation for GELU*mul activation (matches test/srt/cpu/utils.py)."""
-    d = x.shape[-1] // 2
-    return torch.nn.functional.gelu(x[..., :d], approximate=approximate) * x[..., d:]
-
-
-def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize):
-    """Reference implementation for fused MoE."""
-    B, D = a.shape
-    a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
-    out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
-    score = torch.softmax(score, dim=-1, dtype=torch.float32)
-    topk_weight, topk_ids = torch.topk(score, topk)
-
-    if renormalize:
-        topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
-
-    topk_weight = topk_weight.view(-1)
-    topk_ids = topk_ids.view(-1)
-    for i in range(w1.shape[0]):
-        mask = topk_ids == i
-        if mask.sum():
-            out[mask] = SiluAndMul(a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(
-                0, 1
-            )
-    return (
-        out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
-    ).sum(dim=1)

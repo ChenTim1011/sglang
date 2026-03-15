@@ -1,20 +1,20 @@
 """Unit Tests for RVV GEMM kernel.
 
 Tests BF16 and INT8 GEMM operations on RISC-V Vector architecture.
+
+Usage:
+    python3 -m unittest test.srt.cpu.rvv.test_rvv_gemm -v
 """
 
 import itertools
-
-# Use RVV-specific utils (not Intel utils)
 import unittest
 
-# Import sgl_kernel to register custom ops
 import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.test.test_utils import CustomTestCase
 
-from .utils import (
+from .rvv_utils import (
     gemm_precision,
     native_w8a8_per_token_matmul,
     precision,
@@ -24,8 +24,8 @@ from .utils import (
 torch.manual_seed(1234)
 
 
-class TestGemm(CustomTestCase):
-    """RVV GEMM Tests - BF16 and INT8"""
+class TestRVVGemm(CustomTestCase):
+    """Test suite for RVV GEMM kernels."""
 
     M = [1, 2, 3, 4, 5, 101]
     N = [16, 32, 48, 64, 80]
@@ -40,7 +40,8 @@ class TestGemm(CustomTestCase):
     N_int8 = [32 * 12]
     K_int8 = [32 * 17]
 
-    def _bf16_gemm(self, M, N, K, has_bias, dtype):
+    def run_case_gemm_bf16(self, M, N, K, has_bias, dtype):
+        """Run one BF16 GEMM case and compare packed and unpacked paths."""
         mat1 = torch.randn(M, K, dtype=dtype)
         mat2 = torch.randn(N, K, dtype=dtype)
 
@@ -71,7 +72,8 @@ class TestGemm(CustomTestCase):
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
         torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
 
-    def test_fp16_bf16_gemm(self):
+    def test_case_gemm_bf16_matrix(self):
+        """Case: BF16 and FP16 GEMM across shape and bias matrix."""
         for params in itertools.product(
             self.M,
             self.N,
@@ -86,10 +88,10 @@ class TestGemm(CustomTestCase):
                 has_bias=params[3],
                 dtype=params[4],
             ):
-                self._bf16_gemm(*params)
+                self.run_case_gemm_bf16(*params)
 
-    def test_fp16_bf16_gemm_fma_path(self):
-        """Stress checks the FMA size boundaries checking N>64 VL MAX chunking specifically."""
+    def test_case_gemm_bf16_fma_path(self):
+        """Case: GEMM FMA boundary where N exceeds one vector-length chunk."""
         for params in itertools.product(
             self.M,
             self.N_fma,
@@ -104,12 +106,10 @@ class TestGemm(CustomTestCase):
                 has_bias=params[3],
                 dtype=params[4],
             ):
-                self._bf16_gemm(*params)
+                self.run_case_gemm_bf16(*params)
 
-    def _int8_gemm(self, M, N, K, has_bias, dtype):
-        """
-        INT8 GEMM test - uses RVV quantization.
-        """
+    def run_case_gemm_int8(self, M, N, K, has_bias, dtype):
+        """Run one INT8 GEMM case against the native reference implementation."""
         A = torch.randn((M, K), dtype=dtype) / 10
 
         # The Python reference uses round() while C++ RVV uses hardware vfcvt_x_f
@@ -159,7 +159,8 @@ class TestGemm(CustomTestCase):
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
         torch.testing.assert_close(ref_out, fused_out, atol=atol, rtol=rtol)
 
-    def test_int8_gemm(self):
+    def test_case_gemm_int8_matrix(self):
+        """Case: INT8 GEMM across shape, bias, and dtype matrix."""
         for params in itertools.product(
             self.M_int8,
             self.N_int8,
@@ -174,15 +175,10 @@ class TestGemm(CustomTestCase):
                 has_bias=params[3],
                 dtype=params[4],
             ):
-                self._int8_gemm(*params)
+                self.run_case_gemm_int8(*params)
 
-    def _bf16_gemm_with_small_oc(self, M, N, K, has_bias, use_post_sigmul, dtype):
-        """
-        Test BF16 GEMM with small output channels and optional sigmoid-mul fusion.
-
-        This tests fused_linear_sigmoid_mul which is implemented in RISC-V.
-        Note: fused_linear_sigmoid_mul requires post_mul_mat.size(1) to be divisible by 32.
-        """
+    def run_case_gemm_bf16_small_oc(self, M, N, K, has_bias, use_post_sigmul, dtype):
+        """Run one small-output-channel GEMM case with optional sigmoid fusion."""
         use_post_sigmul = use_post_sigmul and N == 1
         mat1 = torch.randn(M, K, dtype=dtype)
         mat2 = torch.randn(N, K, dtype=dtype)
@@ -208,13 +204,10 @@ class TestGemm(CustomTestCase):
                 True,  # is_vnni (for RISC-V, this means packed)
                 mat_mul,
             )
-            # Output shape is [M, post_mul_size]
-            # For reference: sigmoid(ref) * mat_mul[:, :1] (only first column)
-            # But actual output is sigmoid(ref) * mat_mul (all columns)
-            # So we compare the first column
-            ref = torch.nn.functional.sigmoid(ref) * mat_mul[:, :1].float()
-            ref = ref.to(dtype)
-            out = out[:, :1]
+            # Output shape is [M, post_mul_size].
+            # sigmoid(ref) broadcasts [M, 1] × mat_mul [M, post_mul_size] → [M, post_mul_size].
+            # Compare ALL columns.
+            ref = (torch.nn.functional.sigmoid(ref) * mat_mul.float()).to(dtype)
             atol = rtol = sigmoid_mul_precision[dtype]
         else:
             ref = ref.to(dtype)
@@ -229,8 +222,8 @@ class TestGemm(CustomTestCase):
 
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
-    def test_fp16_bf16_gemm_with_small_oc(self):
-        """Test BF16 GEMM with small output channels and sigmoid-mul fusion."""
+    def test_case_gemm_bf16_small_oc(self):
+        """Case: small output-channel GEMM with optional sigmoid fusion."""
         for params in itertools.product(
             [1, 8, 32, 1024], [12, 1], self.K, self.has_bias, [False, True], self.dtypes
         ):
@@ -242,7 +235,7 @@ class TestGemm(CustomTestCase):
                 use_post_sigmul=params[4],
                 dtype=params[5],
             ):
-                self._bf16_gemm_with_small_oc(*params)
+                self.run_case_gemm_bf16_small_oc(*params)
 
 
 if __name__ == "__main__":
