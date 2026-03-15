@@ -40,7 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
-from sglang.srt.layers.rvv_utils import rvv_linear_forward
+from sglang.srt.layers.rvv_utils import _convert_weight_packed, rvv_linear_forward
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     compute_temp_top_p_normalized_logprobs,
@@ -57,6 +57,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import (
+    cpu_has_rvv_support,
     is_npu,
     use_intel_amx_backend,
     use_riscv_rvv_backend,
@@ -65,6 +66,27 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
+def _rvv_lm_head_linear(hidden_states: torch.Tensor, lm_head) -> torch.Tensor:
+    """Run RVV lm-head linear with lazy weight packing.
+
+    tie_weights() may replace lm_head.weight with the embedding weight (unpacked
+    BF16) after process_weights_after_loading has packed it.  We re-pack on the
+    first forward call and cache the result as _rvv_logits_weight_packed.
+    """
+    if not hasattr(lm_head, "_rvv_logits_weight_packed"):
+        lm_head._rvv_logits_weight_packed = (
+            _convert_weight_packed(lm_head.weight)
+            if _convert_weight_packed is not None
+            else None
+        )
+    packed = lm_head._rvv_logits_weight_packed
+    if packed is not None:
+        return torch.ops.sgl_kernel.weight_packed_linear(
+            hidden_states, packed, None, True
+        )
+    return torch.matmul(hidden_states.to(lm_head.weight.dtype), lm_head.weight.T)
 
 
 @dataclasses.dataclass
@@ -903,12 +925,26 @@ class LogitsProcessor(nn.Module):
                     True,  # is_vnni
                 )
             elif use_riscv_rvv_backend(lm_head):
-                logits = rvv_linear_forward(hidden_states, lm_head)
+                if hasattr(lm_head, "weight_scale"):
+                    # INT8 W8A8: needs per-token activation quant + int8 GEMM.
+                    logits = rvv_linear_forward(hidden_states, lm_head)
+                else:
+                    # BF16/FP16: _rvv_lm_head_linear handles lazy re-packing if
+                    # tie_weights() replaced the packed weight with embed_tokens.weight.
+                    logits = _rvv_lm_head_linear(hidden_states, lm_head)
             elif get_global_server_args().rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
+            elif cpu_has_rvv_support() and lm_head.weight.dtype in (
+                torch.bfloat16,
+                torch.float16,
+            ):
+                # Tied-embedding path: lm_head is a VocabParallelEmbedding without
+                # use_riscv_rvv_backend set (weight was never packed via the normal
+                # process_weights_after_loading path).
+                logits = _rvv_lm_head_linear(hidden_states, lm_head)
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
