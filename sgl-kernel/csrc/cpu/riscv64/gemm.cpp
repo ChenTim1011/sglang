@@ -353,9 +353,10 @@ void weight_packed_linear_kernel_impl(
     const scalar_t* a_row = mat1 + m * mat1_strideM;
     scalar_t* c_row = out + m * out_strideM;
 
+    alignas(64) float linear_row[rvv_constants::MAX_VL_ELEMENTS_M4];
+
     for (int64_t n_start = 0; n_start < N; n_start += vl_max) {
       size_t vl = __riscv_vsetvl_e32m4(N - n_start);
-      alignas(64) float linear_row[rvv_constants::MAX_VL_ELEMENTS_M4];
 
       // Initialize accumulator with bias or zero
       vfloat32m4_t v_acc =
@@ -370,13 +371,14 @@ void weight_packed_linear_kernel_impl(
 
       __riscv_vse32_v_f32m4(linear_row, v_acc, vl);
 
-      // Post-process
-      if (post_mul_mat != nullptr) {
-        scalar_sigmoid_and_mul<scalar_t, false>(
-            c_row + n_start, linear_row, nullptr, post_mul_mat + m * out_strideM + n_start, vl);
-      } else {
+      if (post_mul_mat == nullptr) {
         copy_stub(c_row + n_start, linear_row, vl);
       }
+    }
+
+    if (post_mul_mat != nullptr) {
+      scalar_sigmoid_and_mul<scalar_t, false>(
+          c_row, linear_row, nullptr, post_mul_mat + m * out_strideM, static_cast<int>(out_strideM));
     }
   }
 }
@@ -567,7 +569,7 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
 
 // mat1         : [M, K]
 // mat2         : [K, 1]
-// post_mul_mat : [M, K]
+// post_mul_mat : [M, out_strideM]  (out_strideM = post_mul_mat.size(1), not K)
 // bias         : [N]
 // out          : [M, N]
 //
