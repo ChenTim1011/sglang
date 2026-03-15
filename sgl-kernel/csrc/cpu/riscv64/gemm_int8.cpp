@@ -267,28 +267,28 @@ void int8_scaled_mm_kernel_impl(
   const int64_t NB = div_up(N, BLOCK_N);
 
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
-    at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
-      for (int64_t idx = begin; idx < end; ++idx) {
-        int64_t mb = idx / NB;
-        int64_t nb = idx % NB;
-
-        int64_t mb_start = mb * BLOCK_M;
-        int64_t mb_size = std::min(BLOCK_M, M - mb_start);
+    at::parallel_for(0, NB, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t nb = begin; nb < end; ++nb) {
         int64_t nb_start = nb * BLOCK_N;
         int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-        tinygemm_kernel<scalar_t, has_bias>(
-            /*      A */ mat1 + mb_start * K,
-            /*      B */ mat2 + nb * K * BLOCK_N,
-            /*      C */ out + mb_start * N + nb_start,
-            /*     As */ scales1 + mb_start,
-            /*     Bs */ scales2 + nb_start,
-            /*   bias */ has_bias ? (bias + nb_start) : nullptr,
-            /*      M */ mb_size,
-            /*      N */ nb_size,
-            /*      K */ K,
-            /*    lda */ K,
-            /*    ldc */ N);
+        for (int64_t mb = 0; mb < MB; ++mb) {
+          int64_t mb_start = mb * BLOCK_M;
+          int64_t mb_size = std::min(BLOCK_M, M - mb_start);
+
+          tinygemm_kernel<scalar_t, has_bias>(
+              /*      A */ mat1 + mb_start * K,
+              /*      B */ mat2 + nb * K * BLOCK_N,
+              /*      C */ out + mb_start * N + nb_start,
+              /*     As */ scales1 + mb_start,
+              /*     Bs */ scales2 + nb_start,
+              /*   bias */ has_bias ? (bias + nb_start) : nullptr,
+              /*      M */ mb_size,
+              /*      N */ nb_size,
+              /*      K */ K,
+              /*    lda */ K,
+              /*    ldc */ N);
+        }
       }
     });
   });

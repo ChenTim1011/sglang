@@ -26,16 +26,7 @@ def rvv_linear_forward(
     if len(x_shapes) == 3:
         x = x.view(-1, x.shape[-1])
 
-    if hasattr(layer, "weight_scale_rvv"):
-        output = torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
-            x,
-            layer.weight,
-            layer.weight_scale_rvv,
-            bias,
-            x.dtype,
-            True,  # is_packed
-        )
-    elif hasattr(layer, "weight_scale"):
+    if hasattr(layer, "weight_scale"):
         output = torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
             x,
             layer.weight,
