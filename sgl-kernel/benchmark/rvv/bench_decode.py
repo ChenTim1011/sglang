@@ -1,4 +1,4 @@
-# Benchmark RVV vs torch_native fp16 decode
+"""Benchmark RVV vs torch_native FP16 decode attention."""
 
 import argparse
 import os
@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 
 import torch
-from utils import (
+from _rvv_bench_utils import (
     IS_CI,
     create_decode_mock_forward_batch,
     create_decode_mock_layer,
@@ -46,16 +46,16 @@ class BenchmarkResult:
     throughput_rvv: float
 
 
-# Llama-3.2-1B: num_heads=32, head_dim=64
+# Target attention shape: num_heads=12, head_dim=128
 STANDARD_CONFIGS = [
-    BenchmarkConfig(1, 32, 64, 128, "LLaMA-1B decode BS=1 seq=128"),
-    BenchmarkConfig(4, 32, 64, 128, "LLaMA-1B decode BS=4 seq=128"),
-    BenchmarkConfig(8, 32, 64, 128, "LLaMA-1B decode BS=8 seq=128"),
-    BenchmarkConfig(1, 32, 64, 512, "LLaMA-1B decode BS=1 seq=512"),
+    BenchmarkConfig(1, 12, 128, 128, "decode BS=1 seq=128"),
+    BenchmarkConfig(4, 12, 128, 128, "decode BS=4 seq=128"),
+    BenchmarkConfig(8, 12, 128, 128, "decode BS=8 seq=128"),
+    BenchmarkConfig(1, 12, 128, 512, "decode BS=1 seq=512"),
 ]
 
 CI_CONFIGS = [
-    BenchmarkConfig(1, 32, 64, 32, "CI LLaMA-1B decode"),
+    BenchmarkConfig(1, 12, 128, 32, "CI decode"),
 ]
 
 if IS_CI:

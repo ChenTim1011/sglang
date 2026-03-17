@@ -1,11 +1,4 @@
-# Benchmark RVV vs torch_native BFloat16 GEMM
-#
-# This benchmark mirrors the ACTUAL E2E path (--dtype bfloat16):
-#   RVV backend   : weight_packed_linear(x_bf16, packed_weight_bf16, bias_fp32, True)
-#   torch_native  : F.linear(x_bf16, weight_bf16, bias_fp32)
-#
-# This is the authoritative speedup number for E2E inference.
-# The FP16 bench (bench_gemm.py) measures a different kernel path.
+"""Benchmark RVV vs torch_native BF16 GEMM."""
 
 import argparse
 import os
@@ -16,7 +9,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from utils import (
+from _rvv_bench_utils import (
     IS_CI,
     print_benchmark_result,
 )
@@ -47,21 +40,21 @@ class BenchmarkResult:
     speedup: float
 
 
-# Llama-3.2-1B only: hidden_size=2048, intermediate_size=8192
+# Target shapes: hidden_size=1536, intermediate_size=8960
 STANDARD_CONFIGS = [
-    BenchmarkConfig(1, 2048, 2048, "LLaMA-1B QKV decode"),
-    BenchmarkConfig(1, 16384, 2048, "LLaMA-1B FFN up decode"),
-    BenchmarkConfig(1, 2048, 8192, "LLaMA-1B FFN down decode"),
-    BenchmarkConfig(4, 2048, 2048, "LLaMA-1B QKV batch=4"),
-    BenchmarkConfig(8, 2048, 2048, "LLaMA-1B QKV batch=8"),
-    BenchmarkConfig(256, 2048, 2048, "LLaMA-1B QKV prefill M=256"),
-    BenchmarkConfig(256, 16384, 2048, "LLaMA-1B FFN up prefill M=256"),
-    BenchmarkConfig(256, 2048, 8192, "LLaMA-1B FFN down prefill M=256"),
+    BenchmarkConfig(1, 1536, 1536, "Q proj decode"),
+    BenchmarkConfig(1, 17920, 1536, "FFN up decode"),
+    BenchmarkConfig(1, 1536, 8960, "FFN down decode"),
+    BenchmarkConfig(4, 1536, 1536, "Q proj batch=4"),
+    BenchmarkConfig(8, 1536, 1536, "Q proj batch=8"),
+    BenchmarkConfig(256, 1536, 1536, "Q proj prefill M=256"),
+    BenchmarkConfig(256, 17920, 1536, "FFN up prefill M=256"),
+    BenchmarkConfig(256, 1536, 8960, "FFN down prefill M=256"),
 ]
 
 CI_CONFIGS = [
-    BenchmarkConfig(1, 2048, 2048, "LLaMA-1B QKV decode"),
-    BenchmarkConfig(1, 16384, 2048, "LLaMA-1B FFN up decode"),
+    BenchmarkConfig(1, 1536, 1536, "Q proj decode"),
+    BenchmarkConfig(1, 17920, 1536, "FFN up decode"),
 ]
 
 if IS_CI:
@@ -93,9 +86,6 @@ def run_single_backend(backend_name, config, num_iterations=20, warmup=5):
             sgl_kernel.weight_packed_linear(x, weight_packed, bias_fp32, True)
         end = time.time()
     else:
-        # Exact path taken by torch_native backend in E2E:
-        # unquant.py: return F.linear(x, layer.weight, bias)
-        # where layer.weight and bias are both BF16 in torch_native mode.
         for _ in range(warmup):
             F.linear(x, weight, bias_bf16)
 

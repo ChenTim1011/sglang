@@ -1,8 +1,4 @@
-# Benchmark RVV backend accuracy on GSM8K
-#
-# - Launches RVV server internally (no pre-existing server)
-# - Uses smaller defaults for RISC-V (num_questions: 5-10, num_shots: 1-2)
-# - Supports --platinum (HuggingFace) or fallback to embedded subset when offline
+"""Benchmark GSM8K accuracy on the RVV backend."""
 
 import argparse
 import ast
@@ -14,11 +10,11 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-# Allow importing local utils when run from project root or rvv dir
+# Support direct execution from project root or this directory.
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
-from utils import IS_CI
+from _rvv_bench_utils import IS_CI
 
 os.environ.setdefault("SGLANG_USE_CPU_ENGINE", "1")
 
@@ -31,39 +27,18 @@ except ImportError:
     HAS_SGLANG = False
     print("sglang not found")
     sys.exit(1)
-
-MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
-MODEL_W8A8 = "RedHatAI/Qwen2.5-1.5B-quantized.w8a8"
+MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 BASE_URL = DEFAULT_URL_FOR_TEST
 INVALID = -9999999
 
-# Named experiment configs: model, quantization, kv_int8; optional num_questions, num_shots for preset.
-# Use: --config int8_kv --platinum  => Qwen2.5-1.5B, 10q 8-shot, INT8 KV
-#      --config w8a8_bf16_kv --platinum => Qwen2.5-1.5B.w8a8, 10q 8-shot, BF16 KV, --quantization w8a8_int8
-#      --config w8a8_int8_kv --platinum => Qwen2.5-1.5B.w8a8, 10q 8-shot, INT8 KV, --quantization w8a8_int8
+# Named presets for model/KV dtype, with optional eval-size overrides.
 GSM8K_EXPERIMENT_CONFIGS = {
     "default": {
         "model": MODEL,
-        "quantization": None,
         "kv_int8": False,
     },
     "int8_kv": {
         "model": MODEL,
-        "quantization": None,
-        "kv_int8": True,
-        "num_questions": 10,
-        "num_shots": 8,
-    },
-    "w8a8_bf16_kv": {
-        "model": MODEL_W8A8,
-        "quantization": "w8a8_int8",
-        "kv_int8": False,
-        "num_questions": 10,
-        "num_shots": 8,
-    },
-    "w8a8_int8_kv": {
-        "model": MODEL_W8A8,
-        "quantization": "w8a8_int8",
         "kv_int8": True,
         "num_questions": 10,
         "num_shots": 8,
@@ -171,11 +146,47 @@ def _load_dataset(platinum: bool, data_path: str, num_questions: int, num_shots:
         return GSM8K_EMBEDDED[: min(need, len(GSM8K_EMBEDDED))], "embedded"
 
 
+def _kill_port(port: int) -> None:
+    """Kill any process listening on the given TCP port (no external tools needed)."""
+    import os
+    import signal
+
+    try:
+        # /proc/net/tcp6 covers both IPv4-mapped and IPv6; fall back to /proc/net/tcp
+        for tcp_file in ("/proc/net/tcp6", "/proc/net/tcp"):
+            try:
+                with open(tcp_file) as f:
+                    lines = f.readlines()[1:]  # skip header
+            except FileNotFoundError:
+                continue
+            hex_port = f"{port:04X}"
+            for line in lines:
+                parts = line.split()
+                # local_address field is "addr:port"; state 0A = LISTEN
+                if len(parts) < 10 or parts[3] != "0A":
+                    continue
+                if parts[1].split(":")[1].upper() == hex_port:
+                    inode = parts[9]
+                    # Find the PID that owns this inode
+                    for pid in os.listdir("/proc"):
+                        if not pid.isdigit():
+                            continue
+                        try:
+                            fd_dir = f"/proc/{pid}/fd"
+                            for fd in os.listdir(fd_dir):
+                                link = os.readlink(f"{fd_dir}/{fd}")
+                                if f"socket:[{inode}]" in link:
+                                    os.kill(int(pid), signal.SIGKILL)
+                        except (PermissionError, FileNotFoundError, ProcessLookupError):
+                            pass
+    except Exception:
+        pass  # best-effort; if it fails the server launch will report the conflict
+
+
 def run_benchmark(
     config: BenchmarkConfig,
     model: str,
     kv_int8: bool = False,
-    quantization: str | None = None,
 ):
     """Launch RVV server, run GSM8K questions, kill server, return BenchmarkResult."""
     other_args = [
@@ -191,8 +202,15 @@ def run_benchmark(
     ]
     if kv_int8:
         other_args += ["--kv-cache-dtype", "int8"]
-    if quantization:
-        other_args += ["--quantization", quantization]
+    # Kill any stale server left from a previous crashed run.
+    import os as _os
+    import re as _re
+
+    _m = _re.search(r":(\d+)", BASE_URL)
+    if _m:
+        _port = int(_m.group(1))
+        _kill_port(_port)
+
     process = popen_launch_server(
         model,
         BASE_URL,
@@ -330,8 +348,7 @@ def main():
         type=str,
         choices=list(GSM8K_EXPERIMENT_CONFIGS),
         default=None,
-        help="Named experiment: default, int8_kv (10q 8-shot INT8 KV), "
-        "w8a8_bf16_kv (W8A8 10q 8-shot BF16 KV), w8a8_int8_kv (W8A8 10q 8-shot INT8 KV).",
+        help="Named experiment: default, int8_kv (10q 8-shot INT8 KV).",
     )
     args = parser.parse_args()
 
@@ -343,12 +360,10 @@ def main():
         max_tokens = args.max_new_tokens
 
     run_model = MODEL
-    run_quantization = None
     run_kv_int8 = args.kv_int8
     if args.config:
         cfg = GSM8K_EXPERIMENT_CONFIGS[args.config]
         run_model = cfg["model"]
-        run_quantization = cfg.get("quantization")
         run_kv_int8 = cfg["kv_int8"]
         if "num_questions" in cfg:
             num_questions = cfg["num_questions"]
@@ -364,7 +379,7 @@ def main():
         sys.exit(1)
     lines = lines[: num_shots + num_questions]
 
-    model_short = "Qwen2.5-1.5B.w8a8" if run_quantization else "Qwen2.5-1.5B"
+    model_short = "Llama-3.2-1B-Instruct"
     config = BenchmarkConfig(
         num_questions=num_questions,
         num_shots=num_shots,
@@ -378,8 +393,6 @@ def main():
     print("=" * 60)
     print(f"Platform: {platform.machine()}")
     print(f"Model   : {run_model}")
-    if run_quantization:
-        print(f"Quant   : {run_quantization}")
     print(f"CI Mode : {IS_CI}")
     print(f"Data    : {source} ({num_questions} questions)")
     if run_kv_int8:
@@ -397,7 +410,6 @@ def main():
             config,
             model=run_model,
             kv_int8=run_kv_int8,
-            quantization=run_quantization,
         )
         print_result(result)
         if args.save:
