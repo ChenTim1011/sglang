@@ -29,15 +29,15 @@ static int compute_buffer_size_per_thread(int head_size, int head_size_v) {
   // 1. s_i: float[BLOCK_M * BLOCK_N]
   // 2. v_prime: float[BLOCK_M * head_size_v]
   // 3. Btmp: scalar_t[BLOCK_N * max(head_size, head_size_v)]
-  // 4. k_trans: scalar_t[MAX_HEAD_SIZE * 64] (Shared FP/INT8)
-  // 5. v_buf: scalar_t[64 * MAX_HEAD_SIZE] (Shared FP/INT8)
+  // 4. k_trans: scalar_t[head_size * BLOCK_N]
+  // 5. v_buf: scalar_t[BLOCK_N * head_size_v]
 
   int size = 0;
   size += BLOCK_M * BLOCK_N * sizeof(float);
   size += BLOCK_M * head_size_v * sizeof(float);
   size += BLOCK_N * std::max(head_size, head_size_v) * 4;  // worst case sizeof(scalar_t)=4
-  size += MAX_HEAD_SIZE * 64 * 4;                          // worst case sizeof(scalar_t)=4
-  size += 64 * MAX_HEAD_SIZE * 4;                          // worst case sizeof(scalar_t)=4
+  size += MAX_HEAD_SIZE * BLOCK_N * 4;                     // k_trans: head_size * BLOCK_N
+  size += BLOCK_N * MAX_HEAD_SIZE * 4;                     // v_buf: BLOCK_N * head_size_v
 
   // Add alignment overhead (64 bytes per allocation, worst case)
   return size + 64 * 5;
@@ -125,10 +125,10 @@ void extend_attention_kernel_impl(
     int v_strideH,
     float scaling,
     float logit_cap,
-    int max_num_reqs,
-    int max_context_len,
-    int max_total_num_tokens,
-    int max_len_extend,
+    int64_t max_num_reqs,
+    int64_t max_context_len,
+    int64_t max_total_num_tokens,
+    int64_t max_len_extend,
     int buffer_size_per_thread,
     bool is_prefix_skipped,
     float k_scale = 1.0f,
@@ -145,13 +145,19 @@ void extend_attention_kernel_impl(
       MAX_HEAD_SIZE,
       ")");
 
+  // Stage-1 gather uses vluxei64 with e64m8 indices (no inner loop).
+  // vl_max_e64m8 = VLEN*8/64. With VLEN=256: vl_max=32=BLOCK_N.
+  // VLEN < 256 would silently truncate the gather; require VLEN >= 256.
+  static_assert(
+      __riscv_v_fixed_vlen >= 256, "extend Stage-1 gather requires VLEN >= 256 (vl_max_e64m8 must be >= BLOCK_N=32)");
+
   constexpr bool IS_INT8 = is_quantized<kv_t>::value;
 
   const int BLOCK_M = 32;
   const int BLOCK_N = 32;
 
   const int num_groups = num_heads / num_heads_kv;
-  int MB = div_up(max_len_extend, BLOCK_M);
+  int MB = static_cast<int>(div_up(max_len_extend, static_cast<int64_t>(BLOCK_M)));
 
   at::parallel_for(0, batches * num_heads * MB, 0, [&](int64_t begin, int64_t end) {
     int64_t b{0}, h{0}, mb{0};
@@ -179,11 +185,11 @@ void extend_attention_kernel_impl(
 
     // 4. Transposed Key buffer (Shared implementation)
     // If IS_INT8, we reuse this memory as int8_t*, otherwise strictly scalar_t*
-    scalar_t* k_trans_buf_fp = arena.alloc<scalar_t>(MAX_HEAD_SIZE * 64);
+    scalar_t* k_trans_buf_fp = arena.alloc<scalar_t>(MAX_HEAD_SIZE * BLOCK_N);
     int8_t* k_trans_buf_int8 = reinterpret_cast<int8_t*>(k_trans_buf_fp);
 
     // 5. Value buffer (Shared implementation)
-    scalar_t* v_buf_fp = arena.alloc<scalar_t>(64 * MAX_HEAD_SIZE);
+    scalar_t* v_buf_fp = arena.alloc<scalar_t>(BLOCK_N * MAX_HEAD_SIZE);
     int8_t* v_buf_int8 = reinterpret_cast<int8_t*>(v_buf_fp);
 
     // Thread-local scalars
@@ -272,8 +278,8 @@ void extend_attention_kernel_impl(
                 k_scale,
                 k_scales_block);
           } else {
-            // 1. Load token indices
-            size_t vl_max = __riscv_vsetvlmax_e64m8();
+            // 1. Load token indices (single shot; requires vl_max_e64m8 >= n_size <= BLOCK_N=32;
+            //    guaranteed by static_assert(__riscv_v_fixed_vlen >= 256) above)
             size_t vl = __riscv_vsetvl_e64m8(n_size);
             vuint64m8_t v_offsets;
 
@@ -386,7 +392,6 @@ void extend_attention_kernel_impl(
           size_t stride_bytes = ke_strideN * sizeof(scalar_t);
           if (head_size % 4 == 0) {
             for (int d = 0; d < head_size; ++d) {
-              size_t vl = __riscv_vsetvl_e32m4(n_size);
               const scalar_t* src_d = k_src_base + n_start * ke_strideN + d;
 
               if constexpr (sizeof(scalar_t) == 2) {
@@ -394,6 +399,7 @@ void extend_attention_kernel_impl(
                 vuint16m2_t v_16 = __riscv_vlse16_v_u16m2((const uint16_t*)src_d, stride_bytes, vl_16);
                 __riscv_vse16_v_u16m2(reinterpret_cast<uint16_t*>(k_trans_buf_fp + d * BLOCK_N), v_16, vl_16);
               } else {
+                size_t vl = __riscv_vsetvl_e32m4(n_size);
                 vfloat32m4_t v_col = __riscv_vlse32_v_f32m4((const float*)src_d, stride_bytes, vl);
                 __riscv_vse32_v_f32m4(k_trans_buf_fp + d * BLOCK_N, v_col, vl);
               }
@@ -449,7 +455,7 @@ void extend_attention_kernel_impl(
         gemm_nn_tiled(s_i, v_buf_fp, v_prime, m_size, n_size, head_size_v, BLOCK_N, head_size_v);
       }  // End Extend
 
-      // Write Output - m2
+      // Write Output
       for (int r = 0; r < m_size; ++r) {
         float l_val = l_acc[r];
         float inv_l = (l_val > 1e-6f) ? 1.0f / l_val : 0.0f;
@@ -470,6 +476,109 @@ void extend_attention_kernel_impl(
   });
 }
 
+// ── Common parameter extraction ───────────────────────────────────────────────
+// Shared validation and stride extraction for both entry functions below.
+struct ExtendBatchInfo {
+  int num_seqs;
+  int64_t max_num_reqs, max_context_len, max_total_num_tokens;
+  int num_heads, num_heads_kv, head_size, head_size_v;
+  int q_strideM, q_strideH;
+  int o_strideM, o_strideH;
+  int ke_strideN, ke_strideH;
+  int ve_strideN, ve_strideH;
+  int k_strideN, k_strideH;
+  int v_strideN, v_strideH;
+  bool is_prefix_skipped;
+  at::ScalarType index_dtype;
+};
+
+static ExtendBatchInfo validate_extend_inputs(
+    const at::Tensor& q_extend,
+    const at::Tensor& k_extend,
+    const at::Tensor& v_extend,
+    const at::Tensor& o_extend,
+    const at::Tensor& k_buffer,
+    const at::Tensor& v_buffer,
+    const at::Tensor& req_to_token,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& seq_lens,
+    const at::Tensor& extend_seq_lens,
+    const at::Tensor& extend_start_loc) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_extend);
+  CHECK_INPUT(o_extend);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_extend);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_extend);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
+
+  ExtendBatchInfo p;
+  p.num_seqs = seq_lens.size(0);
+  p.max_num_reqs = req_to_token.size(0);
+  p.max_context_len = req_to_token.size(1);
+  p.max_total_num_tokens = k_buffer.size(0);
+
+  p.num_heads = q_extend.size(1);
+  p.num_heads_kv = k_extend.size(1);
+  p.head_size = q_extend.size(2);
+  p.head_size_v = v_extend.size(2);
+
+  p.q_strideM = q_extend.stride(0);
+  p.q_strideH = q_extend.stride(1);
+  p.o_strideM = o_extend.stride(0);
+  p.o_strideH = o_extend.stride(1);
+  p.ke_strideN = k_extend.stride(0);
+  p.ke_strideH = k_extend.stride(1);
+  p.ve_strideN = v_extend.stride(0);
+  p.ve_strideH = v_extend.stride(1);
+  p.k_strideN = k_buffer.stride(0);
+  p.k_strideH = k_buffer.stride(1);
+  p.v_strideN = v_buffer.stride(0);
+  p.v_strideH = v_buffer.stride(1);
+
+  CHECK_EQ(req_pool_indices.size(0), p.num_seqs);
+  CHECK_EQ(extend_seq_lens.size(0), p.num_seqs);
+  CHECK_EQ(extend_start_loc.size(0), p.num_seqs);
+  CHECK_EQ(v_extend.size(1), p.num_heads_kv);
+  CHECK_EQ(k_buffer.size(1), v_buffer.size(1));
+
+  // MLA will skip prefix part
+  p.is_prefix_skipped = (k_buffer.size(1) != p.num_heads_kv);
+
+  p.index_dtype = req_to_token.scalar_type();
+  TORCH_CHECK(
+      p.index_dtype == at::kInt || p.index_dtype == at::kLong,
+      "extend: expect req_to_token to be int32 or int64, got ",
+      p.index_dtype);
+  TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "extend: expect req_lens to be int64, got ", seq_lens.scalar_type());
+  TORCH_CHECK(
+      req_pool_indices.scalar_type() == at::kLong,
+      "extend: expect req_pool_indices to be int64, got ",
+      req_pool_indices.scalar_type());
+  TORCH_CHECK(
+      extend_seq_lens.scalar_type() == p.index_dtype && extend_start_loc.scalar_type() == p.index_dtype,
+      "extend: expect extend_seq_lens and extend_start_loc to have same dtype as req_to_token.");
+
+  TORCH_CHECK(p.head_size % 32 == 0, "invalid head_size ", p.head_size);
+  TORCH_CHECK(p.head_size_v % 32 == 0, "invalid head_size_v ", p.head_size_v);
+
+  return p;
+}
+
+// q_extend, k_extend, v_extend, o_extend: contiguous tensors
+// k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
+//
+// q_extend: [num_tokens, num_heads, head_size]
+// k_extend: [num_extend_tokens, num_heads, head_size]
+// v_extend: [num_extend_tokens, num_heads, head_size]
+// o_extend: [num_tokens, num_heads, head_size]
+// k_buffer: [max_total_num_tokens, num_heads, head_size]
+// v_buffer: [max_total_num_tokens, num_heads, head_size]
+// req_to_token: [max_num_reqs, max_context_len] int32 or int64
+// req_pool_indices: [num_seqs] int64
+// seq_lens: [num_seqs] int64
+// extend_seq_lens: [num_seqs]
+// extend_start_loc: [num_seqs]
+//
 void extend_attention_cpu(
     at::Tensor& q_extend,
     at::Tensor& k_extend,
@@ -500,78 +609,25 @@ void extend_attention_cpu(
            extend_seq_lens,
            extend_start_loc}));
 
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_extend);
-  CHECK_INPUT(o_extend);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_extend);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_extend);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
+  const auto p = validate_extend_inputs(
+      q_extend,
+      k_extend,
+      v_extend,
+      o_extend,
+      k_buffer,
+      v_buffer,
+      req_to_token,
+      req_pool_indices,
+      seq_lens,
+      extend_seq_lens,
+      extend_start_loc);
 
-  int num_seqs = seq_lens.size(0);
-  int64_t max_num_reqs = req_to_token.size(0);
-  int64_t max_context_len = req_to_token.size(1);
-  int64_t max_total_num_tokens = k_buffer.size(0);
-
-  int num_heads = q_extend.size(1);
-  int num_heads_kv = k_extend.size(1);
-  int head_size = q_extend.size(2);
-  int head_size_v = v_extend.size(2);
-
-  int q_strideM = q_extend.stride(0);
-  int q_strideH = q_extend.stride(1);
-  int o_strideM = o_extend.stride(0);
-  int o_strideH = o_extend.stride(1);
-  int ke_strideN = k_extend.stride(0);
-  int ke_strideH = k_extend.stride(1);
-  int ve_strideN = v_extend.stride(0);
-  int ve_strideH = v_extend.stride(1);
-
-  int k_strideN = k_buffer.stride(0);
-  int k_strideH = k_buffer.stride(1);
-  int v_strideN = v_buffer.stride(0);
-  int v_strideH = v_buffer.stride(1);
-
-  // check sizes
-  CHECK_EQ(req_pool_indices.size(0), num_seqs);
-  CHECK_EQ(extend_seq_lens.size(0), num_seqs);
-  CHECK_EQ(extend_start_loc.size(0), num_seqs);
-  CHECK_EQ(v_extend.size(1), num_heads_kv);
-  CHECK_EQ(k_buffer.size(1), v_buffer.size(1));
-
-  // MLA will skip prefix part
-  const bool is_prefix_skipped = k_buffer.size(1) != num_heads_kv;
-
-  // check index data types
-  const auto index_dtype = req_to_token.scalar_type();
-  TORCH_CHECK(
-      index_dtype == at::kInt || index_dtype == at::kLong,
-      "extend: expect req_to_token to be int32 or int64, got ",
-      index_dtype);
-  TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "extend: expect req_lens to be int64, got ", seq_lens.scalar_type());
-  TORCH_CHECK(
-      req_pool_indices.scalar_type() == at::kLong,
-      "extend: expect req_pool_indices to be int64, got ",
-      req_pool_indices.scalar_type());
-  TORCH_CHECK(
-      extend_seq_lens.scalar_type() == index_dtype && extend_start_loc.scalar_type() == index_dtype,
-      "extend: expect extend_seq_lens and extend_start_loc to have same dtype as req_to_token.");
-
-  // D and DV need to be 32x as we transpose by 512-bit (or matching RVV constraints)
-  TORCH_CHECK(head_size % 32 == 0, "invalid head_size ", head_size);
-  TORCH_CHECK(head_size_v % 32 == 0, "invalid head_size_v ", head_size_v);
-
-  // block size for query seq length
-  constexpr int BLOCK_M = 32;
-  // block size for key/value seq length
-  constexpr int BLOCK_N = 32;
-
-  int buffer_size = compute_buffer_size_per_thread(head_size, head_size_v);
-
+  int buffer_size = compute_buffer_size_per_thread(p.head_size, p.head_size_v);
   int num_threads = at::get_num_threads();
   auto buffer = at::empty({num_threads, buffer_size}, q_extend.options().dtype(at::kChar));
 
   AT_DISPATCH_RVV_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
-    AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_kernel_indices", [&] {
+    AT_DISPATCH_INDEX_TYPES(p.index_dtype, "extend_attention_kernel_indices", [&] {
       extend_attention_kernel_impl<scalar_t, scalar_t, index_t>(
           o_extend.data_ptr<scalar_t>(),
           q_extend.data_ptr<scalar_t>(),
@@ -585,31 +641,31 @@ void extend_attention_cpu(
           extend_seq_lens.data_ptr<index_t>(),
           extend_start_loc.data_ptr<index_t>(),
           buffer.data_ptr(),
-          num_seqs,
-          num_heads,
-          num_heads_kv,
-          head_size,
-          head_size_v,
-          o_strideM,
-          o_strideH,
-          q_strideM,
-          q_strideH,
-          ke_strideN,
-          ke_strideH,
-          ve_strideN,
-          ve_strideH,
-          k_strideN,
-          k_strideH,
-          v_strideN,
-          v_strideH,
-          sm_scale,
-          logit_cap,
-          max_num_reqs,
-          max_context_len,
-          max_total_num_tokens,
+          p.num_seqs,
+          p.num_heads,
+          p.num_heads_kv,
+          p.head_size,
+          p.head_size_v,
+          p.o_strideM,
+          p.o_strideH,
+          p.q_strideM,
+          p.q_strideH,
+          p.ke_strideN,
+          p.ke_strideH,
+          p.ve_strideN,
+          p.ve_strideH,
+          p.k_strideN,
+          p.k_strideH,
+          p.v_strideN,
+          p.v_strideH,
+          (float)sm_scale,
+          (float)logit_cap,
+          p.max_num_reqs,
+          p.max_context_len,
+          p.max_total_num_tokens,
           max_len_extend,
           buffer_size,
-          is_prefix_skipped);
+          p.is_prefix_skipped);
     });
   });
 }
@@ -637,7 +693,7 @@ void extend_set_kv_buffer_int8_quantize(
     int ke_strideH,
     int ve_strideN,
     int ve_strideH,
-    int max_context_len,
+    int64_t max_context_len,
     float k_scale,
     float v_scale,
     float* k_scale_buf = nullptr,    // [max_tokens * num_heads_kv]; written when k_scale==1.0
@@ -721,74 +777,20 @@ void extend_attention_int8_cpu(
            extend_seq_lens,
            extend_start_loc}));
 
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_extend);
-  CHECK_INPUT(o_extend);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_extend);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_extend);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
+  const auto p = validate_extend_inputs(
+      q_extend,
+      k_extend,
+      v_extend,
+      o_extend,
+      k_buffer,
+      v_buffer,
+      req_to_token,
+      req_pool_indices,
+      seq_lens,
+      extend_seq_lens,
+      extend_start_loc);
 
-  int num_seqs = seq_lens.size(0);
-  int64_t max_num_reqs = req_to_token.size(0);
-  int64_t max_context_len = req_to_token.size(1);
-  int64_t max_total_num_tokens = k_buffer.size(0);
-
-  int num_heads = q_extend.size(1);
-  int num_heads_kv = k_extend.size(1);
-  int head_size = q_extend.size(2);
-  int head_size_v = v_extend.size(2);
-
-  int q_strideM = q_extend.stride(0);
-  int q_strideH = q_extend.stride(1);
-  int ke_strideN = k_extend.stride(0);
-  int ke_strideH = k_extend.stride(1);
-  int ve_strideN = v_extend.stride(0);
-  int ve_strideH = v_extend.stride(1);
-
-  int o_strideM = o_extend.stride(0);
-  int o_strideH = o_extend.stride(1);
-
-  int k_strideN = k_buffer.stride(0);
-  int k_strideH = k_buffer.stride(1);
-  int v_strideN = v_buffer.stride(0);
-  int v_strideH = v_buffer.stride(1);
-
-  // check sizes
-  CHECK_EQ(req_pool_indices.size(0), num_seqs);
-  CHECK_EQ(extend_seq_lens.size(0), num_seqs);
-  CHECK_EQ(extend_start_loc.size(0), num_seqs);
-  CHECK_EQ(v_extend.size(1), num_heads_kv);
-  CHECK_EQ(k_buffer.size(1), v_buffer.size(1));
-
-  // MLA will skip prefix part
-  bool is_prefix_skipped = k_buffer.size(1) != num_heads_kv;
-
-  // check index data types
-  const auto index_dtype = req_to_token.scalar_type();
-  TORCH_CHECK(
-      index_dtype == at::kInt || index_dtype == at::kLong,
-      "extend: expect req_to_token to be int32 or int64, got ",
-      index_dtype);
-  TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "extend: expect req_lens to be int64, got ", seq_lens.scalar_type());
-  TORCH_CHECK(
-      req_pool_indices.scalar_type() == at::kLong,
-      "extend: expect req_pool_indices to be int64, got ",
-      req_pool_indices.scalar_type());
-  TORCH_CHECK(
-      extend_seq_lens.scalar_type() == index_dtype && extend_start_loc.scalar_type() == index_dtype,
-      "extend: expect extend_seq_lens and extend_start_loc to have same dtype as req_to_token.");
-
-  // D and DV need to be 32x as we transpose by 512-bit (or matching RVV constraints)
-  TORCH_CHECK(head_size % 32 == 0, "invalid head_size ", head_size);
-  TORCH_CHECK(head_size_v % 32 == 0, "invalid head_size_v ", head_size_v);
-
-  // block size for query seq length
-  constexpr int BLOCK_M = 32;
-  // block size for key/value seq length
-  constexpr int BLOCK_N = 32;
-
-  int buffer_size = compute_buffer_size_per_thread(head_size, head_size_v);
-
+  int buffer_size = compute_buffer_size_per_thread(p.head_size, p.head_size_v);
   int num_threads = at::get_num_threads();
   auto buffer = at::empty({num_threads, buffer_size}, q_extend.options().dtype(at::kChar));
 
@@ -796,7 +798,7 @@ void extend_attention_int8_cpu(
   float* v_scale_buf_ptr = v_scale_buf.defined() ? v_scale_buf.data_ptr<float>() : nullptr;
 
   AT_DISPATCH_RVV_TYPES(q_extend.scalar_type(), "extend_attention_int8_cpu", [&] {
-    AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_int8_cpu_indices", [&] {
+    AT_DISPATCH_INDEX_TYPES(p.index_dtype, "extend_attention_int8_cpu_indices", [&] {
       if (k_extend.scalar_type() != at::kChar) {
         extend_set_kv_buffer_int8_quantize<scalar_t, index_t>(
             (int8_t*)k_buffer.data_ptr(),
@@ -808,21 +810,21 @@ void extend_attention_int8_cpu(
             seq_lens.data_ptr<int64_t>(),
             extend_seq_lens.data_ptr<index_t>(),
             extend_start_loc.data_ptr<index_t>(),
-            num_seqs,
-            num_heads_kv,
-            head_size,
-            head_size_v,
-            k_strideN,
-            k_strideH,
-            v_strideN,
-            v_strideH,
-            ke_strideN,
-            ke_strideH,
-            ve_strideN,
-            ve_strideH,
-            max_context_len,
-            k_scale,
-            v_scale,
+            p.num_seqs,
+            p.num_heads_kv,
+            p.head_size,
+            p.head_size_v,
+            p.k_strideN,
+            p.k_strideH,
+            p.v_strideN,
+            p.v_strideH,
+            p.ke_strideN,
+            p.ke_strideH,
+            p.ve_strideN,
+            p.ve_strideH,
+            p.max_context_len,
+            (float)k_scale,
+            (float)v_scale,
             k_scale_buf_ptr,
             v_scale_buf_ptr);
       }
@@ -840,33 +842,33 @@ void extend_attention_int8_cpu(
           extend_seq_lens.data_ptr<index_t>(),
           extend_start_loc.data_ptr<index_t>(),
           buffer.data_ptr(),
-          num_seqs,
-          num_heads,
-          num_heads_kv,
-          head_size,
-          head_size_v,
-          o_strideM,
-          o_strideH,
-          q_strideM,
-          q_strideH,
-          ke_strideN,
-          ke_strideH,
-          ve_strideN,
-          ve_strideH,
-          k_strideN,
-          k_strideH,
-          v_strideN,
-          v_strideH,
-          sm_scale,
-          logit_cap,
-          max_num_reqs,
-          max_context_len,
-          max_total_num_tokens,
+          p.num_seqs,
+          p.num_heads,
+          p.num_heads_kv,
+          p.head_size,
+          p.head_size_v,
+          p.o_strideM,
+          p.o_strideH,
+          p.q_strideM,
+          p.q_strideH,
+          p.ke_strideN,
+          p.ke_strideH,
+          p.ve_strideN,
+          p.ve_strideH,
+          p.k_strideN,
+          p.k_strideH,
+          p.v_strideN,
+          p.v_strideH,
+          (float)sm_scale,
+          (float)logit_cap,
+          p.max_num_reqs,
+          p.max_context_len,
+          p.max_total_num_tokens,
           max_len_extend,
           buffer_size,
-          is_prefix_skipped,
-          k_scale,
-          v_scale,
+          p.is_prefix_skipped,
+          (float)k_scale,
+          (float)v_scale,
           k_scale_buf_ptr,
           v_scale_buf_ptr);
     });

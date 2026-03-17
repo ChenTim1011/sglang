@@ -27,11 +27,11 @@ void l2norm_kernel_impl(
       // Pass 1: accumulate sum of squares
       float sum_sq = 0.0f;
       size_t vl;
+      vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       for (int64_t j = 0; j < hidden_size; j += vl) {
         vl = __riscv_vsetvl_e32m4(hidden_size - j);
         vfloat32m4_t vx = load_as_float_m4(in_ptr + j, vl, scratch);
         vfloat32m4_t vsq = __riscv_vfmul_vv_f32m4(vx, vx, vl);
-        vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
         sum_sq += __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m4_f32m1(vsq, vzero, vl));
       }
       float scale = 1.0f / std::sqrt(sum_sq / hidden_size + eps);
@@ -67,11 +67,11 @@ void rmsnorm_kernel_impl(
       // Pass 1: sum x^2
       float sum_sq = 0.0f;
       size_t vl;
+      vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       for (int64_t j = 0; j < hidden_size; j += vl) {
         vl = __riscv_vsetvl_e32m4(hidden_size - j);
         vfloat32m4_t vx = load_as_float_m4(in_ptr + j, vl, scratch);
         vfloat32m4_t vsq = __riscv_vfmul_vv_f32m4(vx, vx, vl);
-        vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
         sum_sq += __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m4_f32m1(vsq, vzero, vl));
       }
       float rsqrt_var = 1.0f / std::sqrt(sum_sq / hidden_size + eps);
@@ -120,11 +120,11 @@ void gemma3_rmsnorm_kernel_4d_impl(
       // Pass 1: sum x^2
       float sum_sq = 0.0f;
       size_t vl;
+      vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       for (int64_t j = 0; j < hidden_size; j += vl) {
         vl = __riscv_vsetvl_e32m4(hidden_size - j);
         vfloat32m4_t vx = load_as_float_m4(in_ptr + j, vl, scratch);
         vfloat32m4_t vsq = __riscv_vfmul_vv_f32m4(vx, vx, vl);
-        vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
         sum_sq += __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m4_f32m1(vsq, vzero, vl));
       }
       float rsqrt_var = 1.0f / std::sqrt(sum_sq / hidden_size + eps);
@@ -172,6 +172,7 @@ void fused_add_rmsnorm_kernel_impl(
       // Pass 1: fused add → residual; fill float buffer; accumulate sum-sq
       float sum_sq = 0.0f;
       size_t vl;
+      vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       for (int64_t j = 0; j < hidden_size; j += vl) {
         vl = __riscv_vsetvl_e32m4(hidden_size - j);
         vfloat32m4_t vx = load_as_float_m4(in_ptr + j, vl, scratch);
@@ -182,7 +183,6 @@ void fused_add_rmsnorm_kernel_impl(
         // Keep float32 copy in buffer for Pass 2
         __riscv_vse32_v_f32m4(buf_ptr + j, vs, vl);
         vfloat32m4_t vsq = __riscv_vfmul_vv_f32m4(vs, vs, vl);
-        vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
         sum_sq += __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m4_f32m1(vsq, vzero, vl));
       }
       float rsqrt_var = 1.0f / std::sqrt(sum_sq / hidden_size + eps);
@@ -224,11 +224,11 @@ void fused_rmsnorm_gated_kernel_impl(
       // Pass 1: sum x^2
       float sum_sq = 0.0f;
       size_t vl;
+      vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       for (int64_t j = 0; j < hidden_size; j += vl) {
         vl = __riscv_vsetvl_e32m4(hidden_size - j);
         vfloat32m4_t vx = load_as_float_m4(in_ptr + j, vl, scratch);
         vfloat32m4_t vsq = __riscv_vfmul_vv_f32m4(vx, vx, vl);
-        vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
         sum_sq += __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m4_f32m1(vsq, vzero, vl));
       }
       float rsqrt_var = 1.0f / std::sqrt(sum_sq / hidden_size + eps);
@@ -277,6 +277,7 @@ void fused_add_layernorm_kernel_impl(
       // Pass 1: optional fused add; fill buffer; accumulate sum and sum-sq
       float sum_val = 0.0f, sum_sq = 0.0f;
       size_t vl;
+      vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       for (int64_t j = 0; j < hidden_size; j += vl) {
         vl = __riscv_vsetvl_e32m4(hidden_size - j);
         vfloat32m4_t vx = load_as_float_m4(in_ptr + j, vl, scratch);
@@ -285,7 +286,6 @@ void fused_add_layernorm_kernel_impl(
           vx = __riscv_vfadd_vv_f32m4(vx, vr, vl);
           store_from_float_m4(res_ptr + j, vx, vl, scratch);
         }
-        vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
         sum_val += __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m4_f32m1(vx, vzero, vl));
         vfloat32m4_t vsq = __riscv_vfmul_vv_f32m4(vx, vx, vl);
         sum_sq += __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m4_f32m1(vsq, vzero, vl));

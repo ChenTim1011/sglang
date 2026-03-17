@@ -222,6 +222,7 @@ inline float exp_and_sum(float* __restrict__ scores, int n_size, float m_i) {
   size_t vl_max = __riscv_vsetvlmax_e32m4();
   float total_sum = 0.0f;
 
+  vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
   for (int j = 0; j < n_size; j += vl_max) {
     size_t vl = __riscv_vsetvl_e32m4(n_size - j);
     vfloat32m4_t vx = __riscv_vle32_v_f32m4(scores + j, vl);
@@ -229,7 +230,6 @@ inline float exp_and_sum(float* __restrict__ scores, int n_size, float m_i) {
     vfloat32m4_t vex = vfexp_f32m4(vx, vl);
     __riscv_vse32_v_f32m4(scores + j, vex, vl);
 
-    vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
     vfloat32m1_t vsum = __riscv_vfredusum_vs_f32m4_f32m1(vex, vzero, vl);
     total_sum += __riscv_vfmv_f_s_f32m1_f32(vsum);
   }
