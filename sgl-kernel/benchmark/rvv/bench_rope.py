@@ -1,14 +1,12 @@
-# Benchmark RVV vs torch_native rotary embedding kernel
-#
-# Covers 2D, 4D (neox / non-neox) and 3D (DeepSeek V2 style).
-# Dtypes tested: BF16 (primary for RoPE).
+"""Benchmark RVV vs torch_native rotary embedding kernels."""
 
+import dataclasses
 import platform
 import sys
 from dataclasses import dataclass
 
 import torch
-from utils import (
+from _rvv_bench_utils import (
     IS_CI,
     benchmark_function,
     print_benchmark_result,
@@ -55,8 +53,22 @@ class BenchmarkResult:
     speedup: float
 
 
+def _expand_dtypes(configs, dtypes=(torch.bfloat16, torch.float16)):
+    """Return one entry per (config, dtype), appending the dtype name to description."""
+    result = []
+    for c in configs:
+        for dt in dtypes:
+            suffix = str(dt).split(".")[-1]  # "bfloat16" or "float16"
+            result.append(
+                dataclasses.replace(
+                    c, dtype=dt, description=f"{c.description} {suffix}"
+                )
+            )
+    return result
+
+
 # fmt: off
-STANDARD_CONFIGS = [
+_STANDARD_BASE = [
     # 2D non-neox
     RopeConfig(128, 128, 2048, 10000, False, torch.bfloat16, 2, 512, 32, 8, 2, "2D non-neox B=2 S=512"),
     RopeConfig(128, 128, 2048, 10000, False, torch.bfloat16, 1, 32, 16, 4, 2, "2D non-neox B=1 S=32"),
@@ -74,13 +86,16 @@ STANDARD_CONFIGS = [
     RopeConfig(64, 64, 256, 16, False, torch.bfloat16, 1, 128, 16, 1, 3, "3D DeepSeek-V2 S=128"),
 ]
 
-CI_CONFIGS = [
+_CI_BASE = [
     RopeConfig(128, 128, 2048, 10000, False, torch.bfloat16, 1, 32, 16, 4, 2, "2D non-neox"),
     RopeConfig(64, 64, 32, 8000, True, torch.bfloat16, 4, 32, 1, 1, 2, "2D neox"),
     RopeConfig(128, 128, 2048, 10000, False, torch.bfloat16, 1, 32, 16, 4, 4, "4D non-neox"),
     RopeConfig(64, 64, 256, 16, False, torch.bfloat16, 1, 128, 16, 1, 3, "3D DeepSeek-V2"),
 ]
 # fmt: on
+
+STANDARD_CONFIGS = _expand_dtypes(_STANDARD_BASE)
+CI_CONFIGS = _expand_dtypes(_CI_BASE)
 
 ALL_CONFIGS = CI_CONFIGS if IS_CI else STANDARD_CONFIGS
 

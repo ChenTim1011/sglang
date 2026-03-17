@@ -1,7 +1,4 @@
-# Benchmark RVV vs torch_native activation kernels (SiLU, GELU-tanh, GELU-exact)
-#
-# Input shape: (batch, seq_len, 2*dim) — the last dimension is halved by the kernel.
-# Dtypes tested: FP16 and BF16.
+"""Benchmark RVV vs torch_native activation kernels."""
 
 import platform
 import sys
@@ -9,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from utils import (
+from _rvv_bench_utils import (
     IS_CI,
     benchmark_function,
     print_benchmark_result,
@@ -44,22 +41,23 @@ class BenchmarkResult:
     speedup: float
 
 
-# Llama-3.2-1B only: intermediate_size=8192 -> MLP last dim 2*8192=16384 (dim=8192).
+# Intermediate size for this benchmark target.
+# Kernel input shape uses 2 * dim on the last axis.
 # fmt: off
 STANDARD_CONFIGS = [
-    BenchmarkConfig(1,      1,  8192, torch.float16,  "LLaMA-1B decode 1 tok FP16"),
-    BenchmarkConfig(1,      1,  8192, torch.bfloat16, "LLaMA-1B decode 1 tok BF16"),
-    BenchmarkConfig(1,    128,  8192, torch.float16,  "LLaMA-1B decode 128 tok FP16"),
-    BenchmarkConfig(1,    128,  8192, torch.bfloat16, "LLaMA-1B decode 128 tok BF16"),
-    BenchmarkConfig(4,     64,  8192, torch.float16,  "LLaMA-1B decode BS=4 FP16"),
-    BenchmarkConfig(4,     64,  8192, torch.bfloat16, "LLaMA-1B decode BS=4 BF16"),
-    BenchmarkConfig(1,   512,  8192, torch.float16,  "LLaMA-1B prefill 512 FP16"),
-    BenchmarkConfig(1,   512,  8192, torch.bfloat16, "LLaMA-1B prefill 512 BF16"),
+    BenchmarkConfig(1,      1,  8960, torch.float16,  "decode 1 tok FP16"),
+    BenchmarkConfig(1,      1,  8960, torch.bfloat16, "decode 1 tok BF16"),
+    BenchmarkConfig(1,    128,  8960, torch.float16,  "decode 128 tok FP16"),
+    BenchmarkConfig(1,    128,  8960, torch.bfloat16, "decode 128 tok BF16"),
+    BenchmarkConfig(4,     64,  8960, torch.float16,  "decode BS=4 FP16"),
+    BenchmarkConfig(4,     64,  8960, torch.bfloat16, "decode BS=4 BF16"),
+    BenchmarkConfig(1,   512,  8960, torch.float16,  "prefill 512 FP16"),
+    BenchmarkConfig(1,   512,  8960, torch.bfloat16, "prefill 512 BF16"),
 ]
 
 CI_CONFIGS = [
-    BenchmarkConfig(1, 1, 8192, torch.float16,  "LLaMA-1B 1 tok FP16"),
-    BenchmarkConfig(1, 128, 8192, torch.bfloat16, "LLaMA-1B 128 tok BF16"),
+    BenchmarkConfig(1, 1, 8960, torch.float16,  "1 tok FP16"),
+    BenchmarkConfig(1, 128, 8960, torch.bfloat16, "128 tok BF16"),
 ]
 # fmt: on
 

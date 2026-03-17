@@ -1,4 +1,4 @@
-# Benchmark RVV vs torch_native fp16 extend
+"""Benchmark RVV vs torch_native FP16 extend attention."""
 
 import argparse
 import os
@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 
 import torch
-from utils import (
+from _rvv_bench_utils import (
     IS_CI,
     ExtendMockForwardBatch,
     ExtendMockLayer,
@@ -47,15 +47,15 @@ class BenchmarkResult:
     speedup: float
 
 
-# Llama-3.2-1B: num_heads=32, head_dim=64
+# Target attention shape: num_heads=12, head_dim=128
 STANDARD_CONFIGS = [
-    BenchmarkConfig(1, 128, 32, 32, 64, "extend", "LLaMA-1B extend Seq=128 Ext=32"),
-    BenchmarkConfig(1, 128, 128, 32, 64, "prefill", "LLaMA-1B prefill Seq=128"),
-    BenchmarkConfig(1, 512, 512, 32, 64, "prefill", "LLaMA-1B prefill Seq=512"),
+    BenchmarkConfig(1, 128, 32, 12, 128, "extend", "extend Seq=128 Ext=32"),
+    BenchmarkConfig(1, 128, 128, 12, 128, "prefill", "prefill Seq=128"),
+    BenchmarkConfig(1, 512, 512, 12, 128, "prefill", "prefill Seq=512"),
 ]
 
 CI_CONFIGS = [
-    BenchmarkConfig(1, 32, 8, 32, 64, "extend", "CI LLaMA-1B extend"),
+    BenchmarkConfig(1, 32, 8, 12, 128, "extend", "CI extend"),
 ]
 
 if IS_CI:

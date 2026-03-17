@@ -1,11 +1,4 @@
-# Benchmark RVV vs torch_native norm kernels
-#
-# Covers: rmsnorm, fused_add_rmsnorm, l2norm, layernorm,
-#         gemma_rmsnorm, gemma3_rmsnorm, fused_rmsnorm_gated,
-#         gemma_fused_add_rmsnorm, fused_add_layernorm
-#
-# Input shape: (batch, hidden_size)
-# Dtypes tested: FP16 and BF16.
+"""Benchmark RVV vs torch_native normalization kernels."""
 
 import platform
 import sys
@@ -13,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from utils import (
+from _rvv_bench_utils import (
     IS_CI,
     benchmark_function,
     print_benchmark_result,
