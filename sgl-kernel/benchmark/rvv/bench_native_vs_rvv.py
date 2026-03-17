@@ -1,28 +1,8 @@
-# Native PyTorch backend vs RVV optimized backend
-#
-# Experiment purpose:
-#   Quantify the speedup from RVV-optimized kernels vs native PyTorch on RISC-V CPU (e.g. SpacemiT K1).
-#   Measure decode throughput, TTFT, and prefill throughput.
-#
-# Two model suites:
-#   (1) Qwen2.5 Instruct (BF16): Native PyTorch, RVV BF16, RVV INT8-KV (--kv-cache-dtype int8).
-#   (2) Qwen2.5 w8a8 (pre-quantized W8): W8A8 (BF16 KV), W8A8+INT8KV (INT8 KV).
-# W8A8 here means a model that is already weight-8 (e.g. RedHatAI/Qwen2.5-1.5B-quantized.w8a8),
-# not dynamic weight quantization.
-#
-# Metrics:
-#   - Decode throughput (tok/s), TTFT (ms), Prefill throughput (tok/s).
-#
-# Usage:
-#   python bench_native_vs_rvv.py           # full run (both suites)
-#   python bench_native_vs_rvv.py --quick  # shorter run for smoke test
-#   python bench_native_vs_rvv.py --instruct-only  # only Qwen2.5 Instruct suite
-#   python bench_native_vs_rvv.py --w8a8-only    # only Qwen2.5 w8a8 suite
+"""Compare native PyTorch and RVV backends on decode/prefill/TTFT."""
 
 import argparse
 import os
 import re
-import socket
 import subprocess
 import sys
 import time
@@ -31,26 +11,39 @@ from typing import Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+from _rvv_bench_utils import (
+    BASE_URL,
+)
+from _rvv_bench_utils import BF16_MODEL as MODEL_INSTRUCT
+from _rvv_bench_utils import (
+    _port_in_use,
+    _wait_for_port_free,
+)
 
 os.environ.setdefault("SGLANG_USE_CPU_ENGINE", "1")
 
 try:
     from sglang.srt.utils import kill_process_tree
-    from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, popen_launch_server
+    from sglang.test.test_utils import popen_launch_server
 except ImportError:
     print("sglang not found")
     sys.exit(1)
 
-MODEL_INSTRUCT = "Qwen/Qwen2.5-1.5B-Instruct"
-MODEL_W8A8 = "RedHatAI/Qwen2.5-1.5B-quantized.w8a8"
-BASE_URL = DEFAULT_URL_FOR_TEST
-
-# ── prompts ──────────────────────────────────────────────────────────────────
+# Prompts
 
 _SHORT = "The quick fox:"  # ~5 tokens
 _CTX_32 = ("the quick brown fox jumps over the lazy dog " * 4).strip()  # ~32 tokens
 
-# ── configs ───────────────────────────────────────────────────────────────────
+# Deterministic greedy sampling improves run-to-run comparability.
+BENCH_SAMPLING_PARAMS = {
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "ignore_eos": True,
+}
+
+# Configs
 
 
 @dataclass
@@ -67,11 +60,8 @@ class PrefillConfig:
     desc: str
 
 
-# max_tokens = output length per sequence; unified to 32 for all so throughput comparison is fair (same decode length).
+# Keep output length fixed to make throughput comparisons fair.
 DECODE_CONFIGS = [
-    DecodeConfig(_SHORT, 16, 1, "decode BS=1  short-ctx/5  (16 tok)"),
-    DecodeConfig(_SHORT, 16, 4, "decode BS=4  short-ctx/5  (16 tok)"),
-    DecodeConfig(_SHORT, 16, 8, "decode BS=8  short-ctx/5  (16 tok)"),
     DecodeConfig(_CTX_32, 16, 1, "decode BS=1  ctx/32  (16 tok)"),
     DecodeConfig(_CTX_32, 16, 4, "decode BS=4  ctx/32  (16 tok)"),
     DecodeConfig(_CTX_32, 16, 8, "decode BS=8  ctx/32  (16 tok)"),
@@ -81,7 +71,7 @@ PREFILL_CONFIGS = [
     PrefillConfig(_CTX_32, "prefill ctx/32"),
 ]
 
-# Quick mode: shorter runs for smoke test
+# Short smoke-test configs.
 QUICK_DECODE_CONFIGS = [
     DecodeConfig(_SHORT, 16, 1, "decode BS=1  short-ctx/5  (16 tok)  [quick]"),
 ]
@@ -89,10 +79,7 @@ QUICK_PREFILL_CONFIGS = [
     PrefillConfig(_CTX_32, "prefill ctx/32 [quick]"),
 ]
 
-# ── modes ─────────────────────────────────────────────────────────────────────
-
-# (name, model, extra_env, attention_backend, other_args)
-# other_args: extra server CLI args, e.g. ["--kv-cache-dtype", "int8"]
+# Modes: (name, model, extra_env, attention_backend, other_args)
 INSTRUCT_MODES = [
     (
         "Native PyTorch",
@@ -102,17 +89,7 @@ INSTRUCT_MODES = [
         [],
     ),
     ("RVV BF16", MODEL_INSTRUCT, {}, "rvv", []),
-    ("RVV INT8-KV", MODEL_INSTRUCT, {}, "rvv", ["--kv-cache-dtype", "int8"]),
-]
-W8A8_MODES = [
-    ("W8A8", MODEL_W8A8, {}, "rvv", ["--quantization", "w8a8_int8"]),
-    (
-        "W8A8+INT8KV",
-        MODEL_W8A8,
-        {},
-        "rvv",
-        ["--quantization", "w8a8_int8", "--kv-cache-dtype", "int8"],
-    ),
+    ("RVV W8A8", MODEL_INSTRUCT, {}, "rvv", ["--quantization", "w8a8_int8"]),
 ]
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -126,7 +103,10 @@ def _measure_decode(cfg: DecodeConfig, warmup: int = 1) -> Optional[float]:
                 f"{BASE_URL}/generate",
                 json={
                     "text": prompts,
-                    "sampling_params": {"max_new_tokens": cfg.max_tokens},
+                    "sampling_params": {
+                        **BENCH_SAMPLING_PARAMS,
+                        "max_new_tokens": cfg.max_tokens,
+                    },
                 },
                 timeout=300,
             )
@@ -138,9 +118,12 @@ def _measure_decode(cfg: DecodeConfig, warmup: int = 1) -> Optional[float]:
             f"{BASE_URL}/generate",
             json={
                 "text": prompts,
-                "sampling_params": {"max_new_tokens": cfg.max_tokens},
+                "sampling_params": {
+                    **BENCH_SAMPLING_PARAMS,
+                    "max_new_tokens": cfg.max_tokens,
+                },
             },
-            timeout=600,
+            timeout=1200,
         )
         elapsed = time.perf_counter() - t0
         r.raise_for_status()
@@ -162,8 +145,14 @@ def _measure_prefill(
         try:
             requests.post(
                 f"{BASE_URL}/generate",
-                json={"text": cfg.prompt, "sampling_params": {"max_new_tokens": 1}},
-                timeout=600,
+                json={
+                    "text": cfg.prompt,
+                    "sampling_params": {
+                        **BENCH_SAMPLING_PARAMS,
+                        "max_new_tokens": 1,
+                    },
+                },
+                timeout=1200,
             )
         except Exception:
             pass
@@ -171,8 +160,14 @@ def _measure_prefill(
         t0 = time.perf_counter()
         r = requests.post(
             f"{BASE_URL}/generate",
-            json={"text": cfg.prompt, "sampling_params": {"max_new_tokens": 1}},
-            timeout=600,
+            json={
+                "text": cfg.prompt,
+                "sampling_params": {
+                    **BENCH_SAMPLING_PARAMS,
+                    "max_new_tokens": 1,
+                },
+            },
+            timeout=1200,
         )
         elapsed = time.perf_counter() - t0
         r.raise_for_status()
@@ -182,21 +177,9 @@ def _measure_prefill(
         return None, None
 
 
-SERVER_START_TIMEOUT = 1800
+SERVER_START_TIMEOUT = 3600
 POST_KILL_SLEEP = 600
-# PyTorch/CPU server can be slow to release the port after kill; wait long enough.
 PORT_FREE_TIMEOUT = 900
-
-
-def _port_in_use(host: str, port: int) -> bool:
-    """Return True if something is listening on host:port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.settimeout(1)
-            s.connect((host, port))
-            return True
-        except (socket.error, OSError):
-            return False
 
 
 def _kill_process_on_port(port: int) -> bool:
@@ -236,18 +219,6 @@ def _kill_process_on_port(port: int) -> bool:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
     return killed
-
-
-def _wait_for_port_free(
-    host: str, port: int, timeout: float = PORT_FREE_TIMEOUT
-) -> bool:
-    """Wait until port is free (connection refused). Returns True if free, False on timeout."""
-    start = time.perf_counter()
-    while time.perf_counter() - start < timeout:
-        if not _port_in_use(host, port):
-            return True
-        time.sleep(5)
-    return False
 
 
 def _launch(
@@ -325,7 +296,7 @@ def run_mode(
             f"  Waiting for port {port} to be free (timeout={PORT_FREE_TIMEOUT}s)...",
             flush=True,
         )
-        if not _wait_for_port_free(host, port):
+        if not _wait_for_port_free(host, port, timeout=PORT_FREE_TIMEOUT):
             raise RuntimeError(
                 f"Port {port} still in use after {PORT_FREE_TIMEOUT}s; cannot launch server. "
                 f"On the host, run: fuser -k {port}/tcp  or  kill -9 $(lsof -ti :{port})"
@@ -458,12 +429,7 @@ def main():
     parser.add_argument(
         "--instruct-only",
         action="store_true",
-        help="Run only Qwen2.5 Instruct suite (Native, RVV BF16, RVV INT8-KV)",
-    )
-    parser.add_argument(
-        "--w8a8-only",
-        action="store_true",
-        help="Run only Qwen2.5 w8a8 suite (W8A8, W8A8+INT8KV)",
+        help="Run only Qwen2.5 Instruct suite (Native, RVV BF16, RVV W8A8)",
     )
     args = parser.parse_args()
 
@@ -472,8 +438,7 @@ def main():
     else:
         decode_cfgs, prefill_cfgs = DECODE_CONFIGS, PREFILL_CONFIGS
 
-    run_instruct = args.instruct_only or not args.w8a8_only
-    run_w8a8 = args.w8a8_only or not args.instruct_only
+    run_instruct = True
 
     print(f"Decode configs: {len(decode_cfgs)}, Prefill configs: {len(prefill_cfgs)}")
 
@@ -497,28 +462,6 @@ def main():
             prefill_cfgs,
             mode_names=[n for n, *_ in INSTRUCT_MODES],
             baseline_name="Native PyTorch",
-        )
-
-    if run_w8a8:
-        print(f"\n>>> Suite: Qwen2.5 w8a8 ({MODEL_W8A8})")
-        print(f"Modes: {[n for n, *_ in W8A8_MODES]}")
-        all_w8a8 = {}
-        for name, model, extra_env, attn_backend, server_args in W8A8_MODES:
-            all_w8a8[name] = run_mode(
-                name,
-                model,
-                extra_env,
-                attn_backend,
-                server_args,
-                decode_cfgs,
-                prefill_cfgs,
-            )
-        print_summary(
-            all_w8a8,
-            decode_cfgs,
-            prefill_cfgs,
-            mode_names=[n for n, *_ in W8A8_MODES],
-            baseline_name="W8A8",
         )
 
 

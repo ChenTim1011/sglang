@@ -1,4 +1,4 @@
-# Benchmark RVV vs torch_native fp16 GEMM
+"""Benchmark RVV vs torch_native FP16 GEMM."""
 
 import argparse
 import os
@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from utils import (
+from _rvv_bench_utils import (
     IS_CI,
     print_benchmark_result,
 )
@@ -40,21 +40,23 @@ class BenchmarkResult:
     speedup: float
 
 
-# Llama-3.2-1B: hidden_size=2048, intermediate_size=8192. GEMM (M,K)@(N,K): QKV (1,2048)@(2048,2048), FFN up (1,2048)@(16384,2048), FFN down (1,8192)@(2048,8192)
+# Target shapes: hidden_size=1536, intermediate_size=8960.
+# GEMM (M,K)@(N,K): Q proj (1,1536)@(1536,1536),
+# FFN up+gate fused (1,1536)@(17920,1536), FFN down (1,8960)@(1536,8960).
 STANDARD_CONFIGS = [
-    BenchmarkConfig(1, 2048, 2048, "LLaMA-1B QKV decode"),
-    BenchmarkConfig(1, 16384, 2048, "LLaMA-1B FFN up decode"),
-    BenchmarkConfig(1, 2048, 8192, "LLaMA-1B FFN down decode"),
-    BenchmarkConfig(4, 2048, 2048, "LLaMA-1B QKV batch=4"),
-    BenchmarkConfig(8, 2048, 2048, "LLaMA-1B QKV batch=8"),
-    BenchmarkConfig(256, 2048, 2048, "LLaMA-1B QKV prefill M=256"),
-    BenchmarkConfig(256, 16384, 2048, "LLaMA-1B FFN up prefill M=256"),
-    BenchmarkConfig(256, 2048, 8192, "LLaMA-1B FFN down prefill M=256"),
+    BenchmarkConfig(1, 1536, 1536, "Q proj decode"),
+    BenchmarkConfig(1, 17920, 1536, "FFN up decode"),
+    BenchmarkConfig(1, 1536, 8960, "FFN down decode"),
+    BenchmarkConfig(4, 1536, 1536, "Q proj batch=4"),
+    BenchmarkConfig(8, 1536, 1536, "Q proj batch=8"),
+    BenchmarkConfig(256, 1536, 1536, "Q proj prefill M=256"),
+    BenchmarkConfig(256, 17920, 1536, "FFN up prefill M=256"),
+    BenchmarkConfig(256, 1536, 8960, "FFN down prefill M=256"),
 ]
 
 CI_CONFIGS = [
-    BenchmarkConfig(1, 2048, 2048, "LLaMA-1B QKV decode"),
-    BenchmarkConfig(1, 16384, 2048, "LLaMA-1B FFN up decode"),
+    BenchmarkConfig(1, 1536, 1536, "Q proj decode"),
+    BenchmarkConfig(1, 17920, 1536, "FFN up decode"),
 ]
 
 if IS_CI:

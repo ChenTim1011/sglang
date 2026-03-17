@@ -1,23 +1,4 @@
-# Profile SGLang RVV components and produce a breakdown of time spent per kernel.
-#
-# Experiment purpose:
-#   Identify which RVV kernels (GEMM, attention, etc.) dominate inference time on RISC-V
-#   CPU (e.g. SpacemiT K1). Use PyTorch profiler traces to quantify per-component cost and
-#   guide optimization priorities.
-#
-# What this script does:
-#   1. Launch SGLang server (--device cpu, Qwen2.5-1.5B)
-#   2. POST /start_profile → send num_steps generate requests → POST /stop_profile
-#   3. Kill server, parse Chrome trace JSON: extract "sgl-kernel::*" events, aggregate by kernel
-#   4. Print table: Component, Time (ms), % of total sgl-kernel time
-#
-# Output:
-#   - Component time breakdown (ms, % of total sgl-kernel)
-#   - Traces written to output_dir (Chrome trace format)
-#
-# Usage:
-#   python bench_profile_rvv_components.py           # full run (5 steps)
-#   python bench_profile_rvv_components.py --test    # smoke test (2 steps)
+"""Profile RVV kernels and report per-component time breakdown."""
 
 import argparse
 import gzip
@@ -38,9 +19,10 @@ except ImportError:
     pass  # Optional: for --launch-server only
 
 SGL_KERNEL_PREFIX = "sgl-kernel::"
-MODEL = "Qwen/Qwen2.5-1.5B"
+BF16_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+W8A8_MODEL = "RedHatAI/Qwen2.5-1.5B-quantized.w8a8"
 
-# Component → RVV source file (for optimization targeting)
+# Component -> RVV source file mapping for follow-up optimization.
 COMPONENT_TO_FILE = {
     "weight_packed_linear": "gemm.cpp",
     "decode_attention_cpu": "decode.cpp",
@@ -52,7 +34,7 @@ COMPONENT_TO_FILE = {
     "int8_scaled_mm_cpu": "gemm_int8.cpp",
 }
 SERVER_START_TIMEOUT = 1800
-POST_KILL_SLEEP = 100
+POST_KILL_SLEEP = 15
 
 
 def _load_trace(path: Path) -> dict:
@@ -184,8 +166,8 @@ def run_profile(
     Start profiler, send requests to trigger forwards, then stop and flush traces.
     Returns the output_dir where traces are written.
 
-    NOTE:We poll the output directory until the trace file appears.  Writing to /dev/shm
-    (ramdisk) via --output-dir /dev/shm/rvv_profile eliminates most of this delay.
+    NOTE: We poll the output directory until the trace file appears.
+    Do NOT use /dev/shm — large traces can exhaust K1's RAM (OOM).  Use /tmp (default).
     """
     output_dir = output_dir / str(int(time.time()))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -327,36 +309,45 @@ def print_breakdown(
 
 
 def run_with_launch(
-    num_steps: int, profile_by_stage: bool, output_dir: Path, max_new_tokens: int = 4
+    num_steps: int,
+    profile_by_stage: bool,
+    output_dir: Path,
+    max_new_tokens: int = 4,
+    w8a8: bool = False,
 ) -> Path:
     """Launch server, run profile, kill server. Returns output_dir with traces."""
     try:
         from sglang.srt.utils import kill_process_tree
         from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, popen_launch_server
     except ImportError as e:
-        print(f"[ERROR] --launch-server requires sglang: {e}")
+        print(f"[ERROR] requires sglang: {e}")
         sys.exit(1)
 
+    model = W8A8_MODEL if w8a8 else BF16_MODEL
     url = DEFAULT_URL_FOR_TEST
-    env = {**os.environ}
+    other_args = [
+        "--dtype",
+        "bfloat16",
+        "--device",
+        "cpu",
+        "--watchdog-timeout",
+        "900",
+        "--attention-backend",
+        "rvv",
+    ]
+    if w8a8:
+        other_args += ["--quantization", "w8a8_int8"]
+
     proc = popen_launch_server(
-        MODEL,
+        model,
         url,
         timeout=SERVER_START_TIMEOUT,
-        other_args=[
-            "--dtype",
-            "bfloat16",
-            "--device",
-            "cpu",
-            "--watchdog-timeout",
-            "900",
-            "--attention-backend",
-            "rvv",
-        ],
-        env=env,
+        other_args=other_args,
+        env={**os.environ},
     )
     try:
-        trace_wait = 300 if profile_by_stage else 3600
+        # 300s for profile_by_stage (trace written per stage), 120s otherwise
+        trace_wait = 300 if profile_by_stage else 120
         output_dir = run_profile(
             url=url,
             output_dir=output_dir,
@@ -379,8 +370,8 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="/dev/shm/rvv_profile",
-        help="Profile output directory (default: /dev/shm ramdisk to avoid slow flash I/O)",
+        default="/tmp/rvv_profile",
+        help="Profile output directory (default: /tmp to avoid OOM from /dev/shm ramdisk)",
     )
     parser.add_argument(
         "--num-steps",
@@ -402,18 +393,30 @@ def main():
     parser.add_argument(
         "--test", action="store_true", help="Smoke test: 2 steps, no profile_by_stage"
     )
+    parser.add_argument(
+        "--w8a8",
+        action="store_true",
+        help=f"Profile W8A8 quantized model ({W8A8_MODEL}) with --quantization w8a8_int8",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     num_steps = 2 if args.test else args.num_steps
     profile_by_stage = False if args.test else args.profile_by_stage
     max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else 4
+    model_label = W8A8_MODEL if args.w8a8 else BF16_MODEL
 
     print(
-        f"Launching server + profile: {num_steps} steps, max_new_tokens={max_new_tokens}, profile_by_stage={profile_by_stage}, output={output_dir}"
+        f"Launching server + profile: model={model_label}, w8a8={args.w8a8}, "
+        f"{num_steps} steps, max_new_tokens={max_new_tokens}, "
+        f"profile_by_stage={profile_by_stage}, output={output_dir}"
     )
     output_dir = run_with_launch(
-        num_steps, profile_by_stage, output_dir, max_new_tokens=max_new_tokens
+        num_steps,
+        profile_by_stage,
+        output_dir,
+        max_new_tokens=max_new_tokens,
+        w8a8=args.w8a8,
     )
 
     traces = find_traces_in_dir(output_dir)
