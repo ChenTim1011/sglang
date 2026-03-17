@@ -19,7 +19,11 @@ struct is_quantized<int8_t> : std::true_type {};
 
 namespace rvv_constants {
 inline constexpr int64_t BLOCK_N = 64;
-inline constexpr size_t MAX_VL_ELEMENTS_M4 = 32;
+// MAX_VL_ELEMENTS_M{4,8}: maximum element count per vsetvlmax call for each LMUL.
+// Computed from __riscv_v_fixed_vlen (set by -mrvv-vector-bits=N in CMakeLists).
+// Example: VLEN=256 → M4=32, M8=64; VLEN=512 → M4=64, M8=128.
+inline constexpr size_t MAX_VL_ELEMENTS_M4 = __riscv_v_fixed_vlen / 8;
+inline constexpr size_t MAX_VL_ELEMENTS_M8 = __riscv_v_fixed_vlen / 4;
 }  // namespace rvv_constants
 
 // Returns VLENB (vector register length in bytes) at runtime via vsetvlmax.
@@ -28,7 +32,9 @@ inline int64_t rvv_get_vlenb() {
   return static_cast<int64_t>(__riscv_vsetvlmax_e8m1());
 }
 
-typedef vfloat32m1_t vf32m1_t __attribute__((riscv_rvv_vector_bits(256)));
+// Fixed-width vector type: width follows __riscv_v_fixed_vlen (set at compile time via -mrvv-vector-bits=N).
+// Enables stack arrays of vector type (e.g., vf32m1_t arr[N]) in kernels that need them.
+typedef vfloat32m1_t vf32m1_t __attribute__((riscv_rvv_vector_bits(__riscv_v_fixed_vlen)));
 
 #ifndef MAX_HEAD_SIZE
 #define MAX_HEAD_SIZE 256
@@ -340,13 +346,12 @@ inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ s
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc, float s, int64_t size) {
   size_t vl;
-  vfloat32m4_t v_scale = __riscv_vfmv_v_f_f32m4(s, __riscv_vsetvlmax_e32m4());
   alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
 
   for (int64_t d = 0; d < size; d += vl) {
     vl = __riscv_vsetvl_e32m4(size - d);
     vfloat32m4_t v_acc = __riscv_vle32_v_f32m4(acc + d, vl);
-    vfloat32m4_t v_scaled = __riscv_vfmul_vv_f32m4(v_acc, v_scale, vl);
+    vfloat32m4_t v_scaled = __riscv_vfmul_vf_f32m4(v_acc, s, vl);
     store_from_float_m4(out + d, v_scaled, vl, scratch);
   }
 }
@@ -428,7 +433,6 @@ inline void scalar_sigmoid_and_mul(
   // Sigmoid: 1 / (1 + exp(-x))
   float sigmoid_val = 1.0f / (1.0f + std::exp(-x_val));
   size_t vl_max = __riscv_vsetvlmax_e32m4();
-  vfloat32m4_t v_sigmoid = __riscv_vfmv_v_f_f32m4(sigmoid_val, vl_max);
 
   // Vector multiply: mul * sigmoid
   alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
@@ -440,7 +444,7 @@ inline void scalar_sigmoid_and_mul(
     vfloat32m4_t v_mul = load_as_float_m4(mul + d, vl, scratch);
 
     // Multiply by sigmoid
-    vfloat32m4_t v_result = __riscv_vfmul_vv_f32m4(v_mul, v_sigmoid, vl);
+    vfloat32m4_t v_result = __riscv_vfmul_vf_f32m4(v_mul, sigmoid_val, vl);
 
     // Store back as scalar_t
     store_from_float_m4(out + d, v_result, vl, scratch);

@@ -11,8 +11,7 @@
 
 #include "riscv64/vector_helpers.h"
 
-// RVV-optimized blocking parameters
-// SpacemiT K1 (VLEN=256b)
+// RVV blocking parameters. Tuned for VLEN=256; adjust via CMakeLists for other VLENs.
 #define TILE_M 4
 #define TILE_N 64
 #define TILE_K 64
@@ -176,11 +175,8 @@ inline void gemm_nt_tiled_transposed(
         } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
           v_k_f32 = bf16_to_f32m4(reinterpret_cast<const uint16_t*>(k_ptr), vl);
         } else {
-          assert(vl <= 64 && "k_tmp buffer size; VLEN=256 e32m4 yields at most 8");
-          float k_tmp[64];
-          for (size_t i = 0; i < vl; ++i)
-            k_tmp[i] = static_cast<float>(k_ptr[i]);
-          v_k_f32 = __riscv_vle32_v_f32m4(k_tmp, vl);
+          // scalar_t=float: identity cast, load directly
+          v_k_f32 = __riscv_vle32_v_f32m4(reinterpret_cast<const float*>(k_ptr), vl);
         }
 
         float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
@@ -261,10 +257,8 @@ inline void gemm_nn_tiled(
           if (m_count > 2) acc2 = __riscv_vfmacc_vf_f32m4(acc2, p2, v_v, vl);
           if (m_count > 3) acc3 = __riscv_vfmacc_vf_f32m4(acc3, p3, v_v, vl);
         } else {
-          float v_tmp[64];
-          for (size_t i = 0; i < vl; ++i)
-            v_tmp[i] = static_cast<float>(v_ptr[i]);
-          vfloat32m4_t v_v = __riscv_vle32_v_f32m4(v_tmp, vl);
+          // scalar_t=float: identity cast, load directly
+          vfloat32m4_t v_v = __riscv_vle32_v_f32m4(reinterpret_cast<const float*>(v_ptr), vl);
 
           acc0 = __riscv_vfmacc_vf_f32m4(acc0, p0, v_v, vl);
           if (m_count > 1) acc1 = __riscv_vfmacc_vf_f32m4(acc1, p1, v_v, vl);

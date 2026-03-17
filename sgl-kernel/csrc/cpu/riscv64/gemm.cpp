@@ -346,7 +346,6 @@ void weight_packed_linear_kernel_impl(
     int64_t mat1_strideM,
     int64_t out_strideM) {
   const size_t vl_max = __riscv_vsetvlmax_e32m4();
-  const bool two_chunks = (static_cast<size_t>(N) > vl_max);
 
 #pragma omp parallel for if (M > 1)
   for (int64_t m = 0; m < M; ++m) {
@@ -487,8 +486,7 @@ at::Tensor
 weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni) {
   RECORD_FUNCTION("sgl-kernel::weight_packed_linear", std::vector<c10::IValue>({mat1, mat2, bias}));
 
-  bool is_packed = is_vnni;
-  auto packed_w = is_packed ? mat2 : convert_weight_packed(mat2);
+  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
   bool use_fma_gemm = false;
   if (packed_w.scalar_type() == at::kFloat) {
     use_fma_gemm = true;
@@ -500,7 +498,7 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
   if (use_fma_gemm) {
     N = packed_w.size(1);
   } else {
-    if (is_packed) {
+    if (is_vnni) {
       // RVV packed: 2D [NB, IC*BLOCK_N] or 3D [E, NB, block_size]; logical OC = NB*BLOCK_N
       if (packed_w.dim() == 2) {
         N = packed_w.size(0) * block_size_n();
@@ -517,7 +515,7 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_DIM(2, mat1);
-  if (!is_packed) {
+  if (!is_vnni) {
     CHECK_DIM(2, mat2);
     if (!use_fma_gemm) {
       CHECK_EQ(mat1.size(1), mat2.size(1));
@@ -581,17 +579,16 @@ at::Tensor fused_linear_sigmoid_mul(
     const at::Tensor& post_mul_mat) {
   RECORD_FUNCTION("sgl-kernel::fused_linear_sigmoid_mul", std::vector<c10::IValue>({mat1, mat2, bias, post_mul_mat}));
 
-  bool is_packed = is_vnni;
-  auto packed_w = is_packed ? mat2 : convert_weight_packed(mat2);
+  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 
   int64_t M = mat1.size(0);
   int64_t K = mat1.size(1);
-  int64_t N = is_packed ? mat2.size(1) : (mat2.dim() == 3 ? mat2.size(1) : mat2.size(0));
+  int64_t N = is_vnni ? mat2.size(1) : (mat2.dim() == 3 ? mat2.size(1) : mat2.size(0));
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_DIM(2, mat1);
-  if (!is_packed) {
+  if (!is_vnni) {
     CHECK_DIM(2, mat2);
     TORCH_CHECK(mat2.size(1) == K, "K dimension mismatch: mat1 K=", K, " vs mat2 K=", mat2.size(1));
   }
@@ -613,32 +610,18 @@ at::Tensor fused_linear_sigmoid_mul(
   }
 
   AT_DISPATCH_RVV_TYPES(dispatch_type, "fused_linear_sigmoid_mul", [&] {
-    if (packed_w.scalar_type() != at::kFloat) {
-      auto float_w = packed_w.to(at::kFloat);
-      weight_packed_linear_kernel_impl<scalar_t>(
-          out.data_ptr<scalar_t>(),
-          mat1.data_ptr<scalar_t>(),
-          float_w.data_ptr<float>(),
-          bias_data,
-          post_mul_mat.data_ptr<scalar_t>(),
-          M,
-          N,
-          K,
-          mat1_strideM,
-          out_strideM);
-    } else {
-      weight_packed_linear_kernel_impl<scalar_t>(
-          out.data_ptr<scalar_t>(),
-          mat1.data_ptr<scalar_t>(),
-          packed_w.data_ptr<float>(),
-          bias_data,
-          post_mul_mat.data_ptr<scalar_t>(),
-          M,
-          N,
-          K,
-          mat1_strideM,
-          out_strideM);
-    }
+    auto float_w = (packed_w.scalar_type() != at::kFloat) ? packed_w.to(at::kFloat) : packed_w;
+    weight_packed_linear_kernel_impl<scalar_t>(
+        out.data_ptr<scalar_t>(),
+        mat1.data_ptr<scalar_t>(),
+        float_w.data_ptr<float>(),
+        bias_data,
+        post_mul_mat.data_ptr<scalar_t>(),
+        M,
+        N,
+        K,
+        mat1_strideM,
+        out_strideM);
   });
 
   return out;

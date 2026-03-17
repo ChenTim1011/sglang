@@ -2,10 +2,12 @@
 #pragma clang riscv intrinsic vector
 #endif
 
+#if defined(CPU_CAPABILITY_RVV)
+
 #include <cstdint>
 
 #include "common.h"
-#include "riscv64/vector_helpers.h"  // includes vector_math.h for vfexp, vftanh, vferf
+#include "riscv64/vector_helpers.h"
 
 namespace {
 
@@ -17,35 +19,35 @@ constexpr float kInvSqrt2 = 0.7071067811865476f;
 
 // Inner loop: out[j] = silu(x[j]) * y[j]
 // SiLU(x) = x / (1 + exp(-x)) = x * rec(1 + exp(-x))
-// 2-way unrolled: issues exp(A) then loads chunk B while exp(A) is in-flight,
-// hiding the ~15-cycle exp latency on in-order cores.
+
 template <typename scalar_t>
 void act_silu_inner(
     scalar_t* __restrict__ out_ptr, const scalar_t* __restrict__ x_ptr, const scalar_t* __restrict__ y_ptr, int64_t d) {
   alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
-  const int64_t max_vl = static_cast<int64_t>(__riscv_vsetvlmax_e32m4());
+  const size_t max_vl = __riscv_vsetvlmax_e32m4();
+  const int64_t max_vl_i = static_cast<int64_t>(max_vl);
   int64_t j = 0;
 
   // 2-way unrolled main loop (both chunks are full-width, no tail logic needed here)
-  for (; j + 2 * max_vl <= d; j += 2 * max_vl) {
+  for (; j + 2 * max_vl_i <= d; j += 2 * max_vl_i) {
     // ---- chunk A: load + issue exp ----
     vfloat32m4_t vxA = load_as_float_m4(x_ptr + j, max_vl, scratch);
     vfloat32m4_t vyA = load_as_float_m4(y_ptr + j, max_vl, scratch);
     vfloat32m4_t vexpA = vfexp_f32m4(__riscv_vfneg_v_f32m4(vxA, max_vl), max_vl);
     // ---- chunk B: load while expA computes ----
-    vfloat32m4_t vxB = load_as_float_m4(x_ptr + j + max_vl, max_vl, scratch);
-    vfloat32m4_t vyB = load_as_float_m4(y_ptr + j + max_vl, max_vl, scratch);
+    vfloat32m4_t vxB = load_as_float_m4(x_ptr + j + max_vl_i, max_vl, scratch);
+    vfloat32m4_t vyB = load_as_float_m4(y_ptr + j + max_vl_i, max_vl, scratch);
     vfloat32m4_t vexpB = vfexp_f32m4(__riscv_vfneg_v_f32m4(vxB, max_vl), max_vl);
-    // ---- finish A ----
+
     vfloat32m4_t vdA = __riscv_vfadd_vf_f32m4(vexpA, 1.0f, max_vl);
     vfloat32m4_t voutA =
         __riscv_vfmul_vv_f32m4(__riscv_vfmul_vv_f32m4(vxA, vrec_f32m4(vdA, max_vl), max_vl), vyA, max_vl);
     store_from_float_m4(out_ptr + j, voutA, max_vl, scratch);
-    // ---- finish B ----
+
     vfloat32m4_t vdB = __riscv_vfadd_vf_f32m4(vexpB, 1.0f, max_vl);
     vfloat32m4_t voutB =
         __riscv_vfmul_vv_f32m4(__riscv_vfmul_vv_f32m4(vxB, vrec_f32m4(vdB, max_vl), max_vl), vyB, max_vl);
-    store_from_float_m4(out_ptr + j + max_vl, voutB, max_vl, scratch);
+    store_from_float_m4(out_ptr + j + max_vl_i, voutB, max_vl, scratch);
   }
 
   // tail: handles remainder (including d < 2*max_vl entirely)
@@ -62,11 +64,7 @@ void act_silu_inner(
 
 // Inner loop: out[j] = gelu_tanh(x[j]) * y[j]
 // gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-//
-// Register-pressure fix: compute tanh_arg from vx BEFORE loading vy.
-// On FP16, load_as_float_m4 temporarily allocates a f16m2 register; deferring
-// the vy load until vx2/vx3/vinner/vtanh_arg are dead reduces peak live-reg count
-// from 9 to 8 (the physical m4-group limit), eliminating register spills.
+
 template <typename scalar_t>
 void act_gelu_tanh_inner(
     scalar_t* __restrict__ out_ptr, const scalar_t* __restrict__ x_ptr, const scalar_t* __restrict__ y_ptr, int64_t d) {
@@ -92,10 +90,7 @@ void act_gelu_tanh_inner(
 
 // Inner loop: out[j] = gelu(x[j]) * y[j]
 // gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
-//
-// Register-pressure fix: compute vx_scaled and call vferf BEFORE loading vy.
-// vferf uses up to 7 m4 registers internally; deferring the vy load avoids
-// holding vy live across the entire vferf call chain.
+
 template <typename scalar_t>
 void act_gelu_inner(
     scalar_t* __restrict__ out_ptr, const scalar_t* __restrict__ x_ptr, const scalar_t* __restrict__ y_ptr, int64_t d) {
@@ -184,3 +179,5 @@ at::Tensor gelu_and_mul_cpu(const at::Tensor& input) {
   });
   return out;
 }
+
+#endif  // CPU_CAPABILITY_RVV

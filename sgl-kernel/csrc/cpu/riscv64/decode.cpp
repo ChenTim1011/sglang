@@ -317,7 +317,7 @@ struct tinygemm_kernel_nn<at::BFloat16, at::BFloat16, index_t, BLOCK_M, BLOCK_N>
     (void)v_scale;
     (void)v_scales_per_token;
     constexpr int ROWS = BLOCK_M;
-    constexpr int COLS = 4;  // 4 * 8(vl) = 32 elements per tile
+    constexpr int COLS = 4;  // 4 m1 vectors per tile
 
     size_t vl_max = __riscv_vsetvlmax_e32m1();
     int64_t tile_n = COLS * vl_max;
@@ -678,8 +678,8 @@ void index_gemm_kernel_nn(
     float v_scale = 1.0f,                         // Only used for INT8 dequantization
     const float* v_scales_per_token = nullptr) {  // Per-token scales; overrides v_scale if not null
   using kv_type = kv_t;
+  // Minimum alignment for N tiling dispatch: BLOCK_N must be a multiple of 16.
   constexpr int kVecSize = 16;
-  // N must be multiple of 16 for vectorized path
   if ((N & (kVecSize - 1)) != 0) {
     tinygemm_kernel_nn_scalar<scalar_t, kv_t, index_t>(
         A, B, C, indices, scale, M, N, K, lda, ldb, ldc, max_tokens, v_scale, v_scales_per_token);
@@ -900,14 +900,6 @@ void decode_set_kv_buffer_int8_copy(
       buffer_t* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_kv_id * k_strideH;
       const buffer_t* new_key_ptr = key + bs * nk_strideN + head_kv_id * nk_strideH;
 
-      copy_stub<buffer_t>(k_buffer_ptr, new_key_ptr, head_size);
-
-      if (!is_mla) {
-        buffer_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
-        const buffer_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
-        copy_stub<buffer_t>(v_buffer_ptr, new_value_ptr, head_size_v);
-      }
-
       if (i + 1 < end) {
         int64_t next_bs = bs, next_head = head_kv_id;
         data_index_step(next_bs, batches, next_head, num_heads_kv);
@@ -915,6 +907,14 @@ void decode_set_kv_buffer_int8_copy(
         if (!is_mla) {
           __builtin_prefetch(value + next_bs * nv_strideN + next_head * nv_strideH, 0, 1);
         }
+      }
+
+      copy_stub<buffer_t>(k_buffer_ptr, new_key_ptr, head_size);
+
+      if (!is_mla) {
+        buffer_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
+        const buffer_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
+        copy_stub<buffer_t>(v_buffer_ptr, new_value_ptr, head_size_v);
       }
 
       data_index_step(bs, batches, head_kv_id, num_heads_kv);
@@ -1024,7 +1024,8 @@ inline void decode_accumulate_kv_splits(
       float scale = (s_prime > 0.0f && std::isfinite(s_prime)) ? (1.0f / s_prime) : 0.0f;
 
       size_t vl_max = __riscv_vsetvlmax_e32m8();
-      float scratch[256];
+      alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M8];
+      // Assumes contiguous output: stride[0]=num_heads*head_size_v, stride[1]=head_size_v
       scalar_t* o_ptr = output + i * head_size_v;
       for (int64_t d = 0; d < head_size_v; d += vl_max) {
         size_t vl = __riscv_vsetvl_e32m8(head_size_v - d);
@@ -1037,7 +1038,7 @@ inline void decode_accumulate_kv_splits(
   });
 }
 
-template <typename scalar_t, typename kv_t, typename index_t, int64_t BLOCK_N_IGNORED>
+template <typename scalar_t, typename kv_t, typename index_t, int64_t BLOCK_N_UNUSED>
 void decode_attention_kernel_impl(
     scalar_t* __restrict__ output,
     float* __restrict__ attn_logits,
@@ -1145,8 +1146,15 @@ void decode_attention_kernel_impl(
 
         // 2. Logit Cap & Softmax parts
         if (has_logit_cap) {
-          for (int k = 0; k < n_size; ++k)
-            s_i[k] = std::tanh(s_i[k] * rlogit_cap) * logit_cap;
+          size_t vl_max = __riscv_vsetvlmax_e32m4();
+          for (int64_t idx = 0; idx < n_size; idx += vl_max) {
+            size_t vl = __riscv_vsetvl_e32m4(n_size - idx);
+            vfloat32m4_t vx = __riscv_vle32_v_f32m4(s_i + idx, vl);
+            vx = __riscv_vfmul_vf_f32m4(vx, rlogit_cap, vl);
+            vx = vftanh_f32m4(vx, vl);
+            vx = __riscv_vfmul_vf_f32m4(vx, logit_cap, vl);
+            __riscv_vse32_v_f32m4(s_i + idx, vx, vl);
+          }
         }
 
         // m_i: max value across block
@@ -1192,7 +1200,8 @@ void decode_attention_kernel_impl(
       }
 
       if (kv_end > kv_start) {
-        float s = 1.0f / s_prime;
+        const float safe_s_prime = (s_prime > 1e-38f) ? s_prime : 1e-38f;
+        float s = 1.0f / safe_s_prime;
         size_t vl_max = __riscv_vsetvlmax_e32m8();
         for (int64_t d = 0; d < head_size_v; d += vl_max) {
           size_t vl = __riscv_vsetvl_e32m8(head_size_v - d);
@@ -1200,7 +1209,7 @@ void decode_attention_kernel_impl(
           vval = __riscv_vfmul_vf_f32m8(vval, s, vl);
           __riscv_vse32_v_f32m8(v_prime + d, vval, vl);
         }
-        v_prime[head_size_v] = m_prime + std::log(s_prime);
+        v_prime[head_size_v] = m_prime + std::log(safe_s_prime);
       }
 
       data_index_step(bs, batches, head_id, num_heads, kv_id, num_kv_splits);
@@ -1221,7 +1230,6 @@ void decode_attention_mla_kernel_impl(
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
-    scalar_t* __restrict__ buffer,
     int64_t batches,
     int64_t num_heads,
     int64_t head_size,
@@ -1238,7 +1246,6 @@ void decode_attention_mla_kernel_impl(
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens,
-    int64_t buffer_size_per_thread,
     float k_scale,  // Only used for INT8 dequantization
     float v_scale,
     int64_t o_strideM,
@@ -1250,10 +1257,6 @@ void decode_attention_mla_kernel_impl(
   const int64_t l_stride2 = head_size_v + 1;
 
   TORCH_CHECK(logit_cap == 0.f, "RVV decode MLA: expect no logit_cap.");
-
-  // Suppress unused parameter
-  (void)buffer;
-  (void)buffer_size_per_thread;
 
   const scalar_t* __restrict__ k_buffer_typed = reinterpret_cast<const scalar_t*>(k_buffer);
   const scalar_t* __restrict__ v_buffer_typed = reinterpret_cast<const scalar_t*>(v_buffer);
@@ -1773,7 +1776,6 @@ void decode_attention_cpu(
             req_to_token.data_ptr<index_t>(),
             req_pool_indices.data_ptr<int64_t>(),
             seq_lens.data_ptr<int64_t>(),
-            buffer.data_ptr<scalar_t>(),
             num_seqs,
             num_heads,
             head_size,
@@ -1790,7 +1792,6 @@ void decode_attention_cpu(
             max_num_reqs,
             max_context_len,
             max_total_num_tokens,
-            size_per_thread,
             k_scale,
             v_scale,
             o_strideM,
@@ -1991,8 +1992,8 @@ void decode_attention_int8_cpu(
         // Dispatch to INT8-aware RVV kernel (unified kernel handles INT8 via k_scale/v_scale)
         if (num_heads == num_heads_kv) {
           // MHA : num_heads == num_heads_kv
-          constexpr int64_t BLOCK_N_IGNORED = 4;  // Not used by unified kernel
-          decode_attention_kernel_impl<scalar_t, int8_t, index_t, BLOCK_N_IGNORED>(
+          constexpr int64_t BLOCK_N_UNUSED = 4;  // Not used by unified kernel
+          decode_attention_kernel_impl<scalar_t, int8_t, index_t, BLOCK_N_UNUSED>(
               output.data_ptr<scalar_t>(),
               attn_logits.data_ptr<float>(),
               query.data_ptr<scalar_t>(),
