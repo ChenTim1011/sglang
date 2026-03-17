@@ -94,9 +94,10 @@ void rotary_embedding_neox_4D_kernel_impl(
     int64_t batch_size,
     int64_t seq_len) {
   int64_t embed_dim = rotary_dim / 2;
-  alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
 
+  // scratch is per-call-site (inside lambda) to avoid data race under OMP parallel
   auto compute_loop = [&](scalar_t* cache_ptr, scalar_t* qk, int64_t token_head) {
+    alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
     size_t vl = 0;
     for (int64_t j = 0; j < embed_dim; j += vl) {
       vl = __riscv_vsetvl_e32m4(embed_dim - j);
@@ -173,8 +174,7 @@ void rotary_embedding_4D_kernel_impl(
       scalar_t* cache_ptr = cos_sin_cache + pos * rotary_dim;
       scalar_t* cos_cache_ptr = cache_ptr;
       scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
-      int64_t head_idx = i;
-      int64_t token_head = bs * query_stride_b + seq * query_stride_s + head_idx * query_stride_h;
+      int64_t token_head = bs * query_stride_b + seq * query_stride_s + i * query_stride_h;
       scalar_t* head_query = token_head + query;
       for (int64_t j = 0; j < embed_dim; j += 1) {
         int64_t x_index = 2 * j;
@@ -201,8 +201,7 @@ void rotary_embedding_4D_kernel_impl(
       scalar_t* cache_ptr = cos_sin_cache + pos * rotary_dim;
       scalar_t* cos_cache_ptr = cache_ptr;
       scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
-      int64_t head_idx = i;
-      int64_t token_head = bs * key_stride_b + seq * key_stride_s + head_idx * head_size;
+      int64_t token_head = bs * key_stride_b + seq * key_stride_s + i * key_stride_h;
       scalar_t* head_key = key + token_head;
       for (int64_t j = 0; j < embed_dim; j += 1) {
         int64_t x_index = 2 * j;

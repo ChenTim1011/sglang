@@ -20,6 +20,7 @@ using namespace rvv_constants;
 
 template <typename scalar_t, bool has_bias, int BLOCK_N>
 struct scale_C {
+  // Called with vl <= vl_max; operates on exactly vl elements (no inner loop).
   static inline void apply(
       scalar_t* __restrict__ C,
       const int32_t* __restrict__ Ctmp,
@@ -27,45 +28,24 @@ struct scale_C {
       const float* __restrict__ bias,
       float As,
       const float* __restrict__ Bs,
-      int64_t n_size) {
+      size_t vl) {
     UNUSED(Bcomp);
+
+    vint32m4_t v_acc_i32 = __riscv_vle32_v_i32m4(Ctmp, vl);
+    vfloat32m4_t v_acc = __riscv_vfcvt_f_x_v_f32m4(v_acc_i32, vl);
+
+    // Dequantize: C * (As * Bs) — combine scales first for better precision
+    vfloat32m4_t v_bs = __riscv_vle32_v_f32m4(Bs, vl);
+    vfloat32m4_t v_combined_scale = __riscv_vfmul_vf_f32m4(v_bs, As, vl);
+    v_acc = __riscv_vfmul_vv_f32m4(v_acc, v_combined_scale, vl);
+
     if constexpr (has_bias) {
-      TORCH_CHECK(bias != nullptr);
+      vfloat32m4_t v_bias = __riscv_vle32_v_f32m4(bias, vl);
+      v_acc = __riscv_vfadd_vv_f32m4(v_acc, v_bias, vl);
     }
-    TORCH_CHECK(n_size >= 0 && n_size <= BLOCK_N);
 
-    size_t vl_max = __riscv_vsetvlmax_e32m4();
-    for (int64_t j = 0; j < n_size; j += vl_max) {
-      size_t vl = (j + vl_max <= (size_t)n_size) ? vl_max : __riscv_vsetvl_e32m4(n_size - j);
-
-      vint32m4_t v_acc_i32 = __riscv_vle32_v_i32m4(Ctmp + j, vl);
-      vfloat32m4_t v_acc = __riscv_vfcvt_f_x_v_f32m4(v_acc_i32, vl);
-
-      // Dequantize: C * (As * Bs) - combine scales first for better precision
-      vfloat32m4_t v_bs = __riscv_vle32_v_f32m4(Bs + j, vl);
-      vfloat32m4_t v_combined_scale = __riscv_vfmul_vf_f32m4(v_bs, As, vl);  // As * Bs
-      v_acc = __riscv_vfmul_vv_f32m4(v_acc, v_combined_scale, vl);           // C * (As * Bs)
-
-      if constexpr (has_bias) {
-        vfloat32m4_t v_bias = __riscv_vle32_v_f32m4(bias + j, vl);
-        v_acc = __riscv_vfadd_vv_f32m4(v_acc, v_bias, vl);
-      }
-
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        __riscv_vse32_v_f32m4(C + j, v_acc, vl);
-      } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-        vfloat16m2_t v_f16 = f32m4_to_f16(v_acc, vl);
-        __riscv_vse16_v_f16m2(reinterpret_cast<_Float16*>(C + j), v_f16, vl);
-      } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
-        vuint16m2_t v_bf16 = f32m4_to_bf16(v_acc, vl);
-        __riscv_vse16_v_u16m2(reinterpret_cast<uint16_t*>(C + j), v_bf16, vl);
-      } else {
-        static_assert(
-            std::is_same_v<scalar_t, float> || std::is_same_v<scalar_t, at::Half> ||
-                std::is_same_v<scalar_t, at::BFloat16>,
-            "scale_C: unsupported scalar_t");
-      }
-    }
+    alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
+    store_from_float_m4(C, v_acc, vl, scratch);
   }
 };
 
@@ -90,12 +70,11 @@ struct tinygemm_kernel_nn {
       int64_t nb,
       int64_t n_size) {
     UNUSED(Bcomp);
+    TORCH_CHECK(n_size >= 0 && n_size <= BLOCK_N);
     if constexpr (has_bias) {
       TORCH_CHECK(bias != nullptr);
     }
-    TORCH_CHECK(n_size >= 0 && n_size <= BLOCK_N);
 
-    constexpr int64_t PACKED_BLOCK_N = rvv_constants::BLOCK_N;
     size_t vl_max = __riscv_vsetvlmax_e32m4();
     const int64_t n_start = nb * BLOCK_N;
 
@@ -124,7 +103,6 @@ struct tinygemm_kernel_nn {
         vint8m1_t v_b_i8 = __riscv_vle8_v_i8m1(b_ptr, vl);
         vint16m2_t v_b_i16 = __riscv_vsext_vf2_i16m2(v_b_i8, vl);
 
-        // FMA for each row
         for (int m = 0; m < BLOCK_M; ++m) {
           int8_t a_val = A[m * lda + k];
           if (a_val == 0) continue;
@@ -132,7 +110,7 @@ struct tinygemm_kernel_nn {
         }
       }
 
-      // Store each row: materialize Ctmp for scale_C
+      // Dequantize and store each row
       for (int m = 0; m < BLOCK_M; ++m) {
         __riscv_vse32_v_i32m4(Ctmp_row, *v_acc[m], vl);
         scale_C<scalar_t, has_bias, BLOCK_N>::apply(
@@ -142,7 +120,7 @@ struct tinygemm_kernel_nn {
             has_bias ? (bias + n_start + j) : nullptr,
             As[m],
             Bs + n_start + j,
-            static_cast<int64_t>(vl));
+            vl);
       }
     }
   }
@@ -259,8 +237,7 @@ void int8_scaled_mm_kernel_impl(
     const float* __restrict__ bias,
     int64_t M,
     int64_t N,
-    int64_t K,
-    bool is_packed) {
+    int64_t K) {
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
   const int64_t MB = div_up(M, BLOCK_M);
@@ -339,15 +316,14 @@ at::Tensor int8_scaled_mm_cpu(
     bool is_vnni) {
   RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales1, scales2, bias}));
 
-  bool is_packed = is_vnni;
-  auto packed_w = is_packed ? mat2 : convert_weight_packed(mat2);
+  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 
   CHECK_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scales1);
   CHECK_INPUT(scales2);
   CHECK_DIM(2, mat1);
-  if (!is_packed) {
+  if (!is_vnni) {
     CHECK_DIM(2, mat2);
   }
 
@@ -355,7 +331,7 @@ at::Tensor int8_scaled_mm_cpu(
   int64_t K = mat1.size(1);
   int64_t N = mat2.size(0);
 
-  if (is_packed) {
+  if (is_vnni) {
     N = scales2.numel();
   } else {
     CHECK_EQ(scales2.numel(), N);
@@ -402,8 +378,7 @@ at::Tensor int8_scaled_mm_cpu(
         bias_data,
         M,
         N,
-        K,
-        is_packed);
+        K);
   });
 
   return out;
@@ -418,14 +393,13 @@ at::Tensor int8_scaled_mm_with_quant(
     bool is_vnni) {
   RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales2, bias}));
 
-  bool is_packed = is_vnni;
-  auto packed_w = is_packed ? mat2 : convert_weight_packed(mat2);
+  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scales2);
   CHECK_DIM(2, mat1);
-  if (!is_packed) {
+  if (!is_vnni) {
     CHECK_DIM(2, mat2);
   }
 
@@ -433,7 +407,7 @@ at::Tensor int8_scaled_mm_with_quant(
   int64_t K = mat1.size(1);
   int64_t N = mat2.size(0);
 
-  if (is_packed) {
+  if (is_vnni) {
     N = scales2.numel();
   }
 
@@ -478,8 +452,7 @@ at::Tensor int8_scaled_mm_with_quant(
         bias_data,
         M,
         N,
-        K,
-        is_packed);
+        K);
   });
   return out;
 }
