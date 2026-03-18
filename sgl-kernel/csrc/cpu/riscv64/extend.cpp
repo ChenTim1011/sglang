@@ -22,9 +22,14 @@
 #include "riscv64/gemm.h"
 #include "vector_helpers.h"
 
+// BLOCK_N for extend attention: must equal vl_max_e64m8 for Stage-1 single-shot gather.
+// vl_max_e64m8 = VLEN * LMUL_8 / 64 = __riscv_v_fixed_vlen / 8.
+// VLEN=128 → 16, VLEN=256 → 32, VLEN=512 → 64, VLEN=1024 → 128.
+static constexpr int EXTEND_BLOCK_N = static_cast<int>(__riscv_v_fixed_vlen / 8);
+
 static int compute_buffer_size_per_thread(int head_size, int head_size_v) {
   constexpr int BLOCK_M = 32;
-  constexpr int BLOCK_N = 32;
+  constexpr int BLOCK_N = EXTEND_BLOCK_N;
   // Allocation order in AlignedArena:
   // 1. s_i: float[BLOCK_M * BLOCK_N]
   // 2. v_prime: float[BLOCK_M * head_size_v]
@@ -145,16 +150,10 @@ void extend_attention_kernel_impl(
       MAX_HEAD_SIZE,
       ")");
 
-  // Stage-1 gather uses vluxei64 with e64m8 indices (no inner loop).
-  // vl_max_e64m8 = VLEN*8/64. With VLEN=256: vl_max=32=BLOCK_N.
-  // VLEN < 256 would silently truncate the gather; require VLEN >= 256.
-  static_assert(
-      __riscv_v_fixed_vlen >= 256, "extend Stage-1 gather requires VLEN >= 256 (vl_max_e64m8 must be >= BLOCK_N=32)");
-
   constexpr bool IS_INT8 = is_quantized<kv_t>::value;
 
-  const int BLOCK_M = 32;
-  const int BLOCK_N = 32;
+  constexpr int BLOCK_M = 32;
+  constexpr int BLOCK_N = EXTEND_BLOCK_N;
 
   const int num_groups = num_heads / num_heads_kv;
   int MB = static_cast<int>(div_up(max_len_extend, static_cast<int64_t>(BLOCK_M)));
@@ -278,8 +277,8 @@ void extend_attention_kernel_impl(
                 k_scale,
                 k_scales_block);
           } else {
-            // 1. Load token indices (single shot; requires vl_max_e64m8 >= n_size <= BLOCK_N=32;
-            //    guaranteed by static_assert(__riscv_v_fixed_vlen >= 256) above)
+            // 1. Load token indices (single shot; vl_max_e64m8 == BLOCK_N == EXTEND_BLOCK_N,
+            //    so one vsetvl always covers n_size <= BLOCK_N for any VLEN)
             size_t vl = __riscv_vsetvl_e64m8(n_size);
             vuint64m8_t v_offsets;
 

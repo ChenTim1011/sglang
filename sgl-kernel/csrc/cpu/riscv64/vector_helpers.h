@@ -18,7 +18,11 @@ template <>
 struct is_quantized<int8_t> : std::true_type {};
 
 namespace rvv_constants {
-inline constexpr int64_t BLOCK_N = 64;
+// BLOCK_N: N-tile for weight packing and GEMM dispatch.
+// Set to 2 * vl_max_e32m4 = __riscv_v_fixed_vlen / 4 so each packed tile spans
+// exactly 2 vector iterations, giving optimal pipeline overlap on all VLENs.
+// VLEN=128 → 32, VLEN=256 → 64, VLEN=512 → 128, VLEN=1024 → 256.
+inline constexpr int BLOCK_N = __riscv_v_fixed_vlen / 4;
 // MAX_VL_ELEMENTS_M{4,8}: maximum element count per vsetvlmax call for each LMUL.
 // Computed from __riscv_v_fixed_vlen (set by -mrvv-vector-bits=N in CMakeLists).
 // Example: VLEN=256 → M4=32, M8=64; VLEN=512 → M4=64, M8=128.

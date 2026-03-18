@@ -11,9 +11,10 @@
 
 #include "riscv64/vector_helpers.h"
 
-// RVV blocking parameters. Tuned for VLEN=256; adjust via CMakeLists for other VLENs.
+// RVV blocking parameters.
+// TILE_M and TILE_K are fixed (not VLEN-dependent).
+// TILE_N is derived from rvv_constants::BLOCK_N (= __riscv_v_fixed_vlen / 4).
 #define TILE_M 4
-#define TILE_N 64
 #define TILE_K 64
 
 constexpr int block_size_m() {
@@ -21,7 +22,7 @@ constexpr int block_size_m() {
 }
 
 constexpr int block_size_n() {
-  return TILE_N;
+  return rvv_constants::BLOCK_N;
 }
 
 constexpr int block_size_k() {
