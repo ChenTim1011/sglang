@@ -222,9 +222,12 @@ void tinygemm_kernel(
     int64_t K,
     int64_t lda,
     int64_t ldc) {
-  // pattern: 1-4-16, N = 16, 32, 48, 64
+  // BLOCK_N = rvv_constants::BLOCK_N = __riscv_v_fixed_vlen / 4 (compile-time, VLEN-adaptive).
+  // NB_SIZE template parameter must equal the packed-B stride (BLOCK_N), not nb_size,
+  // so the kernel uses the correct k-stride for both full and tail tiles.
+  // Inner loop uses runtime nb_size as the loop bound → tail tiles are handled correctly.
   constexpr int64_t BLOCK_M = 4;
-  constexpr int64_t BLOCK_N = 64;
+  constexpr int64_t BLOCK_N = rvv_constants::BLOCK_N;
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
   for (int mb = 0; mb < MB; ++mb) {
@@ -234,61 +237,22 @@ void tinygemm_kernel(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch (mb_size << 4 | nb_size >> 4) {
-        // mb_size = 1
-        case 0x11:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 16);
+      // Dispatch only on mb_size; NB_SIZE is always BLOCK_N (the packed-B stride).
+      switch (mb_size) {
+        case 1:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, BLOCK_N);
           break;
-        case 0x12:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 32);
+        case 2:
+          LAUNCH_TINYGEMM_KERNEL_NN(2, BLOCK_N);
           break;
-        case 0x13:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 48);
+        case 3:
+          LAUNCH_TINYGEMM_KERNEL_NN(3, BLOCK_N);
           break;
-        case 0x14:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 64);
-          break;
-        // mb_size = 2
-        case 0x21:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 16);
-          break;
-        case 0x22:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 32);
-          break;
-        case 0x23:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 48);
-          break;
-        case 0x24:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 64);
-          break;
-        // mb_size = 3
-        case 0x31:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 16);
-          break;
-        case 0x32:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 32);
-          break;
-        case 0x33:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 48);
-          break;
-        case 0x34:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 64);
-          break;
-        // mb_size = 4
-        case 0x41:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 16);
-          break;
-        case 0x42:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 32);
-          break;
-        case 0x43:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 48);
-          break;
-        case 0x44:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 64);
+        case 4:
+          LAUNCH_TINYGEMM_KERNEL_NN(4, BLOCK_N);
           break;
         default:
-          TORCH_CHECK(false, "Unexpected block size, ", mb_size, " x ", nb_size);
+          TORCH_CHECK(false, "Unexpected mb_size: ", mb_size);
       }
     }
   }

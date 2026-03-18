@@ -1080,7 +1080,9 @@ void decode_attention_kernel_impl(
   const bool has_logit_cap = logit_cap > 0;
   float rlogit_cap = has_logit_cap ? 1 / logit_cap : 0.f;
 
-  constexpr int64_t TARGET_BLOCK_N = 64;
+  // TARGET_BLOCK_N = 2 * vl_max_e32m4 = __riscv_v_fixed_vlen / 4 (compile-time).
+  // VLEN=128 → 32, VLEN=256 → 64, VLEN=512 → 128, VLEN=1024 → 256.
+  constexpr int64_t TARGET_BLOCK_N = rvv_constants::BLOCK_N;
 
   at::parallel_for(0, batches * num_heads * num_kv_splits, 0, [&](int64_t begin, int64_t end) {
     int64_t bs{0}, head_id{0}, kv_id{0};
