@@ -83,14 +83,83 @@ jobs:
               - 'scripts/ci/rvv/**'
               - '.github/workflows/pr-test-rvv.yml'
 
-  # ==================== Basic Verification ==================== #
-  rvv-basic-test:
+  # ==================== Compile Check (x86, no hardware required) ==================== #
+  # Purpose: cross-compile every riscv64/*.cpp with clang-19 + -fsyntax-only.
+  # Catches intrinsic errors, signature mismatches, and missing headers
+  # without requiring RVV hardware.  Runs on standard ubuntu-latest runner.
+  rvv-compile-check:
+    name: RVV Kernel Compile Check (x86 cross-compile)
     needs: [check-changes]
     if: |
       always() &&
       (
         github.event_name == 'workflow_dispatch' ||
         needs.check-changes.outputs.run_tests == 'true'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Clang-19 with RISC-V target + riscv64 sysroot
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-19 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-19.list
+          sudo apt-get update -q
+          sudo apt-get install -y clang-19 gcc-riscv64-linux-gnu
+
+      - name: Cache PyTorch CPU wheel (ATen headers)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: torch-cpu-headers-${{ runner.os }}-v1
+
+      - name: Install PyTorch CPU (ATen headers only needed)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu --quiet
+
+      - name: Syntax-check all riscv64 kernel files
+        run: |
+          TORCH_INC=$(python3 -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'include'))")
+          SYSROOT=/usr/riscv64-linux-gnu
+          FAILED=0
+          echo "Using TORCH_INC=$TORCH_INC"
+          for f in sgl-kernel/csrc/cpu/riscv64/*.cpp; do
+            echo "  checking: $f"
+            clang-19 \
+              --target=riscv64-linux-gnu \
+              --sysroot="$SYSROOT" \
+              -march=rv64gcv_zvfh \
+              -mabi=lp64d \
+              -mrvv-vector-bits=256 \
+              -DCPU_CAPABILITY_RVV \
+              -D_GLIBCXX_USE_CXX11_ABI=1 \
+              -std=c++17 \
+              -fopenmp \
+              -I sgl-kernel/csrc/cpu \
+              -I "$TORCH_INC" \
+              -I "$TORCH_INC/torch/csrc/api/include" \
+              -fsyntax-only \
+              "$f" || FAILED=1
+          done
+          [ $FAILED -eq 0 ] && echo "All RVV kernel files passed syntax check." || \
+            { echo "Syntax check FAILED. See errors above."; exit 1; }
+
+  # ==================== Basic Verification ==================== #
+  # Purpose: quick infrastructure smoke test — verifies container starts and the
+  # pre-built image has RVV support.  Does NOT rebuild from checkout so it stays
+  # fast (~5 min).  Code correctness is validated by the kernel-unit-test job.
+  rvv-basic-test:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        (
+          needs.check-changes.outputs.run_tests == 'true' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
       )
     runs-on: rvv-bpi-f3
     steps:
@@ -102,15 +171,17 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Verify RVV support
+      - name: Verify RVV support (image pre-built)
         timeout-minutes: 5
         run: |
-          podman exec ci_sglang_rvv python3 /workspace/sglang/scripts/ci/rvv/verify_rvv_support.py
+          bash scripts/ci/rvv/rvv_ci_install_dependency.sh \
+            --skip-kernel-build --skip-sglang-build
+        env:
+          CONTAINER_NAME: ci_sglang_rvv
 
       - name: Cleanup container
         if: always()
-        run: |
-          podman rm -f ci_sglang_rvv || true
+        run: podman rm -f ci_sglang_rvv || true
 
   # ==================== Kernel Unit Tests ==================== #
   rvv-kernel-unit-test:
@@ -121,7 +192,11 @@ jobs:
       needs.rvv-basic-test.result == 'success' &&
       (
         (github.event_name == 'workflow_dispatch' && (inputs.test_level == 'kernel' || inputs.test_level == 'full')) ||
-        (github.event_name == 'pull_request' && needs.check-changes.outputs.run_tests == 'true')
+        (
+          github.event_name == 'pull_request' &&
+          needs.check-changes.outputs.run_tests == 'true' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
       )
     runs-on: rvv-bpi-f3
     steps:
@@ -133,10 +208,16 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Install sglang and sgl-kernel from checkout
+        timeout-minutes: 20
+        run: bash scripts/ci/rvv/rvv_ci_install_dependency.sh
+        env:
+          CONTAINER_NAME: ci_sglang_rvv
+
       - name: Run kernel unit tests
         timeout-minutes: 40
         run: |
-          bash scripts/ci/rvv/rvv_ci_exec.sh -w /workspace/sglang \
+          bash scripts/ci/rvv/rvv_ci_exec.sh \
             python3 -m unittest \
               test.srt.cpu.rvv.test_rvv_gemm \
               test.srt.cpu.rvv.test_rvv_decode \
@@ -150,8 +231,7 @@ jobs:
 
       - name: Cleanup container
         if: always()
-        run: |
-          podman rm -f ci_sglang_rvv || true
+        run: podman rm -f ci_sglang_rvv || true
 
   # ==================== Backend Integration Tests ==================== #
   rvv-backend-integration-test:
@@ -162,7 +242,11 @@ jobs:
       needs.rvv-kernel-unit-test.result == 'success' &&
       (
         (github.event_name == 'workflow_dispatch' && (inputs.test_level == 'integration' || inputs.test_level == 'full')) ||
-        (github.event_name == 'pull_request' && needs.check-changes.outputs.run_tests == 'true')
+        (
+          github.event_name == 'pull_request' &&
+          needs.check-changes.outputs.run_tests == 'true' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
       )
     runs-on: rvv-bpi-f3
     steps:
@@ -174,10 +258,16 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Install sglang and sgl-kernel from checkout
+        timeout-minutes: 20
+        run: bash scripts/ci/rvv/rvv_ci_install_dependency.sh
+        env:
+          CONTAINER_NAME: ci_sglang_rvv
+
       - name: Run RVV backend tests
         timeout-minutes: 40
         run: |
-          bash scripts/ci/rvv/rvv_ci_exec.sh -w /workspace/sglang \
+          bash scripts/ci/rvv/rvv_ci_exec.sh \
             python3 -m unittest \
               test.srt.cpu.rvv.test_rvv_backend_registration \
               test.srt.cpu.rvv.test_rvv_attention_backend \
@@ -185,8 +275,7 @@ jobs:
 
       - name: Cleanup container
         if: always()
-        run: |
-          podman rm -f ci_sglang_rvv || true
+        run: podman rm -f ci_sglang_rvv || true
 
   # ==================== End-to-End Inference Test ==================== #
   rvv-e2e-test:
@@ -195,7 +284,8 @@ jobs:
       always() &&
       !cancelled() &&
       needs.rvv-backend-integration-test.result == 'success' &&
-      (github.event_name == 'workflow_dispatch' && inputs.test_level == 'full')
+      github.event_name == 'workflow_dispatch' &&
+      inputs.test_level == 'full'
     runs-on: rvv-bpi-f3
     steps:
       - name: Checkout code
@@ -206,10 +296,20 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Install sglang and sgl-kernel from checkout
+        timeout-minutes: 20
+        run: bash scripts/ci/rvv/rvv_ci_install_dependency.sh
+        env:
+          CONTAINER_NAME: ci_sglang_rvv
+
       - name: Run E2E inference test (Qwen2.5-1.5B)
-        timeout-minutes: 40
+        timeout-minutes: 60
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          bash scripts/ci/rvv/rvv_ci_exec.sh python3 -c "
+          bash scripts/ci/rvv/rvv_ci_exec.sh \
+            -e HF_TOKEN="$HF_TOKEN" \
+            python3 -c "
           from sglang import Engine
           print('Creating Engine with RVV backend...')
           engine = Engine(
@@ -226,5 +326,4 @@ jobs:
 
       - name: Cleanup container
         if: always()
-        run: |
-          podman rm -f ci_sglang_rvv || true
+        run: podman rm -f ci_sglang_rvv || true

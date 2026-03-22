@@ -1,42 +1,51 @@
 #!/bin/bash
-# Execute commands inside RVV CI container
-# Modeled after scripts/ci/amd/amd_ci_exec.sh
+# Execute commands inside the RVV CI container.
+# Modelled after scripts/ci/amd/amd_ci_exec.sh
 #
 # Usage:
-#   bash rvv_ci_exec.sh [-w WORKDIR] COMMAND [ARGS...]
+#   bash rvv_ci_exec.sh [-w WORKDIR] [-e KEY=VAL] COMMAND [ARGS...]
 #
-# Example:
-#   bash rvv_ci_exec.sh -w /workspace/sglang/test python3 -m pytest test_rvv.py
+# Environment Variables:
+#   CONTAINER_NAME: Target container name (default: ci_sglang_rvv)
 
-set -e
+set -euo pipefail
 
 CONTAINER_NAME="${CONTAINER_NAME:-ci_sglang_rvv}"
-WORKDIR=""
+WORKDIR="/workspace/sglang"
+
+declare -A ENV_MAP=(
+  [SGLANG_IS_IN_CI]=1
+  [SGLANG_IS_IN_CI_RVV]=1
+)
 
 # Parse arguments
-while getopts "w:" opt; do
-    case $opt in
-        w)
-            WORKDIR="$OPTARG"
-            ;;
-        \?)
-            echo "Invalid option: -$OPTARG" >&2
-            exit 1
-            ;;
-    esac
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -w|--workdir)
+      WORKDIR="$2"
+      shift 2
+      ;;
+    -e)
+      IFS="=" read -r key val <<< "$2"
+      ENV_MAP["$key"]="$val"
+      shift 2
+      ;;
+    --)
+      shift; break
+      ;;
+    *)
+      break
+      ;;
+  esac
 done
 
-shift $((OPTIND-1))
+# Build ENV_ARGS
+ENV_ARGS=()
+for key in "${!ENV_MAP[@]}"; do
+  ENV_ARGS+=("-e" "$key=${ENV_MAP[$key]}")
+done
 
-# Build podman exec command
-EXEC_CMD="podman exec"
-
-if [ -n "$WORKDIR" ]; then
-    EXEC_CMD="$EXEC_CMD -w $WORKDIR"
-fi
-
-EXEC_CMD="$EXEC_CMD $CONTAINER_NAME"
-
-# Execute command
-$EXEC_CMD "$@"
-exit $?
+podman exec \
+  -w "$WORKDIR" \
+  "${ENV_ARGS[@]}" \
+  "$CONTAINER_NAME" "$@"

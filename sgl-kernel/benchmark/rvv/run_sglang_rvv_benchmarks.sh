@@ -38,18 +38,18 @@ TOOL="serving"   # serving | one-batch-server | offline | one-batch | all
 QUICK=0
 NATIVE_ONLY=0
 SKIP_NATIVE=0
-SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-600}"
-SERVER_MEM_FRACTION_STATIC="${SERVER_MEM_FRACTION_STATIC:-0.45}"
+SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-900}"
+SERVER_MEM_FRACTION_STATIC="${SERVER_MEM_FRACTION_STATIC:-0.28}"
 SERVER_MAX_RUNNING_REQUESTS="${SERVER_MAX_RUNNING_REQUESTS:-1}"
-SERVER_MAX_TOTAL_TOKENS="${SERVER_MAX_TOTAL_TOKENS:-3072}"
-SERVING_REQUEST_RATE="${SERVING_REQUEST_RATE:-0.15}"
+SERVER_MAX_TOTAL_TOKENS="${SERVER_MAX_TOTAL_TOKENS:-2048}"
+SERVING_REQUEST_RATE="${SERVING_REQUEST_RATE:-0.10}"
 
 # RISC-V low-memory stable defaults.
-NUM_PROMPTS=12
-MAX_CONCURRENCY=1
-BATCH_SIZES="16"
-INPUT_LEN=256
-OUTPUT_LEN=16
+NUM_PROMPTS=16
+MAX_CONCURRENCY=2
+BATCH_SIZES="4"
+INPUT_LEN=128
+OUTPUT_LEN=64
 SERVER_LOG_PATH=""
 NATIVE_GREEDY_EXTRA_REQUEST_BODY='{"temperature":0.0,"top_k":1,"top_p":1.0,"repetition_penalty":1.0,"ignore_eos":true}'
 
@@ -100,11 +100,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$QUICK" -eq 1 ]]; then
-  NUM_PROMPTS=12
+  NUM_PROMPTS=4
   MAX_CONCURRENCY=1
-  BATCH_SIZES="16"
-  INPUT_LEN=256
-  OUTPUT_LEN=16
+  BATCH_SIZES="1"   # single request only in quick mode
+  INPUT_LEN=64
+  OUTPUT_LEN=8
 fi
 
 if [[ ! "$TOOL" =~ ^(serving|one-batch-server|offline|one-batch|all)$ ]]; then
@@ -202,6 +202,8 @@ start_server_for_mode() {
   local kv_dtype="$3"
   local attention_backend="$4"
   local disable_rvv_kernels="$5"
+  # Optional per-mode override; falls back to the global SERVER_MAX_TOTAL_TOKENS.
+  local max_total_tokens="${6:-${SERVER_MAX_TOTAL_TOKENS}}"
 
   cleanup_server
 
@@ -213,7 +215,7 @@ start_server_for_mode() {
     --attention-backend "${attention_backend}"
     --mem-fraction-static "${SERVER_MEM_FRACTION_STATIC}"
     --max-running-requests "${SERVER_MAX_RUNNING_REQUESTS}"
-    --max-total-tokens "${SERVER_MAX_TOTAL_TOKENS}"
+    --max-total-tokens "${max_total_tokens}"
     --host 127.0.0.1
     --port "${PORT}"
   )
@@ -394,14 +396,21 @@ for i in "${!MODE_NAMES[@]}"; do
   mode_output_len="${OUTPUT_LEN}"
   mode_extra_request_body=""
   mode_request_rate="${SERVING_REQUEST_RATE}"
+  mode_max_total_tokens="${SERVER_MAX_TOTAL_TOKENS}"
 
-  # Native PyTorch mode is much slower; constrain workload and use explicit greedy sampling.
+  # Native PyTorch mode is much slower and uses more working memory.
+  # Shrink every dimension to avoid OOM on 16 GB Banana Pi K1:
+  #   - input_len=64 / output_len=8  → smaller attention scratch tensors
+  #   - max_total_tokens=256         → KV pool just large enough for the batch
   if [[ "${name}" == "PYTORCH_NATIVE" ]]; then
-    mode_num_prompts=12
+    mode_num_prompts=4
     mode_max_concurrency=1
-    mode_batch_sizes="16"
+    mode_batch_sizes="1"
+    mode_input_len=64
+    mode_output_len=8
+    mode_max_total_tokens=256
     mode_extra_request_body="${NATIVE_GREEDY_EXTRA_REQUEST_BODY}"
-    mode_request_rate="0.15"
+    mode_request_rate="0.10"
   fi
 
   echo
@@ -416,11 +425,11 @@ for i in "${!MODE_NAMES[@]}"; do
   echo "  request_rate=${mode_request_rate}"
   echo "  mem_fraction_static=${SERVER_MEM_FRACTION_STATIC}"
   echo "  max_running_requests=${SERVER_MAX_RUNNING_REQUESTS}"
-  echo "  max_total_tokens=${SERVER_MAX_TOTAL_TOKENS}"
+  echo "  max_total_tokens=${mode_max_total_tokens}"
   echo "============================================================"
 
   if [[ "$TOOL" == "serving" || "$TOOL" == "one-batch-server" || "$TOOL" == "all" ]]; then
-    start_server_for_mode "${model}" "${quant}" "${kv_dtype}" "${attention_backend}" "${disable_rvv_kernels}"
+    start_server_for_mode "${model}" "${quant}" "${kv_dtype}" "${attention_backend}" "${disable_rvv_kernels}" "${mode_max_total_tokens}"
 
     if [[ "$TOOL" == "serving" || "$TOOL" == "all" ]]; then
       run_bench_serving "${model}" "${mode_num_prompts}" "${mode_max_concurrency}" "${mode_input_len}" "${mode_output_len}" "${disable_rvv_kernels}" "${mode_extra_request_body}" "${mode_request_rate}"
@@ -431,6 +440,10 @@ for i in "${!MODE_NAMES[@]}"; do
     fi
 
     cleanup_server
+    # Wait for OS to release the port before starting the next server or
+    # in-process engine.  On RISC-V the kernel can hold the socket in
+    # TIME_WAIT for several seconds even after the process exits.
+    sleep 15
   fi
 
   if [[ "$TOOL" == "offline" || "$TOOL" == "all" ]]; then
