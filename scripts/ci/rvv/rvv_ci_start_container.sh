@@ -3,8 +3,12 @@
 #
 # Environment Variables:
 #   GITHUB_WORKSPACE: Workspace directory to mount
-#   PODMAN_IMAGE: Container image to use (default: docker.io/juitingchen/sglang-rvv:v1.0)
+#   PODMAN_IMAGE: Container image to use (default: localhost/sglang-rvv:latest)
 #   CONTAINER_NAME: Name for the container (default: ci_sglang_rvv)
+#
+# The image must be pre-built on the runner using docker/rvv.Dockerfile.
+# If the image is not found locally, this script will build it automatically
+# (expect ~30-60 minutes on first run).
 
 set -e
 
@@ -15,7 +19,7 @@ if ! uname -m | grep -q "riscv64"; then
 fi
 
 # Configuration
-PODMAN_IMAGE="${PODMAN_IMAGE:-docker.io/juitingchen/sglang-rvv:latest}"
+PODMAN_IMAGE="${PODMAN_IMAGE:-localhost/sglang-rvv:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-ci_sglang_rvv}"
 WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
 
@@ -42,9 +46,18 @@ log_info "Starting Podman container: ${CONTAINER_NAME}"
 log_info "Image: ${PODMAN_IMAGE}"
 log_info "Workspace: ${WORKSPACE}"
 
-# Pull latest image
-log_info "Pulling container image..."
-podman pull "${PODMAN_IMAGE}"
+# Ensure the image exists locally; build from source if not
+if ! podman image exists "${PODMAN_IMAGE}"; then
+    log_warn "Image ${PODMAN_IMAGE} not found locally. Building from docker/rvv.Dockerfile (~30-60 min)..."
+    podman build \
+        --format docker \
+        -t "${PODMAN_IMAGE}" \
+        -f "${WORKSPACE}/docker/rvv.Dockerfile" \
+        "${WORKSPACE}"
+    log_info "Image build complete."
+else
+    log_info "Using cached image: ${PODMAN_IMAGE}"
+fi
 
 # Start container with appropriate settings
 log_info "Starting container..."

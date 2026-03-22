@@ -1,98 +1,68 @@
 #!/bin/bash
-# Install dependencies for RVV CI testing inside container
-# Should be run inside the Podman container
+# Install/reinstall sglang and sgl-kernel from checkout inside the RVV CI container.
+# Modelled after scripts/ci/amd/amd_ci_install_dependency.sh
+#
+# Runs from the CI host (outside the container) via podman exec.
 #
 # Usage:
-#   podman exec ci_sglang_rvv bash scripts/ci/rvv/rvv_ci_install_dependency.sh
+#   bash scripts/ci/rvv/rvv_ci_install_dependency.sh [OPTIONS]
+#
+# Options:
+#   --skip-kernel-build    Skip rebuilding sgl-kernel C++ extension (use image pre-built)
+#   --skip-sglang-build    Skip reinstalling sglang python package (use image pre-built)
+#
+# Environment Variables:
+#   CONTAINER_NAME: Target container name (default: ci_sglang_rvv)
 
-set -e
+set -euo pipefail
 
 CONTAINER_NAME="${CONTAINER_NAME:-ci_sglang_rvv}"
+SKIP_KERNEL_BUILD=""
+SKIP_SGLANG_BUILD=""
 
-# Colors
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --skip-kernel-build) SKIP_KERNEL_BUILD="1"; shift ;;
+    --skip-sglang-build) SKIP_SGLANG_BUILD="1"; shift ;;
+    -h|--help)
+      echo "Usage: $0 [OPTIONS]"
+      echo "  --skip-kernel-build    Skip rebuilding sgl-kernel C++ extension"
+      echo "  --skip-sglang-build    Skip reinstalling sglang python package"
+      exit 0 ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
 
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
+WORKSPACE="/workspace/sglang"
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
+echo "[RVV-CI] Installing dependencies in container: ${CONTAINER_NAME}"
 
-# Check if running inside container
-if [ ! -f /.dockerenv ] && [ ! -f /run/.containerenv ]; then
-    log_warn "Not running inside container. Executing via podman exec..."
-    podman exec "${CONTAINER_NAME}" bash /workspace/sglang/scripts/ci/rvv/rvv_ci_install_dependency.sh
-    exit $?
+# ── sglang python package ────────────────────────────────────────────────────
+if [[ -n "${SKIP_SGLANG_BUILD}" ]]; then
+  echo "[RVV-CI] Skipping sglang python install (--skip-sglang-build)"
+else
+  echo "[RVV-CI] Reinstalling sglang from checkout..."
+  podman exec "${CONTAINER_NAME}" pip uninstall sglang -y || true
+  # Clear stale bytecode so fresh checkout is used
+  podman exec "${CONTAINER_NAME}" \
+    find "${WORKSPACE}/python" -name "*.pyc" -delete || true
+  podman exec "${CONTAINER_NAME}" \
+    find "${WORKSPACE}/python" -name "__pycache__" -type d -exec rm -rf {} + || true
+  podman exec -w "${WORKSPACE}/python" "${CONTAINER_NAME}" pip install -e .
 fi
 
-log_info "Installing RVV CI dependencies..."
+# ── sgl-kernel C++ extension ─────────────────────────────────────────────────
+if [[ -n "${SKIP_KERNEL_BUILD}" ]]; then
+  echo "[RVV-CI] Skipping sgl-kernel build (--skip-kernel-build)"
+else
+  echo "[RVV-CI] Rebuilding sgl-kernel from checkout..."
+  podman exec "${CONTAINER_NAME}" pip uninstall sgl-kernel -y || true
+  podman exec -w "${WORKSPACE}/sgl-kernel" "${CONTAINER_NAME}" pip install -e .
+fi
 
-# Update package lists
-log_info "Updating package lists..."
-apt-get update -qq
+# ── Verify RVV support ────────────────────────────────────────────────────────
+echo "[RVV-CI] Verifying RVV support..."
+podman exec "${CONTAINER_NAME}" \
+  python3 "${WORKSPACE}/scripts/ci/rvv/verify_rvv_support.py"
 
-# Install build dependencies
-log_info "Installing build essentials..."
-apt-get install -y -qq \
-    build-essential \
-    cmake \
-    ninja-build \
-    git \
-    python3-pip \
-    python3-dev
-
-# Upgrade pip
-log_info "Upgrading pip..."
-python3 -m pip install --upgrade pip
-
-# Install Python dependencies
-log_info "Installing Python dependencies..."
-cd /workspace/sglang/python
-python3 -m pip install -e . -v
-
-# Build and install sgl-kernel
-log_info "Building sgl-kernel..."
-cd /workspace/sglang/sgl-kernel
-
-# Build with CPU backend
-python3 setup.py build_ext --inplace
-python3 -m pip install -e . -v
-
-# Verify installation
-log_info "Verifying RVV support..."
-python3 -c "
-import platform
-import sys
-
-print(f'Python: {sys.version}')
-print(f'Platform: {platform.machine()}')
-
-# Check CPU info
-with open('/proc/cpuinfo', 'r') as f:
-    for line in f:
-        if 'isa' in line.lower():
-            print(f'ISA: {line.strip()}')
-            break
-
-# Try importing sgl_kernel
-try:
-    import sgl_kernel
-    print('✓ sgl_kernel imported successfully')
-except ImportError as e:
-    print(f'✗ Failed to import sgl_kernel: {e}')
-    sys.exit(1)
-
-# Check for RVV functions
-try:
-    # Check if RVV kernels are available
-    import torch
-    print(f'✓ PyTorch version: {torch.__version__}')
-except Exception as e:
-    print(f'Warning: PyTorch check failed: {e}')
-"
-
-log_info "Dependency installation complete!"
+echo "[RVV-CI] Dependency installation complete!"

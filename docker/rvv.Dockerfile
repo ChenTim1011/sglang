@@ -2,9 +2,10 @@ FROM python:3.13-slim
 SHELL ["/bin/bash", "-c"]
 
 ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
-# Assume the rvv_backend branch is merged into main
 ARG VER_SGLANG=main
 
+# NOTE: Only torch 2.8.0+spacemit.1 is currently available as a riscv64 wheel
+# TODO: Update this ARG when a 2.9.0 wheel is released.
 ARG VER_TORCH=2.8.0+spacemit.1
 ARG VER_TORCHVISION=0.23.0
 ARG VER_TRITON=3.3.0+spacemit.a0
@@ -15,7 +16,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC \
     SGLANG_USE_CPU_ENGINE=1
 
-# Because the disk space is limited, we need to use --no-cache and rm -rf /var/lib/apt/lists/* .
 # 1. System Dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake ninja-build pkg-config gdb lcov \
@@ -23,7 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnuma-dev numactl libomp-dev libssl-dev libopenmpi-dev libsleef-dev \
     libsndfile1 \
     clang lld llvm ccache \
-    libsqlite3-dev libtbb-dev && \
+    libsqlite3-dev libtbb-dev \
+    libgl1 libglib2.0-0 libxrender1 libx11-6 libxext6 && \
     rm -rf /var/lib/apt/lists/*
 
 # 2. Install uv
@@ -42,7 +43,7 @@ RUN printf '[[index]]\nname = "spacemit"\nurl = "https://git.spacemit.com/api/v4
 ENV UV_CONFIG_FILE=/opt/.venv/uv.toml
 
 # 5. Build Tools & Heavy Dependencies (Pre-install)
-RUN uv pip install --no-cache \
+RUN uv pip install \
     pip \
     scikit-build-core cmake ninja wheel setuptools \
     "torch==${VER_TORCH}" \
@@ -50,7 +51,7 @@ RUN uv pip install --no-cache \
     "triton==${VER_TRITON}" \
     "pyarrow==${VER_PYARROW}" \
     "vllm==${VER_VLLM}" \
-    --index-strategy unsafe-best-match --no-cache
+    --index-strategy unsafe-best-match
 
 # 6. Install SGLang Source
 WORKDIR /sgl-workspace
@@ -60,18 +61,23 @@ RUN git clone ${SGLANG_REPO} sglang && \
 
 # 7. Compile sgl-kernel (CLANG REQUIRED for RVV)
 WORKDIR /sgl-workspace/sglang/sgl-kernel
-RUN export CC=clang CXX=clang++ && \
-    uv pip install . --no-build-isolation --index-strategy unsafe-best-match --no-cache
+RUN cp pyproject_cpu.toml pyproject.toml && \
+    export CC=clang CXX=clang++ && \
+    uv pip install . --no-build-isolation --index-strategy unsafe-best-match
 
 # 8. Install SGLang (GCC REQUIRED for XGrammar compatibility)
 WORKDIR /sgl-workspace/sglang/python
-# Overlay CPU metadata
-RUN cp pyproject_cpu.toml pyproject.toml
-# Install with GCC and suppressed warnings
+RUN cp pyproject_cpu.toml pyproject.toml && \
+    # TODO: Remove this line when SpacemiT publishes a cp313 torchaudio wheel.
+    sed -i '/torchaudio/d' pyproject.toml
 RUN unset CC CXX && \
     export CXXFLAGS="-Wno-error" && \
     export RISCV_OMP_LIB_PATH=/usr/lib/riscv64-linux-gnu/libomp.so.5 && \
-    uv pip install . --index-strategy unsafe-best-match --no-cache
+    # Override torch-ecosystem version pins: SpacemiT riscv64 wheels lag behind
+    # the versions required by pyproject_cpu.toml.
+    # TODO: Remove these overrides when SpacemiT publishes wheels matching sglang's pinned versions.
+    printf "torch>=2.8.0\ntorchvision>=0.23\ntriton>=3.3\n" > /tmp/torch-override.txt && \
+    uv pip install . --override /tmp/torch-override.txt --index-strategy unsafe-best-match
 
 # 9. Final Configuration
 ENV LD_PRELOAD="/usr/lib/riscv64-linux-gnu/libomp.so.5"
