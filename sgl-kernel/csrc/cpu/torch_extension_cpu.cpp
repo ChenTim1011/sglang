@@ -204,12 +204,14 @@ at::Tensor
 weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
 
 // gemm fusion
+#if !defined(CPU_CAPABILITY_RVV)
 at::Tensor fused_linear_sigmoid_mul(
     at::Tensor& mat1,
     at::Tensor& mat2,
     const std::optional<at::Tensor>& bias,
     bool is_vnni,
     const at::Tensor& post_mul_mat);
+#endif
 
 // igemm
 at::Tensor int8_scaled_mm_cpu(
@@ -564,9 +566,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
 
   // gemm fusion
+#if !defined(CPU_CAPABILITY_RVV)
   m.def(
       "fused_linear_sigmoid_mul(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, Tensor post_mul_mat) -> Tensor");
   m.impl("fused_linear_sigmoid_mul", torch::kCPU, &fused_linear_sigmoid_mul);
+#endif
 
   // igemm
   m.def(
@@ -680,10 +684,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
 
   // multimodal rope
+#if !defined(CPU_CAPABILITY_RVV)
   m.def(
       "multimodal_rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor "
       "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> (Tensor, Tensor)");
   m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
+#endif
 
   // CPU and memory binding
 #if !defined(SGLANG_RISCV_NO_NUMA)

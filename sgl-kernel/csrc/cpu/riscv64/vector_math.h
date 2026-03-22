@@ -1,5 +1,4 @@
-#ifndef SGL_KERNEL_RVV_VECTOR_MATH_H_
-#define SGL_KERNEL_RVV_VECTOR_MATH_H_
+#pragma once
 
 #if defined(CPU_CAPABILITY_RVV)
 
@@ -7,10 +6,7 @@
 
 #include <limits>
 
-namespace {
-
-// Polynomial approximation: exp(x) = 2^(x*log2(e))
-// Reference: veclibm (https://github.com/rivosinc/veclibm)
+// Polynomial approximation: exp(x) = 2^(x*log2(e)
 constexpr float RVV_EXP_C0 = 1.0f;
 constexpr float RVV_EXP_C1 = 0.69314718056f;
 constexpr float RVV_EXP_C2 = 0.24022650695f;
@@ -123,8 +119,9 @@ inline vfloat32m8_t vrec_f32m8(vfloat32m8_t vd, size_t vl) {
   return __riscv_vfmul_vv_f32m8(vr, vcorr, vl);
 }
 
-// tanh(x) = (e^2x - 1) / (e^2x + 1).  Clamped to ±9 (tanh saturates beyond that).
-// Replace vfdiv with vrec_f32m4: saves ~10-20 cycle division latency.
+// tanh(x) = (e^2x - 1) / (e^2x + 1).  Clamped to ±9: at |x|=9, FP32 tanh ≈ 1-6e-8
+// (within 1 ULP of 1.0). FP32 saturates to exactly ±1.0 at |x|>=10; ±9 is a
+// conservative bound that also keeps exp(2x) < 65M, avoiding approximation breakdown.
 inline vfloat32m4_t vftanh_f32m4(vfloat32m4_t vx, size_t vl) {
   vx = __riscv_vfmax_vf_f32m4(vx, -9.0f, vl);
   vx = __riscv_vfmin_vf_f32m4(vx, 9.0f, vl);
@@ -145,8 +142,7 @@ inline vfloat32m8_t vftanh_f32m8(vfloat32m8_t vx, size_t vl) {
   return __riscv_vfmul_vv_f32m8(v_num, vrec_f32m8(v_denom, vl), vl);
 }
 
-// Polynomial approximation: erf(x)
-// Abramowitz & Stegun 7.1.26, max error 1.5e-7
+// Polynomial approximation: erf(x) max error 1.5e-7
 // erf(x) = sign(x) * (1 - poly(t) * exp(-x^2))
 // where t = 1 / (1 + 0.3275911 * |x|)
 // poly(t) = ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t  (Horner form)
@@ -169,7 +165,6 @@ inline vfloat32m4_t vferf_f32m4(vfloat32m4_t vx, size_t vl) {
   vfloat32m4_t vt = vrec_f32m4(vdenom, vl);  // ~1/(1 + p*|x|), replaces vfdiv
 
   // Horner's method: ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t
-  // vfmadd(vd, vs1, vs2) = vd * vs1 + vs2
   vfloat32m4_t vpoly = __riscv_vfmv_v_f_f32m4(RVV_ERF_A5, vl);
   vpoly = __riscv_vfmadd_vv_f32m4(vpoly, vt, __riscv_vfmv_v_f_f32m4(RVV_ERF_A4, vl), vl);
   vpoly = __riscv_vfmadd_vv_f32m4(vpoly, vt, __riscv_vfmv_v_f_f32m4(RVV_ERF_A3, vl), vl);
@@ -212,51 +207,6 @@ inline vfloat32m8_t vferf_f32m8(vfloat32m8_t vx, size_t vl) {
   return __riscv_vfsgnjx_vv_f32m8(vresult, vx, vl);
 }
 
-// Softmax helper: in-place exp and sum (no normalization)
-// scores[i] = exp(scores[i] - max), returns sum = Σ scores[i]
-// NOTE: Does NOT normalize scores. Callers use unnormalized exp values
-// for the online softmax algorithm (FlashAttention-style).
-inline float exp_and_sum(float* __restrict__ scores, int n_size, float m_i) {
-  if (n_size <= 0) return 0.0f;
-
-  size_t vl_max = __riscv_vsetvlmax_e32m4();
-  float total_sum = 0.0f;
-
-  vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
-  for (int j = 0; j < n_size; j += vl_max) {
-    size_t vl = __riscv_vsetvl_e32m4(n_size - j);
-    vfloat32m4_t vx = __riscv_vle32_v_f32m4(scores + j, vl);
-    vx = __riscv_vfsub_vf_f32m4(vx, m_i, vl);
-    vfloat32m4_t vex = vfexp_f32m4(vx, vl);
-    __riscv_vse32_v_f32m4(scores + j, vex, vl);
-
-    vfloat32m1_t vsum = __riscv_vfredusum_vs_f32m4_f32m1(vex, vzero, vl);
-    total_sum += __riscv_vfmv_f_s_f32m1_f32(vsum);
-  }
-
-  return total_sum;
-}
-
-inline float rvv_reduce_max_f32(const float* data, int64_t len) {
-  if (len <= 0) return -std::numeric_limits<float>::infinity();
-
-  float max_val = -std::numeric_limits<float>::infinity();
-  int64_t remaining = len;
-
-  while (remaining > 0) {
-    size_t vl = __riscv_vsetvl_e32m8(remaining);
-    vfloat32m8_t vdata = __riscv_vle32_v_f32m8(data + (len - remaining), vl);
-
-    vfloat32m1_t vcurrent_max = __riscv_vfmv_s_f_f32m1(max_val, 1);
-    vfloat32m1_t vmax = __riscv_vfredmax_vs_f32m8_f32m1(vdata, vcurrent_max, vl);
-    max_val = __riscv_vfmv_f_s_f32m1_f32(vmax);
-
-    remaining -= vl;
-  }
-
-  return max_val;
-}
-
 // Reduction Wrappers for Different register configurations
 inline float reduce_sum_f32m4(vfloat32m4_t v_acc, size_t vl_max) {
   vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
@@ -293,8 +243,4 @@ inline vfloat32m4_t vfwmacc_f16_scalar_to_f32m4(vfloat32m4_t vd, _Float16 scalar
 #endif
 }
 
-}  // namespace
-
 #endif  // CPU_CAPABILITY_RVV
-
-#endif  // SGL_KERNEL_RVV_VECTOR_MATH_H_

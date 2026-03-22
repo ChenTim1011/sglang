@@ -1,9 +1,8 @@
-#ifndef SGL_KERNEL_RVV_VECTOR_HELPERS_H
-#define SGL_KERNEL_RVV_VECTOR_HELPERS_H
+#pragma once
 
 #if defined(CPU_CAPABILITY_RVV)
 
-#include <ATen/core/Tensor.h>
+#include <c10/util/Half.h>
 #include <riscv_vector.h>
 
 #include <algorithm>
@@ -18,16 +17,17 @@ template <>
 struct is_quantized<int8_t> : std::true_type {};
 
 namespace rvv_constants {
-// BLOCK_N: N-tile for weight packing and GEMM dispatch.
-// Set to 2 * vl_max_e32m4 = __riscv_v_fixed_vlen / 4 so each packed tile spans
-// exactly 2 vector iterations, giving optimal pipeline overlap on all VLENs.
-// VLEN=128 → 32, VLEN=256 → 64, VLEN=512 → 128, VLEN=1024 → 256.
+// BLOCK_N = VLEN/4: weight packing tile size; each tile spans 2 vector iterations (m4).
 inline constexpr int BLOCK_N = __riscv_v_fixed_vlen / 4;
-// MAX_VL_ELEMENTS_M{4,8}: maximum element count per vsetvlmax call for each LMUL.
-// Computed from __riscv_v_fixed_vlen (set by -mrvv-vector-bits=N in CMakeLists).
-// Example: VLEN=256 → M4=32, M8=64; VLEN=512 → M4=64, M8=128.
+// MAX_VL_ELEMENTS_M{4,8}: max elements per vsetvlmax for LMUL=4 and LMUL=8.
 inline constexpr size_t MAX_VL_ELEMENTS_M4 = __riscv_v_fixed_vlen / 8;
 inline constexpr size_t MAX_VL_ELEMENTS_M8 = __riscv_v_fixed_vlen / 4;
+// L1 cache size for K-tiling. Set by -DRVV_L1_CACHE_KB=N at cmake time (default 32KB).
+// K-tile KB is derived as: L1_CACHE_BYTES * multiplier / VLEN
+#ifndef RVV_L1_CACHE_KB
+#define RVV_L1_CACHE_KB 32
+#endif
+inline constexpr int64_t L1_CACHE_BYTES = static_cast<int64_t>(RVV_L1_CACHE_KB) * 1024;
 }  // namespace rvv_constants
 
 // Returns VLENB (vector register length in bytes) at runtime via vsetvlmax.
@@ -83,10 +83,6 @@ typedef vfloat32m1_t vf32m1_t __attribute__((riscv_rvv_vector_bits(__riscv_v_fix
       }                                                          \
       case at::ScalarType::Char: {                               \
         using packed_t = int8_t;                                 \
-        return __VA_ARGS__();                                    \
-      }                                                          \
-      case at::ScalarType::Float8_e4m3fn: {                      \
-        using packed_t = at::Float8_e4m3fn;                      \
         return __VA_ARGS__();                                    \
       }                                                          \
       default:                                                   \
@@ -187,6 +183,22 @@ inline vfloat32m4_t load_as_float_m4(const scalar_t* ptr, size_t vl, float* scra
 }
 
 template <typename scalar_t>
+inline vfloat32m8_t load_as_float_m8(const scalar_t* ptr, size_t vl, float* scratch) {
+  if constexpr (std::is_same_v<scalar_t, float>) {
+    return __riscv_vle32_v_f32m8(ptr, vl);
+  } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+    vfloat16m4_t v_f16 = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(ptr), vl);
+    return __riscv_vfwcvt_f_f_v_f32m8(v_f16, vl);
+  } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+    return bf16_to_f32m8(reinterpret_cast<const uint16_t*>(ptr), vl);
+  } else {
+    for (size_t i = 0; i < vl; ++i)
+      scratch[i] = static_cast<float>(ptr[i]);
+    return __riscv_vle32_v_f32m8(scratch, vl);
+  }
+}
+
+template <typename scalar_t>
 inline vfloat32m4_t load_strided_as_float_m4(const scalar_t* ptr, ptrdiff_t stride_byte, size_t vl, float* scratch) {
   if constexpr (std::is_same_v<scalar_t, float>) {
     return __riscv_vlse32_v_f32m4(ptr, stride_byte, vl);
@@ -206,6 +218,26 @@ inline vfloat32m4_t load_strided_as_float_m4(const scalar_t* ptr, ptrdiff_t stri
       scratch[i] = static_cast<float>(*elem_ptr);
     }
     return __riscv_vle32_v_f32m4(scratch, vl);
+  }
+}
+
+template <typename scalar_t>
+inline void
+store_strided_from_float_m4(scalar_t* ptr, ptrdiff_t stride_byte, vfloat32m4_t v, size_t vl, float* scratch) {
+  if constexpr (std::is_same_v<scalar_t, float>) {
+    __riscv_vsse32_v_f32m4(ptr, stride_byte, v, vl);
+  } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+    vfloat16m2_t v_f16 = __riscv_vfncvt_f_f_w_f16m2(v, vl);
+    __riscv_vsse16_v_f16m2(reinterpret_cast<_Float16*>(ptr), stride_byte, v_f16, vl);
+  } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+    vuint16m2_t v_bf16 = f32m4_to_bf16(v, vl);
+    __riscv_vsse16_v_u16m2(reinterpret_cast<uint16_t*>(ptr), stride_byte, v_bf16, vl);
+  } else {
+    __riscv_vse32_v_f32m4(scratch, v, vl);
+    for (size_t i = 0; i < vl; ++i) {
+      scalar_t* elem = reinterpret_cast<scalar_t*>(reinterpret_cast<char*>(ptr) + i * stride_byte);
+      *elem = static_cast<scalar_t>(scratch[i]);
+    }
   }
 }
 
@@ -337,7 +369,7 @@ inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ s
       __riscv_vse32_v_f32m4(out + d, v_data, vl);
     }
   } else {
-    // FP16/BF16
+    // 16-bit element copy (FP16, BF16): bitwise, no conversion needed.
     for (int64_t d = 0; d < size; d += vl) {
       vl = __riscv_vsetvl_e16m4(size - d);
       vuint16m4_t v_data = __riscv_vle16_v_u16m4(reinterpret_cast<const uint16_t*>(src + d), vl);
@@ -417,44 +449,6 @@ inline void copy_stub<int8_t>(int8_t* __restrict__ out, const int8_t* __restrict
   copy_stub_int8(out, src, size);
 }
 
-// Scalar sigmoid and multiply with vector
-template <typename scalar_t, bool has_bias>
-inline void scalar_sigmoid_and_mul(
-    scalar_t* __restrict__ out,
-    const float* __restrict__ input,
-    const float* __restrict__ bias,
-    const scalar_t* __restrict__ mul,
-    int SIZE) {
-  // Scalar sigmoid: compute sigmoid(input[0] + bias[0])
-  float x_val;
-  if constexpr (has_bias) {
-    assert(bias != nullptr);
-    x_val = input[0] + bias[0];
-  } else {
-    x_val = input[0];
-  }
-
-  // Sigmoid: 1 / (1 + exp(-x))
-  float sigmoid_val = 1.0f / (1.0f + std::exp(-x_val));
-  size_t vl_max = __riscv_vsetvlmax_e32m4();
-
-  // Vector multiply: mul * sigmoid
-  alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
-
-  for (int d = 0; d < SIZE; d += vl_max) {
-    size_t vl = (d + static_cast<int64_t>(vl_max) <= SIZE) ? vl_max : __riscv_vsetvl_e32m4(SIZE - d);
-
-    // Load mul as float
-    vfloat32m4_t v_mul = load_as_float_m4(mul + d, vl, scratch);
-
-    // Multiply by sigmoid
-    vfloat32m4_t v_result = __riscv_vfmul_vf_f32m4(v_mul, sigmoid_val, vl);
-
-    // Store back as scalar_t
-    store_from_float_m4(out + d, v_result, vl, scratch);
-  }
-}
-
 // Quantization Operations
 
 // Symmetric Quantization (Scale Provided)
@@ -465,21 +459,16 @@ quantize_row_int8_symmetric(int8_t* __restrict__ Aq, const scalar_t* __restrict_
   const float safe_scale = (scale > 1e-9f) ? scale : 1e-9f;
   const float inv_scale = 1.0f / safe_scale;
   size_t vl;
-  alignas(64) float scratch[MAX_HEAD_SIZE];
+  alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
 
   for (int64_t k = 0; k < K; k += vl) {
     vl = __riscv_vsetvl_e32m4(K - k);
 
-    // Load as FP32
     vfloat32m4_t v_val = load_as_float_m4(A + k, vl, scratch);
-
-    // Scale
     vfloat32m4_t v_scaled = __riscv_vfmul_vf_f32m4(v_val, inv_scale, vl);
 
-    // Convert to Int32 (Round-to-nearest-even)
+    // vfcvt uses fcsr.frm (RNE); vnclip uses VXRM_RNU — different rounding modes per spec.
     vint32m4_t v_i32 = __riscv_vfcvt_x_f_v_i32m4(v_scaled, vl);
-
-    // Narrowing Saturation: Int32 -> Int16 -> Int8
     vint16m2_t v_i16 = __riscv_vnclip_wx_i16m2(v_i32, 0, __RISCV_VXRM_RNU, vl);
     vint8m1_t v_i8 = __riscv_vnclip_wx_i8m1(v_i16, 0, __RISCV_VXRM_RNU, vl);
 
@@ -493,7 +482,7 @@ inline void quantize_row_int8_symmetric_auto(
     int8_t* __restrict__ Aq, float& scale_out, const scalar_t* __restrict__ A, int64_t K, float eps = 1e-7) {
   float max_val = 0.f;
   size_t vl;
-  alignas(64) float scratch[MAX_HEAD_SIZE];
+  alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
 
   // Pass 1: Find Max Absolute Value
   vfloat32m4_t v_max_acc = __riscv_vfmv_v_f_f32m4(0.0f, __riscv_vsetvlmax_e32m4());
@@ -502,7 +491,7 @@ inline void quantize_row_int8_symmetric_auto(
     vl = __riscv_vsetvl_e32m4(K - k);
     vfloat32m4_t v_val = load_as_float_m4(A + k, vl, scratch);
     vfloat32m4_t v_abs = __riscv_vfsgnjx_vv_f32m4(v_val, v_val, vl);  // Abs
-    v_max_acc = __riscv_vfmax_vv_f32m4(v_max_acc, v_abs, vl);
+    v_max_acc = __riscv_vfmax_vv_f32m4_tu(v_max_acc, v_max_acc, v_abs, vl);
   }
 
   vfloat32m1_t v_max_scalar =
@@ -549,6 +538,49 @@ struct AlignedArena {
   }
 };
 
-#endif  // CPU_CAPABILITY_RVV
+// Softmax helper: in-place exp and sum (no normalization)
+// scores[i] = exp(scores[i] - max), returns sum = Σ scores[i]
+// NOTE: Does NOT normalize scores. Callers use unnormalized exp values
+// for the online softmax algorithm (FlashAttention-style).
+inline float exp_and_sum(float* __restrict__ scores, int n_size, float m_i) {
+  if (n_size <= 0) return 0.0f;
 
-#endif  // SGL_KERNEL_RVV_VECTOR_HELPERS_H
+  size_t vl_max = __riscv_vsetvlmax_e32m4();
+  float total_sum = 0.0f;
+
+  vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
+  for (int j = 0; j < n_size; j += vl_max) {
+    size_t vl = __riscv_vsetvl_e32m4(n_size - j);
+    vfloat32m4_t vx = __riscv_vle32_v_f32m4(scores + j, vl);
+    vx = __riscv_vfsub_vf_f32m4(vx, m_i, vl);
+    vfloat32m4_t vex = vfexp_f32m4(vx, vl);
+    __riscv_vse32_v_f32m4(scores + j, vex, vl);
+
+    vfloat32m1_t vsum = __riscv_vfredusum_vs_f32m4_f32m1(vex, vzero, vl);
+    total_sum += __riscv_vfmv_f_s_f32m1_f32(vsum);
+  }
+
+  return total_sum;
+}
+
+inline float rvv_reduce_max_f32(const float* data, int64_t len) {
+  if (len <= 0) return -std::numeric_limits<float>::infinity();
+
+  float max_val = -std::numeric_limits<float>::infinity();
+  int64_t remaining = len;
+
+  while (remaining > 0) {
+    size_t vl = __riscv_vsetvl_e32m8(remaining);
+    vfloat32m8_t vdata = __riscv_vle32_v_f32m8(data + (len - remaining), vl);
+
+    vfloat32m1_t vcurrent_max = __riscv_vfmv_s_f_f32m1(max_val, 1);
+    vfloat32m1_t vmax = __riscv_vfredmax_vs_f32m8_f32m1(vdata, vcurrent_max, vl);
+    max_val = __riscv_vfmv_f_s_f32m1_f32(vmax);
+
+    remaining -= vl;
+  }
+
+  return max_val;
+}
+
+#endif  // CPU_CAPABILITY_RVV

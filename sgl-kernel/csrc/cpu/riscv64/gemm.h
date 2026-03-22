@@ -5,29 +5,11 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
-#ifndef MAX_HEAD_SIZE
-#define MAX_HEAD_SIZE 256
-#endif
 
-#include "riscv64/vector_helpers.h"
+#include "riscv64/vector_helpers.h"  // defines MAX_HEAD_SIZE
 
-// RVV blocking parameters.
-// TILE_M and TILE_K are fixed (not VLEN-dependent).
-// TILE_N is derived from rvv_constants::BLOCK_N (= __riscv_v_fixed_vlen / 4).
-#define TILE_M 4
-#define TILE_K 64
-
-constexpr int block_size_m() {
-  return TILE_M;
-}
-
-constexpr int block_size_n() {
-  return rvv_constants::BLOCK_N;
-}
-
-constexpr int block_size_k() {
-  return TILE_K;
-}
+// 4 m4-accumulators × 4 phys-regs = 16 of 32 VRs; leaves 16 for operands.
+static constexpr int GEMM_TILE_M = 4;
 
 // Weight packing (RVV block-N format)
 at::Tensor convert_weight_packed(at::Tensor& weight);
@@ -154,8 +136,8 @@ inline void gemm_nt_tiled_transposed(
     float scale) {
   size_t vl_max = __riscv_vsetvlmax_e16m2();
 
-  for (int m_base = 0; m_base < M; m_base += TILE_M) {
-    int m_count = std::min(TILE_M, M - m_base);
+  for (int m_base = 0; m_base < M; m_base += GEMM_TILE_M) {
+    int m_count = std::min(GEMM_TILE_M, M - m_base);
 
     for (int n_base = 0; n_base < N; n_base += vl_max) {
       size_t vl = __riscv_vsetvl_e16m2(N - n_base);
@@ -213,6 +195,8 @@ inline void gemm_nt_tiled_transposed(
   }
 }
 
+// NOTE: O must be zero-initialized by the caller before the first call.
+// This function accumulates (load-add-store) onto O across tiled K iterations.
 template <typename scalar_t>
 inline void gemm_nn_tiled(
     const float* __restrict__ P,
@@ -223,8 +207,8 @@ inline void gemm_nn_tiled(
     int head_size_v,
     int p_strideN,
     int v_strideH) {
-  for (int m_base = 0; m_base < M; m_base += 4) {
-    int m_count = std::min(4, M - m_base);
+  for (int m_base = 0; m_base < M; m_base += GEMM_TILE_M) {
+    int m_count = std::min(GEMM_TILE_M, M - m_base);
     size_t vl;
     for (int d = 0; d < head_size_v; d += vl) {
       vl = __riscv_vsetvl_e16m2(head_size_v - d);
@@ -303,12 +287,12 @@ inline void gemm_nt_tiled_transposed_int8(
     const float* k_scales_per_token = nullptr) {
   size_t vl_max = __riscv_vsetvlmax_e32m4();
 
-  for (int m_base = 0; m_base < M; m_base += TILE_M) {
-    int m_count = std::min(TILE_M, M - m_base);
+  for (int m_base = 0; m_base < M; m_base += GEMM_TILE_M) {
+    int m_count = std::min(GEMM_TILE_M, M - m_base);
 
-    // Prepare Q quantization: Quantize TILE_M rows of Q
-    int8_t q_quant[TILE_M][MAX_HEAD_SIZE];
-    float q_scales[TILE_M];
+    // Prepare Q quantization: Quantize GEMM_TILE_M rows of Q
+    int8_t q_quant[GEMM_TILE_M][MAX_HEAD_SIZE];
+    float q_scales[GEMM_TILE_M];
 
     for (int i = 0; i < m_count; ++i) {
       float max_abs = 0.0f;
@@ -395,8 +379,8 @@ inline void gemm_nn_tiled_int8(
   // V: [N, D] (values, int8, row-major)
   // O: [M, D] (output)
 
-  for (int m_base = 0; m_base < M; m_base += TILE_M) {
-    int m_count = std::min(TILE_M, M - m_base);
+  for (int m_base = 0; m_base < M; m_base += GEMM_TILE_M) {
+    int m_count = std::min(GEMM_TILE_M, M - m_base);
     size_t vl;
     for (int d = 0; d < head_size_v; d += vl) {
       vl = __riscv_vsetvl_e32m4(head_size_v - d);
