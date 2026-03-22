@@ -6,14 +6,19 @@ Usage:
 
 import unittest
 
-import sgl_kernel  # noqa: F401
+try:
+    import sgl_kernel  # noqa: F401
+except ImportError:
+    pass
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
+from sglang.test.test_utils import CustomTestCase
+
 try:
-    from .rvv_utils import has_sgl_kernel_op, int8_extend_precision
+    from .rvv_utils import has_sgl_kernel_op, precision
 except ImportError:
-    from test.srt.cpu.rvv.rvv_utils import has_sgl_kernel_op, int8_extend_precision
+    from test.srt.cpu.rvv.rvv_utils import has_sgl_kernel_op, precision
 
 
 def naive_attention_extend(
@@ -110,7 +115,7 @@ def naive_attention_extend(
     return output
 
 
-class TestRVVExtendInt8(unittest.TestCase):
+class TestRVVExtendInt8(CustomTestCase):
     """Test suite for RVV extend attention with INT8 KV cache."""
 
     @classmethod
@@ -283,7 +288,7 @@ class TestRVVExtendInt8(unittest.TestCase):
         )
 
         # Tolerance: small accumulated fp16/bf16 rounding vs reference float32 dequant path.
-        atol = rtol = int8_extend_precision[dtype]
+        atol = rtol = precision["int8_extend"][dtype]
         torch.testing.assert_close(o_extend, ref_output, atol=atol, rtol=rtol)
 
     # Test cases

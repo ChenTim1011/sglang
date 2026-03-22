@@ -178,6 +178,11 @@ def is_in_amd_ci():
     return get_bool_env_var("SGLANG_IS_IN_CI_AMD")
 
 
+def is_in_rvv_ci():
+    """Return whether it is in an RVV (RISC-V Vector) CI runner."""
+    return get_bool_env_var("SGLANG_IS_IN_CI_RVV")
+
+
 def is_blackwell_system():
     """Same CUDA capability + toolkit semantics as ``sglang.srt.utils.is_blackwell``."""
     return is_blackwell()

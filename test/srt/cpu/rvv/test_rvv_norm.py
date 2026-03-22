@@ -18,23 +18,13 @@ from .rvv_utils import (
     fused_rmsnorm_gated_native,
     gemma3_rmsnorm_native,
     gemma_rmsnorm_native,
+    has_sgl_kernel_op,
     layernorm_native,
     precision,
     rmsnorm_native,
 )
 
 torch.manual_seed(1234)
-
-
-def has_sgl_kernel_norm():
-    """Return True only if the RVV norm ops are registered."""
-    try:
-        import sgl_kernel  # noqa: F401
-
-        _ = torch.ops.sgl_kernel.rmsnorm_cpu
-        return True
-    except (ImportError, AttributeError):
-        return False
 
 
 def helper_non_contiguous(t: torch.Tensor) -> torch.Tensor:
@@ -45,7 +35,7 @@ def helper_non_contiguous(t: torch.Tensor) -> torch.Tensor:
 
 
 @unittest.skipUnless(
-    has_sgl_kernel_norm(),
+    has_sgl_kernel_op("rmsnorm_cpu"),
     "sgl_kernel norm not available (non-RISC-V build)",
 )
 class TestRVVNormCore(CustomTestCase):
@@ -64,7 +54,7 @@ class TestRVVNormCore(CustomTestCase):
 
         out = torch.ops.sgl_kernel.rmsnorm_cpu(x, weight, eps)
         ref = rmsnorm_native(x, weight, eps)
-        atol = rtol = precision[dtype]
+        atol = rtol = precision["default"][dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     def run_case_norm_rms_fused_add(self, m, n, dtype):
@@ -80,7 +70,7 @@ class TestRVVNormCore(CustomTestCase):
         torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(x, residual, weight, eps)
         ref_out, ref_res = rmsnorm_native(ref_x, weight, eps, ref_residual)
 
-        atol = rtol = precision[dtype]
+        atol = rtol = precision["default"][dtype]
         torch.testing.assert_close(x, ref_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_res, atol=atol, rtol=rtol)
 
@@ -94,7 +84,7 @@ class TestRVVNormCore(CustomTestCase):
         fake_weight = torch.ones(n, dtype=dtype)
         ref = rmsnorm_native(x, fake_weight, eps)
 
-        atol = rtol = precision[dtype]
+        atol = rtol = precision["default"][dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     def run_case_norm_gemma_rms(self, m, n, dtype):
@@ -105,7 +95,7 @@ class TestRVVNormCore(CustomTestCase):
 
         out = torch.ops.sgl_kernel.gemma_rmsnorm_cpu(x, weight, eps)
         ref = gemma_rmsnorm_native(x, weight, eps)
-        atol = rtol = precision[dtype]
+        atol = rtol = precision["default"][dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     def run_case_norm_gemma_rms_fused_add(self, m, n, dtype):
@@ -121,7 +111,7 @@ class TestRVVNormCore(CustomTestCase):
         torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(x, residual, weight, eps)
         ref_out, ref_res = gemma_rmsnorm_native(ref_x, weight, eps, ref_residual)
 
-        atol = rtol = precision[dtype]
+        atol = rtol = precision["default"][dtype]
         torch.testing.assert_close(x, ref_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_res, atol=atol, rtol=rtol)
 
@@ -134,7 +124,7 @@ class TestRVVNormCore(CustomTestCase):
 
         out_2d = torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x_2d, weight, eps)
         ref_2d = gemma3_rmsnorm_native(x_2d, weight, eps)
-        atol = rtol = precision[dtype]
+        atol = rtol = precision["default"][dtype]
         torch.testing.assert_close(ref_2d, out_2d, atol=atol, rtol=rtol)
 
         # Test 4D input [1, num_head, seq_len, head_dim]
@@ -196,14 +186,14 @@ class TestRVVNormCore(CustomTestCase):
             ref_x, ref_res = rmsnorm_native(x.clone(), weight, eps, residual.clone())
             x_copy, res_copy = x.clone(), residual.clone()
             torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(x_copy, res_copy, weight, eps)
-            atol = rtol = precision[dt]
+            atol = rtol = precision["default"][dt]
             with self.subTest(dtype=dt):
                 torch.testing.assert_close(x_copy, ref_x, atol=atol, rtol=rtol)
                 torch.testing.assert_close(res_copy, ref_res, atol=atol, rtol=rtol)
 
 
 @unittest.skipUnless(
-    has_sgl_kernel_norm(),
+    has_sgl_kernel_op("rmsnorm_cpu"),
     "sgl_kernel norm not available (non-RISC-V build)",
 )
 class TestRVVNormLayer(CustomTestCase):
@@ -216,15 +206,14 @@ class TestRVVNormLayer(CustomTestCase):
     def run_case_norm_layer(self, m, n, dtype):
         """Run one LayerNorm case."""
         x = torch.randn([m, n], dtype=dtype)
-        ref_x = x.clone()
         weight = torch.randn(n, dtype=dtype)
         eps = 1e-6
 
-        torch.ops.sgl_kernel.layernorm_cpu(x, weight, eps)
-        ref = layernorm_native(ref_x, weight, eps)
+        out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, None, eps)
+        ref = layernorm_native(x, weight, eps)
 
-        atol = rtol = precision[dtype]
-        torch.testing.assert_close(x, ref, atol=atol, rtol=rtol)
+        atol = rtol = precision["default"][dtype]
+        torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
     def run_case_norm_layer_fused_add(self, m, n, dtype):
         """Run one fused-add-LayerNorm case."""
@@ -236,11 +225,13 @@ class TestRVVNormLayer(CustomTestCase):
         ref_x = x.clone()
         ref_residual = residual.clone()
 
-        torch.ops.sgl_kernel.fused_add_layernorm_cpu(x, residual, weight, eps)
+        out = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
+            x, residual, weight, None, eps
+        )
         ref_out, ref_res = layernorm_native(ref_x, weight, eps, ref_residual)
 
-        atol = rtol = precision[dtype]
-        torch.testing.assert_close(x, ref_out, atol=atol, rtol=rtol)
+        atol = rtol = precision["default"][dtype]
+        torch.testing.assert_close(out, ref_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_res, atol=atol, rtol=rtol)
 
     def test_case_layernorm(self):
@@ -257,7 +248,7 @@ class TestRVVNormLayer(CustomTestCase):
 
 
 @unittest.skipUnless(
-    has_sgl_kernel_norm(),
+    has_sgl_kernel_op("rmsnorm_cpu"),
     "sgl_kernel norm not available (non-RISC-V build)",
 )
 class TestRVVNormFusedGated(CustomTestCase):
@@ -277,7 +268,9 @@ class TestRVVNormFusedGated(CustomTestCase):
         out = torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(x, weight, gate, eps)
         ref = fused_rmsnorm_gated_native(x, weight, gate, eps)
 
-        atol = rtol = precision[dtype] * 2
+        atol = rtol = (
+            precision["default"][dtype] * 2
+        )  # 2x: fused gate mul compounds BF16 rounding error
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     def test_case_fused_rmsnorm_gated(self):

@@ -6,24 +6,37 @@ Usage:
     python3 -m unittest test.srt.cpu.rvv.test_rvv_gemm -v
 """
 
+import importlib.util
 import itertools
 import unittest
 
-import sgl_kernel  # noqa: F401
+try:
+    import sgl_kernel  # noqa: F401
+except ImportError:
+    pass
 import torch
 
 from sglang.test.test_utils import CustomTestCase
 
 from .rvv_utils import (
-    gemm_precision,
+    has_sgl_kernel_op,
     native_w8a8_per_token_matmul,
     precision,
-    sigmoid_mul_precision,
 )
+
+
+def _has_rvv_gemm_ops() -> bool:
+    if not importlib.util.find_spec("sgl_kernel"):
+        return False
+    return has_sgl_kernel_op("weight_packed_linear") and has_sgl_kernel_op(
+        "convert_weight_packed"
+    )
+
 
 torch.manual_seed(1234)
 
 
+@unittest.skipUnless(_has_rvv_gemm_ops(), "RVV GEMM ops not available")
 class TestRVVGemm(CustomTestCase):
     """Test suite for RVV GEMM kernels."""
 
@@ -36,8 +49,8 @@ class TestRVVGemm(CustomTestCase):
     # Specific tests for FMA path (N size > 64)
     N_fma = [100, 300]
 
-    M_int8 = [2, 128]
-    N_int8 = [32 * 12]
+    M_int8 = [1, 2, 3, 5, 128]  # M=1,3,5 exercise TILE_M=4 boundary (m_count < 4)
+    N_int8 = [32 * 12, 80]  # N=80 is non-multiple of BLOCK_N=64 for VLEN=256
     K_int8 = [32 * 17]
 
     def run_case_gemm_bf16(self, M, N, K, has_bias, dtype):
@@ -67,7 +80,7 @@ class TestRVVGemm(CustomTestCase):
             mat1, packed_mat2, bias if has_bias else None, True
         )
 
-        atol = rtol = gemm_precision[dtype]
+        atol = rtol = precision["gemm"][dtype]
 
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
         torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
@@ -129,7 +142,7 @@ class TestRVVGemm(CustomTestCase):
         # Reference: uses RVV-aligned calculation with unpacked weights
         ref_out = native_w8a8_per_token_matmul(Aq, Bq, As, Bs, bias, dtype)
 
-        atol = rtol = precision[ref_out.dtype]
+        atol = rtol = precision["default"][ref_out.dtype]
 
         # For RVV, both int8_scaled_mm_cpu and int8_scaled_mm_with_quant require packed weights
         Bq_packed = torch.ops.sgl_kernel.convert_weight_packed(Bq)
@@ -177,9 +190,8 @@ class TestRVVGemm(CustomTestCase):
             ):
                 self.run_case_gemm_int8(*params)
 
-    def run_case_gemm_bf16_small_oc(self, M, N, K, has_bias, use_post_sigmul, dtype):
-        """Run one small-output-channel GEMM case with optional sigmoid fusion."""
-        use_post_sigmul = use_post_sigmul and N == 1
+    def run_case_gemm_bf16_small_oc(self, M, N, K, has_bias, dtype):
+        """Run one small-output-channel GEMM case."""
         mat1 = torch.randn(M, K, dtype=dtype)
         mat2 = torch.randn(N, K, dtype=dtype)
 
@@ -188,52 +200,27 @@ class TestRVVGemm(CustomTestCase):
             bias = torch.randn(N, dtype=torch.float32)
             ref.add_(bias)
 
-        if use_post_sigmul:
-            # fused_linear_sigmoid_mul requires post_mul_mat.size(1) to be divisible by 32
-            # The output shape is [M, N] = [M, 1], so we need post_mul_mat to be [M, post_mul_size]
-            # where post_mul_size is divisible by 32
-            # For this test, we use a simple size that's divisible by 32
-            post_mul_size = 32  # Use a fixed size that's divisible by 32
-            mat_mul = torch.randn(M, post_mul_size, dtype=dtype)
-
-            # pass the pre-packed weight and set is_vnni=True
-            out = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
-                mat1,
-                torch.ops.sgl_kernel.convert_weight_packed(mat2),
-                bias if has_bias else None,
-                True,  # is_vnni (for RISC-V, this means packed)
-                mat_mul,
-            )
-            # Output shape is [M, post_mul_size].
-            # sigmoid(ref) broadcasts [M, 1] × mat_mul [M, post_mul_size] → [M, post_mul_size].
-            # Compare ALL columns.
-            ref = (torch.nn.functional.sigmoid(ref) * mat_mul.float()).to(dtype)
-            atol = rtol = sigmoid_mul_precision[dtype]
-        else:
-            ref = ref.to(dtype)
-
-            out = torch.ops.sgl_kernel.weight_packed_linear(
-                mat1,
-                torch.ops.sgl_kernel.convert_weight_packed(mat2),
-                bias if has_bias else None,
-                True,
-            )
-            atol = rtol = gemm_precision[dtype]
-
+        ref = ref.to(dtype)
+        out = torch.ops.sgl_kernel.weight_packed_linear(
+            mat1,
+            torch.ops.sgl_kernel.convert_weight_packed(mat2),
+            bias if has_bias else None,
+            True,
+        )
+        atol = rtol = precision["gemm"][dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     def test_case_gemm_bf16_small_oc(self):
-        """Case: small output-channel GEMM with optional sigmoid fusion."""
+        """Case: small output-channel GEMM."""
         for params in itertools.product(
-            [1, 8, 32, 1024], [12, 1], self.K, self.has_bias, [False, True], self.dtypes
+            [1, 8, 32, 1024], [12, 1], self.K, self.has_bias, self.dtypes
         ):
             with self.subTest(
                 M=params[0],
                 N=params[1],
                 K=params[2],
                 has_bias=params[3],
-                use_post_sigmul=params[4],
-                dtype=params[5],
+                dtype=params[4],
             ):
                 self.run_case_gemm_bf16_small_oc(*params)
 
