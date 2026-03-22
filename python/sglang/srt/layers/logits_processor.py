@@ -66,21 +66,30 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_cpu_rvv_available = cpu_has_rvv_support()
 
 
 def _rvv_lm_head_linear(hidden_states: torch.Tensor, lm_head) -> torch.Tensor:
     """Run RVV lm-head linear with lazy weight packing.
 
     tie_weights() may replace lm_head.weight with the embedding weight (unpacked
-    BF16) after process_weights_after_loading has packed it.  We re-pack on the
-    first forward call and cache the result as _rvv_logits_weight_packed.
+    BF16) after process_weights_after_loading has packed it.  We detect weight
+    replacement by comparing data_ptr and re-pack when needed.
     """
-    if not hasattr(lm_head, "_rvv_logits_weight_packed"):
-        lm_head._rvv_logits_weight_packed = (
-            _convert_weight_packed(lm_head.weight)
-            if _convert_weight_packed is not None
-            else None
-        )
+    current_weight_ptr = lm_head.weight.data_ptr()
+    cached_ptr = getattr(lm_head, "_rvv_logits_source_data_ptr", None)
+
+    if cached_ptr != current_weight_ptr:
+        # Weight replaced (e.g. tie_weights()) or first call — re-pack.
+        if _convert_weight_packed is None:
+            logger.warning(
+                "[RVV] convert_weight_packed unavailable; lm_head will use torch.matmul "
+                "(expect significant performance degradation on vocab projection)."
+            )
+            lm_head._rvv_logits_weight_packed = None
+        else:
+            lm_head._rvv_logits_weight_packed = _convert_weight_packed(lm_head.weight)
+        lm_head._rvv_logits_source_data_ptr = current_weight_ptr
     packed = lm_head._rvv_logits_weight_packed
     if packed is not None:
         return torch.ops.sgl_kernel.weight_packed_linear(
@@ -925,7 +934,7 @@ class LogitsProcessor(nn.Module):
                     True,  # is_vnni
                 )
             elif use_riscv_rvv_backend(lm_head):
-                if hasattr(lm_head, "weight_scale"):
+                if getattr(lm_head, "weight_scale", None) is not None:
                     # INT8 W8A8: needs per-token activation quant + int8 GEMM.
                     logits = rvv_linear_forward(hidden_states, lm_head)
                 else:
@@ -937,13 +946,13 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
-            elif cpu_has_rvv_support() and lm_head.weight.dtype in (
+            elif _is_cpu_rvv_available and lm_head.weight.dtype in (
                 torch.bfloat16,
                 torch.float16,
             ):
-                # Tied-embedding path: lm_head is a VocabParallelEmbedding without
-                # use_riscv_rvv_backend set (weight was never packed via the normal
-                # process_weights_after_loading path).
+                # lm_head weight is not pre-packed (in-place packing would corrupt
+                # embed_tokens on tied-weight models). _rvv_lm_head_linear lazily packs
+                # on first call via _rvv_logits_weight_packed, safe for tied/untied weights.
                 logits = _rvv_lm_head_linear(hidden_states, lm_head)
             else:
                 logits = torch.matmul(

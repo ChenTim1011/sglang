@@ -25,6 +25,7 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.rvv_utils import probe_rvv_op
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -47,6 +48,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_rvv_available = cpu_has_rvv_support()
 _is_cpu = is_cpu()
+
+if _is_cpu_rvv_available:
+    _is_cpu_rvv_available = probe_rvv_op("rmsnorm_cpu")
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
 
