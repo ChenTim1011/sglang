@@ -7,10 +7,6 @@
 #include "vector_math.h"
 
 #if defined(CPU_CAPABILITY_RVV)
-// Clang 19+ version check
-#if !defined(__clang__) || !defined(__clang_major__) || __clang_major__ < 19
-#error "RVV backend requires Clang 19 or later. Please use Clang 19 or later to compile this file."
-#endif
 
 #include <riscv_vector.h>
 
@@ -22,13 +18,16 @@
 #include "riscv64/gemm.h"
 #include "vector_helpers.h"
 
-// BLOCK_N for extend attention: must equal vl_max_e64m8 for Stage-1 single-shot gather.
-// vl_max_e64m8 = VLEN * LMUL_8 / 64 = __riscv_v_fixed_vlen / 8.
-// VLEN=128 → 16, VLEN=256 → 32, VLEN=512 → 64, VLEN=1024 → 128.
+namespace {
+
+// EXTEND_BLOCK_N = VLEN/8: must equal vl_max_e64m8 so Stage-1 index gather fits in one vsetvl.
 static constexpr int EXTEND_BLOCK_N = static_cast<int>(__riscv_v_fixed_vlen / 8);
 
+// BLOCK_M = 8192/VLEN: score tile (BLOCK_M×EXTEND_BLOCK_N floats) stays ~4KB across all VLENs.
+// Always divisible by GEMM_TILE_M=4 as required by the inner GEMM kernel.
+static constexpr int BLOCK_M = 1024 / EXTEND_BLOCK_N;
+
 static int compute_buffer_size_per_thread(int head_size, int head_size_v) {
-  constexpr int BLOCK_M = 32;
   constexpr int BLOCK_N = EXTEND_BLOCK_N;
   // Allocation order in AlignedArena:
   // 1. s_i: float[BLOCK_M * BLOCK_N]
@@ -50,7 +49,6 @@ static int compute_buffer_size_per_thread(int head_size, int head_size_v) {
 
 inline void softmax_update_row(
     float* row, float* vp_row, float& m_acc, float& l_acc, int n_size, int head_size_v, float logit_cap) {
-  // 1. Find max in current block (s_i)
   size_t vl_max = __riscv_vsetvlmax_e32m8();
   vfloat32m8_t v_max = __riscv_vfmv_v_f_f32m8(-INFINITY, vl_max);
   for (int j = 0; j < n_size; j += vl_max) {
@@ -61,18 +59,17 @@ inline void softmax_update_row(
       v_s = vftanh_f32m8(v_s, vl);
       v_s = __riscv_vfmul_vf_f32m8(v_s, logit_cap, vl);
     }
-    v_max = __riscv_vfmax_vv_f32m8(v_max, v_s, vl);
+    v_max = __riscv_vfmax_vv_f32m8_tu(v_max, v_max, v_s, vl);
     __riscv_vse32_v_f32m8(row + j, v_s, vl);  // Store back potentially capped values
   }
   float m_block =
       __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m8_f32m1(v_max, __riscv_vfmv_s_f_f32m1(-INFINITY, 1), vl_max));
 
-  // 2. Update global max and rescaling factor
   float m_new = std::max(m_acc, m_block);
   float alpha = expf(m_acc - m_new);
   m_acc = m_new;
 
-  // 3. Rescale existing v_prime
+  // Rescale accumulated v_prime by alpha = exp(m_old - m_new)
   for (int d = 0; d < head_size_v; d += vl_max) {
     size_t vl = __riscv_vsetvl_e32m8(head_size_v - d);
     vfloat32m8_t v_vp = __riscv_vle32_v_f32m8(vp_row + d, vl);
@@ -80,20 +77,18 @@ inline void softmax_update_row(
     __riscv_vse32_v_f32m8(vp_row + d, v_vp, vl);
   }
 
-  // 4. Compute exp(s - m_new) and sum
   vfloat32m8_t v_l_block = __riscv_vfmv_v_f_f32m8(0.0f, vl_max);
   for (int j = 0; j < n_size; j += vl_max) {
     size_t vl = __riscv_vsetvl_e32m8(n_size - j);
     vfloat32m8_t v_s = __riscv_vle32_v_f32m8(row + j, vl);
     v_s = __riscv_vfsub_vf_f32m8(v_s, m_new, vl);
     vfloat32m8_t v_exp = vfexp_f32m8(v_s, vl);
-    __riscv_vse32_v_f32m8(row + j, v_exp, vl);  // Store exp values for Stage 2 usage
-    v_l_block = __riscv_vfadd_vv_f32m8(v_l_block, v_exp, vl);
+    __riscv_vse32_v_f32m8(row + j, v_exp, vl);
+    v_l_block = __riscv_vfadd_vv_f32m8_tu(v_l_block, v_l_block, v_exp, vl);
   }
   float l_block =
       __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m8_f32m1(v_l_block, __riscv_vfmv_s_f_f32m1(0.0f, 1), vl_max));
 
-  // 5. Update global sum
   l_acc = l_acc * alpha + l_block;
 }
 
@@ -135,7 +130,6 @@ void extend_attention_kernel_impl(
     int64_t max_total_num_tokens,
     int64_t max_len_extend,
     int buffer_size_per_thread,
-    bool is_prefix_skipped,
     float k_scale = 1.0f,
     float v_scale = 1.0f,
     const float* k_scale_buf = nullptr,    // [max_tokens * num_heads_kv]; per-token K scales
@@ -152,7 +146,6 @@ void extend_attention_kernel_impl(
 
   constexpr bool IS_INT8 = is_quantized<kv_t>::value;
 
-  constexpr int BLOCK_M = 32;
   constexpr int BLOCK_N = EXTEND_BLOCK_N;
 
   const int num_groups = num_heads / num_heads_kv;
@@ -191,9 +184,10 @@ void extend_attention_kernel_impl(
     scalar_t* v_buf_fp = arena.alloc<scalar_t>(BLOCK_N * MAX_HEAD_SIZE);
     int8_t* v_buf_int8 = reinterpret_cast<int8_t*>(v_buf_fp);
 
-    // Thread-local scalars
-    alignas(64) float l_acc[32];
-    alignas(64) float m_acc[32];
+    // Thread-local softmax accumulators: one entry per query row in the current tile.
+    // Sized to BLOCK_M (= 8192/VLEN): VLEN=128→64, VLEN=256→32, VLEN=512→16, VLEN=1024→8.
+    alignas(64) float l_acc[BLOCK_M];
+    alignas(64) float m_acc[BLOCK_M];
 
     for (int64_t i = begin; i < end; ++i) {
       int head_kv_id = h / num_groups;
@@ -202,11 +196,6 @@ void extend_attention_kernel_impl(
       int64_t prefix_len = seq_len - extend_len;
       int64_t start_loc = static_cast<int64_t>(extend_start_loc[b]);
       int64_t req_idx = req_pool_indices[b];
-
-      if (is_prefix_skipped) {
-        TORCH_CHECK(
-            prefix_len == 0, "extend attention: expect prefix_len to be 0 when prefix is skipped, got ", prefix_len);
-      }
 
       int m_start = mb * BLOCK_M;
       int m_size = std::min((int64_t)BLOCK_M, extend_len - m_start);
@@ -219,7 +208,6 @@ void extend_attention_kernel_impl(
       const scalar_t* q_ptr = q_extend + h * q_strideH + (start_loc + m_start) * q_strideM;
       scalar_t* o_ptr = o_extend + h * o_strideH + (start_loc + m_start) * o_strideM;
 
-      // Reset accumulators
       fill_stub<float>(l_acc, 0.0f, m_size);
       fill_stub<float>(m_acc, -std::numeric_limits<float>::infinity(), m_size);
       fill_stub<float>(v_prime, 0.0f, m_size * head_size_v);
@@ -229,14 +217,12 @@ void extend_attention_kernel_impl(
         for (int n_start = 0; n_start < prefix_len; n_start += BLOCK_N) {
           int n_size = std::min((int64_t)BLOCK_N, prefix_len - n_start);
 
-          // Prefetch next chunk
           if (n_start + BLOCK_N < prefix_len) {
             int next_idx = req_to_token[req_idx * max_context_len + n_start + BLOCK_N];
             const kv_t* k_next = k_buffer + next_idx * k_strideN + head_kv_id * k_strideH;
             __builtin_prefetch(k_next, 0, 1);
           }
 
-          // 1. Pack/Transpose K
           if constexpr (IS_INT8) {
             float k_scales_block[BLOCK_N];
             for (int j = 0; j < n_size; ++j) {
@@ -257,7 +243,6 @@ void extend_attention_kernel_impl(
                   __riscv_vsse8_v_i8m4(k_trans_buf_int8 + d * BLOCK_N + j, BLOCK_N, v, vl);
                 }
               } else {
-                // Fallback: scalar copy for unaligned access
                 for (int d = 0; d < head_size; ++d) {
                   k_trans_buf_int8[d * BLOCK_N + j] = k_src[d];
                 }
@@ -277,8 +262,7 @@ void extend_attention_kernel_impl(
                 k_scale,
                 k_scales_block);
           } else {
-            // 1. Load token indices (single shot; vl_max_e64m8 == BLOCK_N == EXTEND_BLOCK_N,
-            //    so one vsetvl always covers n_size <= BLOCK_N for any VLEN)
+            // Single vsetvl covers n_size <= BLOCK_N (vl_max_e64m8 == BLOCK_N for any VLEN)
             size_t vl = __riscv_vsetvl_e64m8(n_size);
             vuint64m8_t v_offsets;
 
@@ -287,39 +271,32 @@ void extend_attention_kernel_impl(
                   __riscv_vle64_v_i64m8((const int64_t*)&req_to_token[req_idx * max_context_len + n_start], vl);
               v_offsets = __riscv_vreinterpret_v_i64m8_u64m8(v_idx);
             } else {
-              // index_t is int32_t: Load 32-bit and zero-extend to 64-bit
+              // index_t is int32_t: zero-extend to 64-bit for byte-offset arithmetic
               size_t vl_32 = __riscv_vsetvl_e32m4(n_size);
               vint32m4_t v_idx32 =
                   __riscv_vle32_v_i32m4((const int32_t*)&req_to_token[req_idx * max_context_len + n_start], vl_32);
-              // Zero-extend: i32m4 -> u32m4 -> u64m8
               vuint32m4_t v_u32 = __riscv_vreinterpret_v_i32m4_u32m4(v_idx32);
               vuint64m8_t v_u64 = __riscv_vzext_vf2_u64m8(v_u32, vl);
               v_offsets = v_u64;
             }
 
-            // 2. Compute Base Offsets: token_idx * k_strideN + head_offset
             size_t strideN_bytes = k_strideN * sizeof(kv_t);
             size_t head_offset_bytes = head_kv_id * k_strideH * sizeof(kv_t);
 
             v_offsets = __riscv_vmul_vx_u64m8(v_offsets, strideN_bytes, vl);
             v_offsets = __riscv_vadd_vx_u64m8(v_offsets, head_offset_bytes, vl);
 
-            // 3. Gather Loop over 'd'
             const kv_t* base_ptr = k_buffer;
 
             for (int d = 0; d < head_size; ++d) {
               if constexpr (sizeof(scalar_t) == 2) {
-                // FP16/BF16: Raw 16-bit gather+store (no widening needed)
-                // GEMM handles widening to FP32 internally)
                 vuint16m2_t v_val = __riscv_vluxei64_v_u16m2((const uint16_t*)base_ptr, v_offsets, vl);
                 __riscv_vse16_v_u16m2(reinterpret_cast<uint16_t*>(k_trans_buf_fp + d * BLOCK_N), v_val, vl);
               } else {
-                // FP32 -> Direct Load
                 vfloat32m4_t v_val = __riscv_vluxei64_v_f32m4((const float*)base_ptr, v_offsets, vl);
                 __riscv_vse32_v_f32m4(k_trans_buf_fp + d * BLOCK_N, v_val, vl);
               }
 
-              // Increment offsets for next element
               v_offsets = __riscv_vadd_vx_u64m8(v_offsets, sizeof(kv_t), vl);
             }
 
@@ -327,13 +304,12 @@ void extend_attention_kernel_impl(
                 q_ptr, k_trans_buf_fp, s_i, m_size, n_size, head_size, q_strideM, BLOCK_N, BLOCK_N, scaling);
           }
 
-          // 2. Softmax Update (Online) using helper
           for (int r = 0; r < m_size; ++r) {
             softmax_update_row(
                 s_i + r * BLOCK_N, v_prime + r * head_size_v, m_acc[r], l_acc[r], n_size, head_size_v, logit_cap);
           }
 
-          // 3. GEMM: Score @ V
+          // GEMM: score @ V
           if constexpr (IS_INT8) {
             float v_scales_block[BLOCK_N];
             for (int j = 0; j < n_size; ++j) {
@@ -341,7 +317,6 @@ void extend_attention_kernel_impl(
               const int8_t* v_src =
                   reinterpret_cast<const int8_t*>(v_buffer + token_idx * v_strideN + head_kv_id * v_strideH);
 
-              // Pre-gather per-token V scale (or fall back to global v_scale)
               v_scales_block[j] = v_scale_buf ? v_scale_buf[token_idx * num_heads_kv + head_kv_id] : v_scale;
 
               bool v_src_aligned = (reinterpret_cast<uintptr_t>(v_src) % 8 == 0);
@@ -354,7 +329,6 @@ void extend_attention_kernel_impl(
                   __riscv_vse8_v_i8m4(v_buf_int8 + j * head_size_v + d, v, vl);
                 }
               } else {
-                // Fallback: memcpy for unaligned access
                 int8_t* v_dst = v_buf_int8 + j * head_size_v;
                 std::memcpy(v_dst, v_src, head_size_v * sizeof(int8_t));
               }
@@ -371,14 +345,13 @@ void extend_attention_kernel_impl(
             gemm_nn_tiled(s_i, v_buf_fp, v_prime, m_size, n_size, head_size_v, BLOCK_N, head_size_v);
           }
         }
-      }  // End Prefix
+      }  // Stage 1 end
 
       // STAGE 2: EXTEND (Self-Attention)
       int num_keys = std::min((int64_t)(m_start + BLOCK_M), extend_len);
       for (int n_start = 0; n_start < num_keys; n_start += BLOCK_N) {
         int n_size = std::min(BLOCK_N, num_keys - n_start);
 
-        // Prefetch next block
         if (n_start + BLOCK_N < num_keys) {
           const scalar_t* next_k =
               k_extend + start_loc * ke_strideN + head_kv_id * ke_strideH + (n_start + BLOCK_N) * ke_strideN;
@@ -425,21 +398,17 @@ void extend_attention_kernel_impl(
           for (int c = 0; c < n_size; c += vl_max) {
             size_t vl = __riscv_vsetvl_e32m2(n_size - c);
 
-            // Key position within this batch's extend: n_start + c + lane_id
             vuint32m2_t vid = __riscv_vid_v_u32m2(vl);
             vuint32m2_t vn_pos = __riscv_vadd_vx_u32m2(vid, n_start + c, vl);
 
-            // Mask future keys: k_pos > q_pos → illegal (causal)
+            // Causal mask: set k_pos > q_pos to -inf
             vbool16_t mask = __riscv_vmsgtu_vx_u32m2_b16(vn_pos, (uint32_t)m_pos, vl);
-
-            // Masked Store -inf
             vfloat32m2_t v_inf = __riscv_vfmv_v_f_f32m2(-std::numeric_limits<float>::infinity(), vl);
             vfloat32m2_t v_row = __riscv_vle32_v_f32m2(row + c, vl);
             v_row = __riscv_vmerge_vvm_f32m2(v_row, v_inf, mask, vl);
             __riscv_vse32_v_f32m2(row + c, v_row, vl);
           }
 
-          // Softmax Update (Logit Cap + Max/Sum)
           softmax_update_row(
               s_i + r * BLOCK_N, v_prime + r * head_size_v, m_acc[r], l_acc[r], n_size, head_size_v, logit_cap);
         }
@@ -452,7 +421,7 @@ void extend_attention_kernel_impl(
         }
 
         gemm_nn_tiled(s_i, v_buf_fp, v_prime, m_size, n_size, head_size_v, BLOCK_N, head_size_v);
-      }  // End Extend
+      }  // Stage 2 end
 
       // Write Output
       for (int r = 0; r < m_size; ++r) {
@@ -487,7 +456,6 @@ struct ExtendBatchInfo {
   int ve_strideN, ve_strideH;
   int k_strideN, k_strideH;
   int v_strideN, v_strideH;
-  bool is_prefix_skipped;
   at::ScalarType index_dtype;
 };
 
@@ -540,9 +508,6 @@ static ExtendBatchInfo validate_extend_inputs(
   CHECK_EQ(v_extend.size(1), p.num_heads_kv);
   CHECK_EQ(k_buffer.size(1), v_buffer.size(1));
 
-  // MLA will skip prefix part
-  p.is_prefix_skipped = (k_buffer.size(1) != p.num_heads_kv);
-
   p.index_dtype = req_to_token.scalar_type();
   TORCH_CHECK(
       p.index_dtype == at::kInt || p.index_dtype == at::kLong,
@@ -578,6 +543,8 @@ static ExtendBatchInfo validate_extend_inputs(
 // extend_seq_lens: [num_seqs]
 // extend_start_loc: [num_seqs]
 //
+}  // anonymous namespace
+
 void extend_attention_cpu(
     at::Tensor& q_extend,
     at::Tensor& k_extend,
@@ -663,11 +630,12 @@ void extend_attention_cpu(
           p.max_context_len,
           p.max_total_num_tokens,
           max_len_extend,
-          buffer_size,
-          p.is_prefix_skipped);
+          buffer_size);
     });
   });
 }
+
+namespace {
 
 template <typename scalar_t, typename index_t>
 void extend_set_kv_buffer_int8_quantize(
@@ -741,6 +709,8 @@ void extend_set_kv_buffer_int8_quantize(
     }
   });
 }
+
+}  // anonymous namespace
 
 void extend_attention_int8_cpu(
     at::Tensor& q_extend,
@@ -865,7 +835,6 @@ void extend_attention_int8_cpu(
           p.max_total_num_tokens,
           max_len_extend,
           buffer_size,
-          p.is_prefix_skipped,
           (float)k_scale,
           (float)v_scale,
           k_scale_buf_ptr,

@@ -2,6 +2,8 @@
 #pragma clang riscv intrinsic vector
 #endif
 
+#if defined(CPU_CAPABILITY_RVV)
+
 #include <cmath>
 #include <cstdint>
 
@@ -46,25 +48,33 @@ void rotary_embedding_3D_kernel_impl(
       scalar_t* sin_start = cos_sin_cache + p * rotary_dim + COFF;
       scalar_t* cos_start = cos_sin_cache + p * rotary_dim;
 
-      // Apply rotary pos emb to query — adjacent pairs
       for (int64_t h = 0; h < rotary_dim; h += 2) {
         float cos_val = static_cast<float>(cos_start[h >> 1]);
         float sin_val = static_cast<float>(sin_start[h >> 1]);
-        float in1 = static_cast<float>(query[in_offset_q + h]);
-        float in2 = static_cast<float>(query[in_offset_q + h + 1]);
-        query_out[out_offset_q + h] = static_cast<scalar_t>(in1 * cos_val - in2 * sin_val);
-        query_out[out_offset_q + h + 1] = static_cast<scalar_t>(in2 * cos_val + in1 * sin_val);
+        float q1 = static_cast<float>(query[in_offset_q + h]);
+        float q2 = static_cast<float>(query[in_offset_q + h + 1]);
+        query_out[out_offset_q + h] = static_cast<scalar_t>(q1 * cos_val - q2 * sin_val);
+        query_out[out_offset_q + h + 1] = static_cast<scalar_t>(q2 * cos_val + q1 * sin_val);
       }
-
-      // Apply rotary pos emb to key (single head)
-      for (int64_t h = 0; h < rotary_dim; h += 2) {
-        float cos_val = static_cast<float>(cos_start[h >> 1]);
-        float sin_val = static_cast<float>(sin_start[h >> 1]);
+      for (int64_t h = rotary_dim; h < head_size; ++h) {
+        query_out[out_offset_q + h] = query[in_offset_q + h];
+      }
+      // Key has only 1 head in 3D layout (num_kv_heads == 1, enforced by CHECK_EQ).
+      // Only the first query head writes the key output to avoid redundant stores.
+      if (head_id == 0) {
         int64_t k_pe_offset = seq * key_stride_s;
-        float in1_k = static_cast<float>(key[k_pe_offset + h]);
-        float in2_k = static_cast<float>(key[k_pe_offset + h + 1]);
-        key_out[out_offset_k + h] = static_cast<scalar_t>(in1_k * cos_val - in2_k * sin_val);
-        key_out[out_offset_k + h + 1] = static_cast<scalar_t>(in2_k * cos_val + in1_k * sin_val);
+        for (int64_t h = 0; h < rotary_dim; h += 2) {
+          float cos_val = static_cast<float>(cos_start[h >> 1]);
+          float sin_val = static_cast<float>(sin_start[h >> 1]);
+          float k1 = static_cast<float>(key[k_pe_offset + h]);
+          float k2 = static_cast<float>(key[k_pe_offset + h + 1]);
+          key_out[out_offset_k + h] = static_cast<scalar_t>(k1 * cos_val - k2 * sin_val);
+          key_out[out_offset_k + h + 1] = static_cast<scalar_t>(k2 * cos_val + k1 * sin_val);
+        }
+        // Copy non-rotated tail of key.
+        for (int64_t h = rotary_dim; h < head_size; ++h) {
+          key_out[out_offset_k + h] = key[k_pe_offset + h];
+        }
       }
 
       data_index_step(seq, num_tokens, head_id, num_heads);
@@ -166,59 +176,51 @@ void rotary_embedding_4D_kernel_impl(
     int64_t seq_len) {
   int64_t embed_dim = rotary_dim / 2;
 
-  at::parallel_for(0, batch_size * seq_len * num_heads, GRAIN_SIZE / rotary_dim, [&](int64_t begin, int64_t end) {
-    int64_t bs = {0}, seq = {0}, i = {0};
-    data_index_init(begin, bs, batch_size, seq, seq_len, i, num_heads);
-    for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
+  // Vectorized adjacent-pair rotation using stride-2 load/store.
+  // cache_ptr points to [cos(embed_dim) | sin(embed_dim)] for the token's position.
+  // head_ptr points to the start of one head: layout [x0, y0, x1, y1, ...].
+  // stride = 2 * sizeof(scalar_t) so strided loads pick up every other element.
+  auto compute_body = [&](scalar_t* cache_ptr, scalar_t* head_ptr) {
+    alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
+    scalar_t* cos_ptr = cache_ptr;
+    scalar_t* sin_ptr = cache_ptr + embed_dim;
+    const ptrdiff_t stride = 2 * static_cast<ptrdiff_t>(sizeof(scalar_t));
+    size_t vl = 0;
+    for (int64_t j = 0; j < embed_dim; j += static_cast<int64_t>(vl)) {
+      vl = __riscv_vsetvl_e32m4(embed_dim - j);
+      vfloat32m4_t v_cos = load_as_float_m4(cos_ptr + j, vl, scratch);
+      vfloat32m4_t v_sin = load_as_float_m4(sin_ptr + j, vl, scratch);
+      // Stride-2 load: x = head[0,2,4,...], y = head[1,3,5,...]
+      vfloat32m4_t v_x = load_strided_as_float_m4(head_ptr + 2 * j, stride, vl, scratch);
+      vfloat32m4_t v_y = load_strided_as_float_m4(head_ptr + 2 * j + 1, stride, vl, scratch);
+
+      // out_x = x * cos - y * sin
+      vfloat32m4_t v_out_x = __riscv_vfmul_vv_f32m4(v_x, v_cos, vl);
+      v_out_x = __riscv_vfnmsac_vv_f32m4(v_out_x, v_y, v_sin, vl);
+      // out_y = y * cos + x * sin
+      vfloat32m4_t v_out_y = __riscv_vfmul_vv_f32m4(v_y, v_cos, vl);
+      v_out_y = __riscv_vfmacc_vv_f32m4(v_out_y, v_x, v_sin, vl);
+
+      store_strided_from_float_m4(head_ptr + 2 * j, stride, v_out_x, vl, scratch);
+      store_strided_from_float_m4(head_ptr + 2 * j + 1, stride, v_out_y, vl, scratch);
+    }
+  };
+
+#pragma omp parallel for collapse(2)
+  for (int64_t bs = 0; bs < batch_size; ++bs) {
+    for (int64_t seq = 0; seq < seq_len; ++seq) {
       int64_t pos = positions[bs * seq_len + seq];
       scalar_t* cache_ptr = cos_sin_cache + pos * rotary_dim;
-      scalar_t* cos_cache_ptr = cache_ptr;
-      scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
-      int64_t token_head = bs * query_stride_b + seq * query_stride_s + i * query_stride_h;
-      scalar_t* head_query = token_head + query;
-      for (int64_t j = 0; j < embed_dim; j += 1) {
-        int64_t x_index = 2 * j;
-        int64_t y_index = 2 * j + 1;
-
-        float cos_val = static_cast<float>(cos_cache_ptr[j]);
-        float sin_val = static_cast<float>(sin_cache_ptr[j]);
-
-        float x = static_cast<float>(head_query[x_index]);
-        float y = static_cast<float>(head_query[y_index]);
-
-        head_query[x_index] = static_cast<scalar_t>(x * cos_val - y * sin_val);
-        head_query[y_index] = static_cast<scalar_t>(y * cos_val + x * sin_val);
+      for (int64_t i = 0; i < num_heads; ++i) {
+        int64_t token_head = bs * query_stride_b + seq * query_stride_s + i * query_stride_h;
+        compute_body(cache_ptr, query + token_head);
       }
-      data_index_step(bs, batch_size, seq, seq_len, i, num_heads);
-    }
-  });
-
-  at::parallel_for(0, batch_size * seq_len * num_kv_heads, GRAIN_SIZE / rotary_dim, [&](int64_t begin, int64_t end) {
-    int64_t bs = {0}, seq = {0}, i = {0};
-    data_index_init(begin, bs, batch_size, seq, seq_len, i, num_kv_heads);
-    for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
-      int64_t pos = positions[bs * seq_len + seq];
-      scalar_t* cache_ptr = cos_sin_cache + pos * rotary_dim;
-      scalar_t* cos_cache_ptr = cache_ptr;
-      scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
-      int64_t token_head = bs * key_stride_b + seq * key_stride_s + i * key_stride_h;
-      scalar_t* head_key = key + token_head;
-      for (int64_t j = 0; j < embed_dim; j += 1) {
-        int64_t x_index = 2 * j;
-        int64_t y_index = 2 * j + 1;
-
-        float cos_val = static_cast<float>(cos_cache_ptr[j]);
-        float sin_val = static_cast<float>(sin_cache_ptr[j]);
-
-        float x = static_cast<float>(head_key[x_index]);
-        float y = static_cast<float>(head_key[y_index]);
-
-        head_key[x_index] = static_cast<scalar_t>(x * cos_val - y * sin_val);
-        head_key[y_index] = static_cast<scalar_t>(y * cos_val + x * sin_val);
+      for (int64_t i = 0; i < num_kv_heads; ++i) {
+        int64_t token_head = bs * key_stride_b + seq * key_stride_s + i * key_stride_h;
+        compute_body(cache_ptr, key + token_head);
       }
-      data_index_step(bs, batch_size, seq, seq_len, i, num_kv_heads);
     }
-  });
+  }
 }
 
 }  // namespace
@@ -246,7 +248,13 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
   int64_t rotary_dim = cos_sin_cache.size(1);
   TORCH_CHECK(rotary_dim % 2 == 0, "rotary_dim must be even, got ", rotary_dim);
   if (input_dim == 3) {
-    CHECK_EQ(query.size(-1), rotary_dim);
+    TORCH_CHECK(
+        query.size(-1) >= rotary_dim,
+        "3D rotary: head_size (",
+        query.size(-1),
+        ") must be >= rotary_dim (",
+        rotary_dim,
+        ")");
     CHECK_EQ(key.size(1), 1);
   }
 
@@ -356,3 +364,5 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
   });
   return std::make_tuple(query_out, key_out);
 }
+
+#endif  // CPU_CAPABILITY_RVV
