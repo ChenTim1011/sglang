@@ -2,6 +2,8 @@
 #pragma clang riscv intrinsic vector
 #endif
 
+#if defined(CPU_CAPABILITY_RVV)
+
 #include <cmath>
 #include <cstdint>
 
@@ -26,7 +28,7 @@ void l2norm_kernel_impl(
 
       // Pass 1: accumulate sum of squares
       float sum_sq = 0.0f;
-      size_t vl;
+      size_t vl = 0;
       vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       for (int64_t j = 0; j < hidden_size; j += vl) {
         vl = __riscv_vsetvl_e32m4(hidden_size - j);
@@ -66,7 +68,7 @@ void rmsnorm_kernel_impl(
 
       // Pass 1: sum x^2
       float sum_sq = 0.0f;
-      size_t vl;
+      size_t vl = 0;
       vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       for (int64_t j = 0; j < hidden_size; j += vl) {
         vl = __riscv_vsetvl_e32m4(hidden_size - j);
@@ -119,7 +121,7 @@ void gemma3_rmsnorm_kernel_4d_impl(
 
       // Pass 1: sum x^2
       float sum_sq = 0.0f;
-      size_t vl;
+      size_t vl = 0;
       vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       for (int64_t j = 0; j < hidden_size; j += vl) {
         vl = __riscv_vsetvl_e32m4(hidden_size - j);
@@ -171,7 +173,7 @@ void fused_add_rmsnorm_kernel_impl(
 
       // Pass 1: fused add → residual; fill float buffer; accumulate sum-sq
       float sum_sq = 0.0f;
-      size_t vl;
+      size_t vl = 0;
       vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       for (int64_t j = 0; j < hidden_size; j += vl) {
         vl = __riscv_vsetvl_e32m4(hidden_size - j);
@@ -223,7 +225,7 @@ void fused_rmsnorm_gated_kernel_impl(
 
       // Pass 1: sum x^2
       float sum_sq = 0.0f;
-      size_t vl;
+      size_t vl = 0;
       vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       for (int64_t j = 0; j < hidden_size; j += vl) {
         vl = __riscv_vsetvl_e32m4(hidden_size - j);
@@ -276,7 +278,7 @@ void fused_add_layernorm_kernel_impl(
 
       // Pass 1: optional fused add; fill buffer; accumulate sum and sum-sq
       float sum_val = 0.0f, sum_sq = 0.0f;
-      size_t vl;
+      size_t vl = 0;
       vfloat32m1_t vzero = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       for (int64_t j = 0; j < hidden_size; j += vl) {
         vl = __riscv_vsetvl_e32m4(hidden_size - j);
@@ -355,8 +357,11 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   return output;
 }
 
-// input : {batch_size, hidden_size}  (in-place, no residual)
-void layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
+// input : {batch_size, hidden_size}
+// weight: {hidden_size}
+// bias  : {hidden_size} (optional)
+at::Tensor
+layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias, double eps) {
   RECORD_FUNCTION("sgl-kernel::layernorm_cpu", std::vector<c10::IValue>({input, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(weight);
@@ -365,20 +370,24 @@ void layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   CHECK_EQ(input.size(1), weight.size(0));
   int64_t batch_size = input.size(0);
   int64_t hidden_size = input.size(1);
-  int64_t input_strideN = input.stride(0);
   int64_t num_threads = at::get_num_threads();
   at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
+  at::Tensor output = input.clone();
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "layernorm_kernel", [&] {
     fused_add_layernorm_kernel_impl<scalar_t>(
-        input.data_ptr<scalar_t>(),
+        output.data_ptr<scalar_t>(),
         nullptr,
         weight.data_ptr<scalar_t>(),
         buffer.data_ptr<float>(),
         batch_size,
         hidden_size,
-        input_strideN,
+        output.stride(0),
         static_cast<float>(eps));
   });
+  if (bias.has_value()) {
+    output.add_(bias.value());
+  }
+  return output;
 }
 
 // input : {batch_size, hidden_size}
@@ -557,7 +566,13 @@ void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Te
 // input   : {batch_size, hidden_size}
 // residual: {batch_size, hidden_size}
 // weight  : {hidden_size}
-void fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
+// bias    : {hidden_size} (optional)
+at::Tensor fused_add_layernorm_cpu(
+    const at::Tensor& input,
+    at::Tensor& residual,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    double eps) {
   RECORD_FUNCTION("sgl-kernel::fused_add_layernorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(residual);
@@ -570,18 +585,25 @@ void fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor
   CHECK_EQ(input.size(1), weight.size(0));
   int64_t batch_size = input.size(0);
   int64_t hidden_size = input.size(1);
-  int64_t input_strideN = input.stride(0);
   int64_t num_threads = at::get_num_threads();
   at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
+  // Clone input into output; kernel writes normalized result in-place to output
+  at::Tensor output = input.clone();
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_add_layernorm_kernel", [&] {
     fused_add_layernorm_kernel_impl<scalar_t>(
-        input.data_ptr<scalar_t>(),
+        output.data_ptr<scalar_t>(),
         residual.data_ptr<scalar_t>(),
         weight.data_ptr<scalar_t>(),
         buffer.data_ptr<float>(),
         batch_size,
         hidden_size,
-        input_strideN,
+        output.stride(0),
         static_cast<float>(eps));
   });
+  if (bias.has_value()) {
+    output.add_(bias.value());
+  }
+  return output;
 }
+
+#endif  // CPU_CAPABILITY_RVV
