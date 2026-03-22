@@ -18,24 +18,13 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
-from .rvv_utils import rope_precision
+from .rvv_utils import has_sgl_kernel_op, precision
 
 torch.manual_seed(1234)
 
 
-def has_sgl_kernel_rope():
-    """Return True only if the RVV rotary_embedding_cpu op is registered."""
-    try:
-        import sgl_kernel  # noqa: F401
-
-        _ = torch.ops.sgl_kernel.rotary_embedding_cpu
-        return True
-    except (ImportError, AttributeError):
-        return False
-
-
 @unittest.skipUnless(
-    has_sgl_kernel_rope(),
+    has_sgl_kernel_op("rotary_embedding_cpu"),
     "sgl_kernel rotary_embedding_cpu not available (non-RISC-V build)",
 )
 class TestRVVRopeCore(CustomTestCase):
@@ -51,6 +40,10 @@ class TestRVVRopeCore(CustomTestCase):
         (128, 128, 2048, 10000, False, torch.float16, "cpu", 2, 512, 32, 8),
         (128, 128, 2048, 10000, False, torch.bfloat16, "cpu", 2, 512, 16, 4),
         (512, 128, 311, 10000, False, torch.bfloat16, "cpu", 3, 39, 4, 2),
+        # Non-neox tail case: rotary_dim=96 → embed_dim=48, vl_max=32 → tail of 16
+        # Exercises the j += vl loop when embed_dim % vl_max != 0 in compute_body.
+        (128, 96, 2048, 10000, False, torch.bfloat16, "cpu", 2, 64, 8, 2),
+        (128, 96, 2048, 10000, False, torch.float16, "cpu", 2, 64, 8, 2),
     ]
 
     def run_case_rope_core(
@@ -92,7 +85,11 @@ class TestRVVRopeCore(CustomTestCase):
             dtype=dtype,
             device=device,
         )
-        if dims == 4:
+        if dims == 3:
+            # 3D layout: [num_tokens, num_heads, head_size] — requires num_kv_heads == 1
+            query = query.view(batch_size * seq_len, num_q_heads, head_size)
+            key = key.view(batch_size * seq_len, num_kv_heads, head_size)
+        elif dims == 4:
             query = query.view(batch_size, seq_len, num_q_heads, head_size)
             key = key.view(batch_size, seq_len, num_kv_heads, head_size)
         query_ref, key_ref = query.clone(), key.clone()
@@ -109,7 +106,7 @@ class TestRVVRopeCore(CustomTestCase):
             rope_ref.cos_sin_cache.to(query.dtype),
             rope_ref.is_neox_style,
         )
-        atol = rtol = rope_precision[dtype]
+        atol = rtol = precision["rope"][dtype]
         torch.testing.assert_close(query_ref_out, query_cpu_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(key_ref_out, key_cpu_out, atol=atol, rtol=rtol)
 
@@ -159,7 +156,7 @@ class TestRVVRopeCore(CustomTestCase):
 
 
 @unittest.skipUnless(
-    has_sgl_kernel_rope(),
+    has_sgl_kernel_op("rotary_embedding_cpu"),
     "sgl_kernel rotary_embedding_cpu not available (non-RISC-V build)",
 )
 class TestRVVRopeDeepseekV2(CustomTestCase):
@@ -196,8 +193,12 @@ class TestRVVRopeDeepseekV2(CustomTestCase):
         )
         rope.register_buffer("cos_sin_cache", cos_sin_cache)
 
-        for dtype in [torch.bfloat16]:
-            with torch.no_grad(), torch.amp.autocast("cpu", enabled=True):
+        for dtype in [torch.bfloat16, torch.float16]:
+            # cos_sin_cache and rope buffer must match the query dtype.
+            cs_cache = cos_sin_cache.to(dtype)
+            rope.register_buffer("cos_sin_cache", cs_cache)
+
+            with torch.no_grad():
                 q = torch.randn(seq_len, num_head, q_head_dim, dtype=dtype)
                 q_clone = q.clone()
                 k = torch.randn(seq_len, 1, k_dim, dtype=dtype)
@@ -220,13 +221,67 @@ class TestRVVRopeDeepseekV2(CustomTestCase):
                     q_pe_clone,
                     k_pe_clone,
                     rope.head_size,
-                    cos_sin_cache,
+                    cs_cache,
                     False,
                 )
 
-                atol = rtol = rope_precision[q_pe.dtype]
+                atol = rtol = precision["rope"][q_pe.dtype]
                 torch.testing.assert_close(q_pe, q_pe_clone, atol=atol, rtol=rtol)
                 torch.testing.assert_close(k_pe, k_pe_clone, atol=atol, rtol=rtol)
+
+
+@unittest.skipUnless(
+    has_sgl_kernel_op("rotary_embedding_cpu"),
+    "sgl_kernel rotary_embedding_cpu not available (non-RISC-V build)",
+)
+class TestRVVRope3D(TestRVVRopeCore):
+    """Test suite for the 3D RoPE kernel path (num_kv_heads == 1, non-neox only)."""
+
+    # Config: (head_size, rotary_dim, max_pos, base, is_neox, dtype, device, batch, seq, q_heads, kv_heads)
+    # 3D requires num_kv_heads == 1 (enforced by TORCH_CHECK in rope.cpp)
+    test_config_3d = [
+        (128, 64, 2048, 10000, False, torch.bfloat16, "cpu", 2, 32, 8, 1),
+        (64, 64, 512, 8000, False, torch.float16, "cpu", 4, 16, 4, 1),
+        (128, 128, 2048, 10000, False, torch.bfloat16, "cpu", 2, 64, 16, 1),
+    ]
+
+    def test_case_rope_3d(self):
+        """3D RoPE kernel correctness (non-neox, num_kv_heads=1)."""
+        for cfg in self.test_config_3d:
+            hs, rd, mp, base, neox, dt, dev, bs, sl, qh, kvh = cfg
+            with self.subTest(head_size=hs, rotary_dim=rd, batch=bs, seq=sl, dtype=dt):
+                self.run_case_rope_core(
+                    head_size=hs,
+                    rotary_dim=rd,
+                    max_position_embeddings=mp,
+                    base=base,
+                    batch_size=bs,
+                    seq_len=sl,
+                    num_q_heads=qh,
+                    num_kv_heads=kvh,
+                    dims=3,
+                    is_neox_style=neox,
+                    device=dev,
+                    dtype=dt,
+                )
+
+    def test_case_rope_3d_neox_raises(self):
+        """3D RoPE must raise TORCH_CHECK when is_neox=True."""
+        with self.assertRaises(RuntimeError):
+            self.run_case_rope_core(
+                head_size=128,
+                rotary_dim=64,
+                max_position_embeddings=2048,
+                base=10000,
+                batch_size=2,
+                seq_len=32,
+                num_q_heads=8,
+                num_kv_heads=1,
+                dims=3,
+                is_neox_style=True,
+                device="cpu",
+                dtype=torch.bfloat16,
+            )
 
 
 if __name__ == "__main__":

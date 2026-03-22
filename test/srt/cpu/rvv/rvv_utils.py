@@ -31,40 +31,20 @@ def has_sgl_kernel_op(op_name: str) -> bool:
         return False
 
 
-# Precision tolerances for RVV tests
+# Precision tolerances for RVV tests: precision[op][dtype].
+# "default" covers pointwise / norm / activation ops.
+# logit_cap fp16 needs 10× looser: tanh Horner accumulates extra rounding;
+# bf16's wider default (3e-2) already absorbs it.
 precision = {
-    torch.bfloat16: 3e-2,
-    torch.float16: 1e-3,
-    torch.float32: 1e-5,
-}
-
-# Specific tolerances for GEMM which naturally accumulates more floating point errors
-gemm_precision = {
-    torch.bfloat16: 1.5e-1,
-    torch.float16: 1e-1,
-}
-
-# Tolerances for fused sigmoid-mul which involves non-linear accumulation
-sigmoid_mul_precision = {
-    torch.bfloat16: 0.5,
-    torch.float16: 2e-1,
-}
-
-# Tolerances for rotary embedding (sin/cos accumulate more fp error than point-wise ops)
-rope_precision = {
-    torch.bfloat16: 3e-2,
-    torch.float16: 1e-2,
-}
-
-# Quantization error tolerances for INT8 decode/extend attention
-int8_decode_precision = {
-    torch.bfloat16: 0.15,
-    torch.float16: 0.15,
-}
-
-int8_extend_precision = {
-    torch.bfloat16: 0.5,
-    torch.float16: 0.5,
+    "default": {torch.bfloat16: 3e-2, torch.float16: 1e-3, torch.float32: 1e-5},
+    "gemm": {torch.bfloat16: 1.5e-1, torch.float16: 1e-1},
+    "rope": {torch.bfloat16: 3e-2, torch.float16: 1e-2},
+    "int8_decode": {torch.bfloat16: 0.15, torch.float16: 0.15},
+    "int8_extend": {torch.bfloat16: 0.5, torch.float16: 0.5},
+    "logit_cap": {torch.float16: 1e-2},
+    # Decode/extend attention: kv-split accumulation adds extra exp() passes that
+    # inflate FP16 relative error on near-zero outputs beyond the "default" 1e-3.
+    "attention": {torch.bfloat16: 3e-2, torch.float16: 5e-2, torch.float32: 1e-5},
 }
 
 
@@ -79,6 +59,7 @@ def run_sdpa_forward_decode(
     scaling=None,
     enable_gqa=False,
     causal=False,
+    logit_cap=0.0,
     key: torch.Tensor = None,
     loc: torch.Tensor = None,
 ):
@@ -105,18 +86,40 @@ def run_sdpa_forward_decode(
         per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
         per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-        per_req_out = (
-            scaled_dot_product_attention(
-                per_req_query.unsqueeze(0),
-                per_req_key.unsqueeze(0),
-                per_req_value.unsqueeze(0),
-                enable_gqa=enable_gqa,
-                scale=scaling,
-                is_causal=causal,
+        if logit_cap > 0:
+            # Manual attention: apply tanh softcap to logits before softmax.
+            # q: [H_Q, seq_q, D], k: [H_KV, Tk, D], v: [H_KV, Tk, D_V]
+            q = per_req_query.unsqueeze(0).float()  # [1, H_Q, seq_q, D]
+            k = per_req_key.unsqueeze(0).float()  # [1, H_KV, Tk, D]
+            v = per_req_value.unsqueeze(0).float()  # [1, H_KV, Tk, D_V]
+            if enable_gqa:
+                G = q.size(1) // k.size(1)
+                k = k.repeat_interleave(G, dim=1)  # [1, H_Q, Tk, D]
+                v = v.repeat_interleave(G, dim=1)  # [1, H_Q, Tk, D_V]
+            scores = torch.matmul(
+                q * scaling, k.transpose(-1, -2)
+            )  # [1, H_Q, seq_q, Tk]
+            scores = logit_cap * torch.tanh(scores / logit_cap)
+            weights = torch.softmax(scores, dim=-1)
+            per_req_out = (
+                torch.matmul(weights, v)
+                .to(per_req_query.dtype)
+                .squeeze(0)
+                .movedim(query.dim() - 2, 0)
             )
-            .squeeze(0)
-            .movedim(query.dim() - 2, 0)
-        )
+        else:
+            per_req_out = (
+                scaled_dot_product_attention(
+                    per_req_query.unsqueeze(0),
+                    per_req_key.unsqueeze(0),
+                    per_req_value.unsqueeze(0),
+                    enable_gqa=enable_gqa,
+                    scale=scaling,
+                    is_causal=causal,
+                )
+                .squeeze(0)
+                .movedim(query.dim() - 2, 0)
+            )
         output[start_q:end_q, :, :] = per_req_out
         start_q, start_kv = end_q, end_kv
 

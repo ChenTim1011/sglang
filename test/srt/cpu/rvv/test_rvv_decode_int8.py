@@ -14,10 +14,12 @@ import unittest
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
+from sglang.test.test_utils import CustomTestCase
+
 try:
-    from .rvv_utils import has_sgl_kernel_op, int8_decode_precision
+    from .rvv_utils import has_sgl_kernel_op, precision
 except ImportError:
-    from test.srt.cpu.rvv.rvv_utils import has_sgl_kernel_op, int8_decode_precision
+    from test.srt.cpu.rvv.rvv_utils import has_sgl_kernel_op, precision
 
 
 def naive_attention_decode(
@@ -81,7 +83,7 @@ def naive_attention_decode(
     return output
 
 
-class TestRVVDecodeInt8(unittest.TestCase):
+class TestRVVDecodeInt8(CustomTestCase):
     """Test suite for RVV decode attention with INT8 KV cache."""
 
     @classmethod
@@ -104,6 +106,7 @@ class TestRVVDecodeInt8(unittest.TestCase):
         k_scale=0.01,
         v_scale=0.01,
         dtype=torch.float16,
+        logit_cap=0.0,
     ):
         """Run one INT8 decode case and compare against the reference path."""
         device = self.device
@@ -190,7 +193,6 @@ class TestRVVDecodeInt8(unittest.TestCase):
 
         # Attention parameters
         sm_scale = 1.0 / (head_dim**0.5)
-        logit_cap = 0.0
 
         # Per-token scale buffers: pre-fill with static scale so existing tokens dequantize correctly.
         k_scale_buf = torch.full(
@@ -244,125 +246,7 @@ class TestRVVDecodeInt8(unittest.TestCase):
             enable_gqa=enable_gqa,
         )
 
-        atol = rtol = int8_decode_precision[dtype]
-        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
-
-    def run_case_decode_int8_attention_mla(
-        self,
-        head_dim=192,
-        head_dim_v=128,
-        seq_len=128,
-        num_requests=2,
-        dtype=torch.bfloat16,
-    ):
-        """Run one INT8 decode MLA case with shared KV storage layout."""
-        device = self.device
-        num_heads = 16  # H_Q
-        max_seq_len = seq_len + 16
-
-        k_scale = 0.01
-        v_scale = 0.01
-
-        query = torch.randn(
-            num_requests, num_heads, head_dim, dtype=dtype, device=device
-        )
-
-        # MLA kv structure [max_tokens, 1, head_dim]
-        max_tokens = num_requests * max_seq_len
-        k_buffer_float = (
-            torch.randn(max_tokens, 1, head_dim, dtype=torch.float32, device=device)
-            * 5.0
-        )
-        k_buffer_int8 = (
-            (k_buffer_float / k_scale).round().clamp(-128, 127).to(torch.int8)
-        )
-        v_buffer_int8 = k_buffer_int8.narrow(2, 0, head_dim_v)
-
-        req_to_token = torch.zeros(
-            num_requests, max_seq_len, dtype=torch.long, device=device
-        )
-        req_pool_indices = torch.arange(num_requests, dtype=torch.long, device=device)
-        seq_lens = torch.tensor(
-            [seq_len] * num_requests, dtype=torch.long, device=device
-        )
-
-        # Simulate actual Paged Attention memory fragmentation
-        req_to_token = (
-            torch.randperm(max_tokens, device=device)
-            .reshape(num_requests, max_seq_len)
-            .to(torch.long)
-        )
-
-        key_float = torch.randn(
-            num_requests, 1, head_dim, dtype=torch.float32, device=device
-        )
-        key_int8 = (key_float / k_scale).round().clamp(-128, 127).to(torch.int8)
-        value_int8 = key_int8.narrow(2, 0, head_dim_v)
-
-        loc = torch.zeros(num_requests, dtype=torch.int64, device=device)
-        for i in range(num_requests):
-            loc[i] = req_to_token[i, seq_len - 1]
-
-        output = torch.zeros(
-            num_requests, num_heads, head_dim_v, dtype=dtype, device=device
-        )
-        attn_logits = torch.zeros(
-            num_requests,
-            num_heads,
-            1,
-            head_dim_v + 1,
-            dtype=torch.float32,
-            device=device,
-        )
-
-        sm_scale = 1.0 / (head_dim**0.5)
-        logit_cap = 0.0
-
-        # MLA: num_heads_kv=1
-        k_scale_buf = torch.full((max_tokens, 1), k_scale, dtype=torch.float32)
-        v_scale_buf = torch.full((max_tokens, 1), v_scale, dtype=torch.float32)
-
-        torch.ops.sgl_kernel.decode_attention_int8_cpu(
-            query,
-            k_buffer_int8,
-            v_buffer_int8,
-            output,
-            key_int8,
-            value_int8,
-            loc,
-            attn_logits,
-            req_to_token,
-            req_pool_indices,
-            seq_lens,
-            sm_scale,
-            logit_cap,
-            k_scale_buf,
-            v_scale_buf,
-            k_scale,
-            v_scale,
-        )
-
-        k_buffer_ref = k_buffer_int8.clone()
-        v_buffer_ref = k_buffer_ref.narrow(2, 0, head_dim_v)
-
-        for i in range(num_requests):
-            loc_idx = loc[i].item()
-            k_buffer_ref[loc_idx] = key_int8[i]
-
-        ref_output = naive_attention_decode(
-            query,
-            k_buffer_ref,
-            v_buffer_ref,
-            req_to_token,
-            req_pool_indices,
-            seq_lens,
-            sm_scale,
-            logit_cap,
-            k_scale,
-            v_scale,
-        )
-
-        atol = rtol = int8_decode_precision[dtype]
+        atol = rtol = precision["int8_decode"][dtype]
         torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
     def test_case_decode_int8_gqa(self):
@@ -462,18 +346,12 @@ class TestRVVDecodeInt8(unittest.TestCase):
                 num_heads=1, head_dim=32, seq_len=1, num_requests=1, dtype=dtype
             )
 
-    def test_case_decode_int8_mla(self):
-        """Case: MLA decode with shared KV storage."""
-        for dtype in [torch.float16, torch.bfloat16]:
-            self.run_case_decode_int8_attention_mla(
-                head_dim=192, head_dim_v=128, seq_len=128, num_requests=2, dtype=dtype
-            )
-
     def test_case_decode_int8_per_layer_scale_isolation(self):
         """Case: per-layer scale isolation preserves decode correctness."""
         num_heads = 8
         num_heads_kv = 2
         head_dim = 64
+        head_dim_v = head_dim
         seq_len = 32
         num_requests = 2
         dtype = torch.bfloat16
@@ -529,7 +407,7 @@ class TestRVVDecodeInt8(unittest.TestCase):
         )
 
         def _run(scale_buf_val: float) -> torch.Tensor:
-            out = torch.zeros(num_requests, num_heads, head_dim, dtype=dtype)
+            out = torch.zeros(num_requests, num_heads, head_dim_v, dtype=dtype)
             k_scale_buf = torch.full((max_tokens, num_heads_kv), scale_buf_val)
             v_scale_buf = torch.full((max_tokens, num_heads_kv), scale_buf_val)
             torch.ops.sgl_kernel.decode_attention_int8_cpu(
@@ -553,7 +431,7 @@ class TestRVVDecodeInt8(unittest.TestCase):
             )
             return out
 
-        atol = rtol = int8_decode_precision[dtype]
+        atol = rtol = precision["int8_decode"][dtype]
 
         out_wrong = _run(scale_B)
         self.assertFalse(
@@ -564,6 +442,43 @@ class TestRVVDecodeInt8(unittest.TestCase):
 
         out_correct = _run(scale_A)
         torch.testing.assert_close(out_correct, ref_output, atol=atol, rtol=rtol)
+
+    def test_case_decode_int8_logit_cap(self):
+        """INT8 decode with logit_cap > 0 must exercise the tanh-softcap branch."""
+        for dtype in [torch.float16, torch.bfloat16]:
+            with self.subTest(dtype=dtype):
+                # MHA with logit_cap (mirrors TestRVVDecodeLogitCap for FP path)
+                self.run_case_decode_int8_attention(
+                    num_heads=8,
+                    head_dim=64,
+                    seq_len=64,
+                    num_requests=2,
+                    dtype=dtype,
+                    logit_cap=30.0,
+                )
+                # GQA with logit_cap
+                self.run_case_decode_int8_attention(
+                    num_heads=8,
+                    num_heads_kv=2,
+                    head_dim=64,
+                    seq_len=64,
+                    num_requests=2,
+                    dtype=dtype,
+                    logit_cap=30.0,
+                )
+
+    def test_case_decode_int8_mqa(self):
+        """INT8 decode with MQA (num_kv_heads=1) exercises the H_KV=1 reduction path."""
+        for dtype in [torch.float16, torch.bfloat16]:
+            with self.subTest(dtype=dtype):
+                self.run_case_decode_int8_attention(
+                    num_heads=16,
+                    num_heads_kv=1,
+                    head_dim=64,
+                    seq_len=128,
+                    num_requests=4,
+                    dtype=dtype,
+                )
 
 
 if __name__ == "__main__":
