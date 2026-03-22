@@ -258,8 +258,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-        elif _is_cpu and _is_cpu_rvv_available:
-            _rvv_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:

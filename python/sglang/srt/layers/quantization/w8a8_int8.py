@@ -225,6 +225,10 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             )
         elif use_riscv_rvv_backend(layer):
             return rvv_linear_forward(x, layer, bias)
+        elif _is_cpu:
+            raise RuntimeError(
+                "W8A8Int8LinearMethod on CPU requires Intel AMX or RISC-V RVV support"
+            )
         x_q, x_scale = per_token_quant_int8(x)
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
@@ -325,10 +329,11 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         if _is_cpu:
             if _is_cpu_amx_available:
                 _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-            elif _is_cpu_rvv_available:
-                _rvv_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             else:
-                assert False, "W8A8Int8MoEMethod on CPU only works on AMX or RISC-V"
+                raise RuntimeError(
+                    "W8A8Int8MoEMethod on CPU requires Intel AMX. "
+                    "RVV is supported for dense INT8 linear but not for MoE."
+                )
         else:
             layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
             layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
