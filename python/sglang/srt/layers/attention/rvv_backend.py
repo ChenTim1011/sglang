@@ -16,7 +16,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Number of KV splits for the decode kernel's partial-softmax reduction.
-_NUM_KV_SPLITS = 8
+# Set to 1 for single-core RISC-V boards
+# Increase this for future multi-core RISC-V hardware
+_NUM_KV_SPLITS = 1
 
 
 class RVVAttnBackend(AttentionBackend):
@@ -33,26 +35,19 @@ class RVVAttnBackend(AttentionBackend):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
-        # Keep private reference only for lazy fallback construction.
-        self._model_runner_ref = model_runner
         self.device = "cpu"
         self.use_rvv_kernels = False
         self.num_head = 0
         self.v_head_dim = 0
-        self._fallback_backend = None
+
+        from sglang.srt.layers.attention.torch_native_backend import (
+            TorchNativeAttnBackend,
+        )
+
+        self.fallback_backend = TorchNativeAttnBackend(model_runner)
 
         if cpu_has_rvv_support():
             self._try_init_rvv_kernels(model_runner)
-
-    @property
-    def fallback_backend(self):
-        if self._fallback_backend is None:
-            from sglang.srt.layers.attention.torch_native_backend import (
-                TorchNativeAttnBackend,
-            )
-
-            self._fallback_backend = TorchNativeAttnBackend(self._model_runner_ref)
-        return self._fallback_backend
 
     def _try_init_rvv_kernels(self, model_runner: ModelRunner):
         try:
@@ -63,6 +58,11 @@ class RVVAttnBackend(AttentionBackend):
             layer_id = 0
             if hasattr(pool, "full_attention_layer_id_mapping"):
                 layer_id = next(iter(pool.full_attention_layer_id_mapping))
+            else:
+                logger.debug(
+                    "[RVV] pool has no full_attention_layer_id_mapping; "
+                    "using layer_id=0 for buffer shape probing."
+                )
 
             self.num_head = (
                 model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -80,14 +80,22 @@ class RVVAttnBackend(AttentionBackend):
                     self.extend_fwd_impl = ops.extend_attention_int8_cpu
                     kernels_available = True
                 except AttributeError:
-                    pass
+                    logger.warning(
+                        "[RVV] INT8 attention kernels (decode_attention_int8_cpu / "
+                        "extend_attention_int8_cpu) not found in sgl_kernel. "
+                        "Falling back to TorchNative. Build with RVV INT8 support to enable."
+                    )
             else:
                 try:
                     self.decode_fwd_impl = ops.decode_attention_cpu
                     self.extend_fwd_impl = ops.extend_attention_cpu
                     kernels_available = True
                 except AttributeError:
-                    pass
+                    logger.warning(
+                        "[RVV] FP attention kernels (decode_attention_cpu / "
+                        "extend_attention_cpu) not found in sgl_kernel. "
+                        "Falling back to TorchNative."
+                    )
 
             if kernels_available:
                 # Pre-allocate attn_logits pool once; sliced per batch at runtime.
@@ -121,13 +129,30 @@ class RVVAttnBackend(AttentionBackend):
                     f"[RVV] Initialized. Mode={'INT8' if self.is_int8 else 'FLOAT'}"
                 )
 
+        except StopIteration:
+            logger.warning(
+                "[RVV] Init failed: full_attention_layer_id_mapping is empty — "
+                "pool may be uninitialized or model has no full-attention layers. "
+                "Falling back to TorchNative."
+            )
+        except (AttributeError, RuntimeError, MemoryError) as e:
+            logger.warning(
+                "[RVV] Init failed, falling back to TorchNative. Reason: %s",
+                e,
+                exc_info=True,
+            )
         except Exception as e:
-            logger.warning(f"[RVV] Init failed: {e}. Fallback to Native.")
+            logger.error(
+                "[RVV] Unexpected error during init — this is likely a bug: %s",
+                e,
+                exc_info=True,
+            )
+            raise
 
     @staticmethod
     def _ensure_cached_scales(layer: RadixAttention):
         """Cache quantization scales on first call to avoid repeated .item() calls."""
-        if getattr(layer, "_cached_k_scale_float", None) is not None:
+        if getattr(layer, "_rvv_scales_cached", False):
             return
 
         def _resolve(src_attr: str, fallback_attr: str) -> float:
@@ -140,15 +165,23 @@ class RVVAttnBackend(AttentionBackend):
             fallback = getattr(layer, fallback_attr, None)
             if fallback is not None:
                 return float(fallback)
-            logger.debug(
-                f"[RVV] {src_attr} and {fallback_attr} are both None on layer "
-                f"{type(layer).__name__}; defaulting scale to 1.0 "
-                "(expected for dynamic quantization)."
+            logger.warning(
+                "[RVV] %s and %s are both None on layer %s; defaulting scale to 1.0. "
+                "If this layer uses static quantization, the weight attribute name may be wrong.",
+                src_attr,
+                fallback_attr,
+                type(layer).__name__,
             )
             return 1.0
 
-        layer._cached_k_scale_float = _resolve("k_scale", "k_scale_float")
-        layer._cached_v_scale_float = _resolve("v_scale", "v_scale_float")
+        k_scale = _resolve("k_scale", "k_scale_float")
+        v_scale = _resolve("v_scale", "v_scale_float")
+        # Assign both scales before setting the done flag to avoid a partial-write
+        # race condition in tensor-parallel (another thread may check the flag after
+        # k_scale is written but before v_scale is written).
+        layer._cached_k_scale_float = k_scale
+        layer._cached_v_scale_float = v_scale
+        layer._rvv_scales_cached = True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if not self.use_rvv_kernels:
@@ -156,11 +189,17 @@ class RVVAttnBackend(AttentionBackend):
 
         # Zero-allocation slice from the pre-allocated pool.
         bs = forward_batch.batch_size
+        if bs > self._attn_logits_pool.shape[0]:
+            raise RuntimeError(
+                f"[RVV] batch_size {bs} exceeds pre-allocated pool size "
+                f"{self._attn_logits_pool.shape[0]}. Re-initialize with a larger pool."
+            )
         attn_logits = self._attn_logits_pool[:bs]
 
         max_extend_len = 0
         if not forward_batch.forward_mode.is_decode_or_idle():
-            max_extend_len = forward_batch.extend_seq_lens.max().item()
+            if forward_batch.extend_seq_lens is not None:
+                max_extend_len = forward_batch.extend_seq_lens.max().item()
 
         self.forward_metadata = (attn_logits, max_extend_len)
 
@@ -174,6 +213,14 @@ class RVVAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         if self.use_rvv_kernels:
+            if not save_kv_cache:
+                # The RVV decode kernel always writes K/V to the cache internally.
+                # When save_kv_cache=False (speculative decoding verification pass),
+                # fall back to TorchNative which correctly skips cache writes.
+                return self.fallback_backend.forward_decode(
+                    q, k, v, layer, forward_batch, save_kv_cache
+                )
+
             loc = (
                 forward_batch.encoder_out_cache_loc
                 if (
@@ -216,7 +263,10 @@ class RVVAttnBackend(AttentionBackend):
             self.decode_fwd_impl(*args)
             return o
 
-        # Fallback path
+        logger.warning_once(
+            "[RVV] forward_decode: RVV kernels not active, using TorchNative fallback. "
+            "Check startup logs for init failure details."
+        )
         return self.fallback_backend.forward_decode(
             q, k, v, layer, forward_batch, save_kv_cache
         )
@@ -234,11 +284,23 @@ class RVVAttnBackend(AttentionBackend):
             # Cross-attention: the RVV extend kernel only supports causal (self-)
             # attention.  Fall back to TorchNative which correctly sets causal=False.
             if layer.is_cross_attention:
+                logger.warning_once(
+                    "[RVV] forward_extend: cross-attention is not supported by the RVV "
+                    "extend kernel; falling back to TorchNative for cross-attention layers."
+                )
                 return self.fallback_backend.forward_extend(
                     q, k, v, layer, forward_batch, save_kv_cache
                 )
 
             pool = forward_batch.token_to_kv_pool
+
+            if self.is_int8 and not save_kv_cache:
+                # The INT8 extend kernel writes quantized K/V to the cache internally
+                # with no way to suppress it.  When save_kv_cache=False (speculative
+                # decoding verification pass), fall back to TorchNative.
+                return self.fallback_backend.forward_extend(
+                    q, k, v, layer, forward_batch, save_kv_cache
+                )
 
             if save_kv_cache and not self.is_int8:
                 # FP path: Python writes K/V to the cache pool before the kernel reads it.
@@ -281,7 +343,10 @@ class RVVAttnBackend(AttentionBackend):
             self.extend_fwd_impl(*args)
             return o
 
-        # Fallback path
+        logger.warning_once(
+            "[RVV] forward_extend: RVV kernels not active, using TorchNative fallback. "
+            "Check startup logs for init failure details."
+        )
         return self.fallback_backend.forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache
         )

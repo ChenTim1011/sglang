@@ -264,8 +264,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-        elif _is_cpu and _is_cpu_rvv_available:
-            _rvv_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
         if (
             self.use_deep_gemm

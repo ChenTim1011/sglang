@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from sglang.srt.layers.rvv_utils import probe_rvv_op
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -32,6 +33,9 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_rvv_available = cpu_has_rvv_support()
 _is_cpu = is_cpu()
+
+if _is_cpu_rvv_available:
+    _is_cpu_rvv_available = probe_rvv_op("rotary_embedding_cpu")
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_mps = is_mps()
