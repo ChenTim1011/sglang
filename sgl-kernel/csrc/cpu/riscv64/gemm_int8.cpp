@@ -3,20 +3,17 @@
 #endif
 
 #include "common.h"
-#include "gemm.h"
 #include "riscv64/gemm.h"
-#include "vector_helpers.h"
+#include "riscv64/vector_helpers.h"
 
 #if defined(CPU_CAPABILITY_RVV)
-// Clang 19+ version check
-#if !defined(__clang__) || !defined(__clang_major__) || __clang_major__ < 19
-#error "RVV backend requires Clang 19 or later. Please use Clang 19 or later to compile this file."
-#endif
 #include <riscv_vector.h>
 
 #include <algorithm>
 #include <cmath>
 using namespace rvv_constants;
+
+namespace {
 
 template <typename scalar_t, bool has_bias, int BLOCK_N>
 struct scale_C {
@@ -92,23 +89,29 @@ struct tinygemm_kernel_nn {
       }
 
       // K loop: B layout is [NB, K, BLOCK_N]
+      // K-tiling: target B footprint ≈ L1/2; vl_max_m4 = VLEN/8; INT8: KB = L1*4/VLEN.
+      // Override L1 assumption: cmake -DRVV_L1_CACHE_KB=N (default 32KB).
       const int8_t* b_ptr_base = B + nb * K * BLOCK_N + j;
-      for (int64_t k = 0; k < K; ++k) {
-        // Prefetch next B block
-        if (k + 2 < K) {
-          __builtin_prefetch(b_ptr_base + (k + 2) * BLOCK_N, 0, 1);
-        }
+      constexpr int64_t KB = rvv_constants::L1_CACHE_BYTES * 4 / __riscv_v_fixed_vlen;
+      for (int64_t k_tile = 0; k_tile < K; k_tile += KB) {
+        const int64_t k_end = std::min(k_tile + KB, K);
+        for (int64_t k = k_tile; k < k_end; ++k) {
+          // Prefetch next B block
+          if (k + 2 < K) {
+            __builtin_prefetch(b_ptr_base + (k + 2) * BLOCK_N, 0, 1);
+          }
 
-        const int8_t* b_ptr = b_ptr_base + k * BLOCK_N;
-        vint8m1_t v_b_i8 = __riscv_vle8_v_i8m1(b_ptr, vl);
-        vint16m2_t v_b_i16 = __riscv_vsext_vf2_i16m2(v_b_i8, vl);
+          const int8_t* b_ptr = b_ptr_base + k * BLOCK_N;
+          vint8m1_t v_b_i8 = __riscv_vle8_v_i8m1(b_ptr, vl);
+          vint16m2_t v_b_i16 = __riscv_vsext_vf2_i16m2(v_b_i8, vl);
 
-        for (int m = 0; m < BLOCK_M; ++m) {
-          int8_t a_val = A[m * lda + k];
-          if (a_val == 0) continue;
-          *v_acc[m] = __riscv_vwmacc_vx_i32m4(*v_acc[m], static_cast<int16_t>(a_val), v_b_i16, vl);
+          for (int m = 0; m < BLOCK_M; ++m) {
+            int8_t a_val = A[m * lda + k];
+            if (a_val == 0) continue;
+            *v_acc[m] = __riscv_vwmacc_vx_i32m4(*v_acc[m], static_cast<int16_t>(a_val), v_b_i16, vl);
+          }
         }
-      }
+      }  // k_tile
 
       // Dequantize and store each row
       for (int m = 0; m < BLOCK_M; ++m) {
@@ -154,11 +157,9 @@ void tinygemm_kernel(
     int64_t K,
     int64_t lda,
     int64_t ldc) {
-  // BLOCK_N = block_size_n() = rvv_constants::BLOCK_N = __riscv_v_fixed_vlen / 4.
-  // NB_SIZE template parameter must equal the packed-B stride (BLOCK_N), not nb_size,
-  // so the k-stride is correct for both full and tail tiles.
-  constexpr int64_t BLOCK_M = block_size_m();
-  constexpr int64_t BLOCK_N = block_size_n();
+  // NB_SIZE template arg == BLOCK_N (pack stride); inner loop uses runtime nb_size for tail tiles.
+  constexpr int64_t BLOCK_M = GEMM_TILE_M;
+  constexpr int64_t BLOCK_N = rvv_constants::BLOCK_N;
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
@@ -200,8 +201,8 @@ void int8_scaled_mm_kernel_impl(
     int64_t M,
     int64_t N,
     int64_t K) {
-  constexpr int64_t BLOCK_M = block_size_m();
-  constexpr int64_t BLOCK_N = block_size_n();
+  constexpr int64_t BLOCK_M = GEMM_TILE_M;
+  constexpr int64_t BLOCK_N = rvv_constants::BLOCK_N;
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
@@ -232,6 +233,8 @@ void int8_scaled_mm_kernel_impl(
     });
   });
 }
+
+}  // anonymous namespace
 
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A) {
   RECORD_FUNCTION("sgl-kernel::per_token_quant_int8_cpu", std::vector<c10::IValue>({A}));
@@ -275,17 +278,20 @@ at::Tensor int8_scaled_mm_cpu(
     at::Tensor& scales2,
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
-    bool is_vnni) {
+    // is_packed: true = weight already in RVV block-N format, skip repacking.
+    // Declaration uses is_vnni for API consistency with x86 backend;
+    // renamed here because RVV has no VNNI hardware — is_vnni is misleading.
+    bool is_packed) {
   RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales1, scales2, bias}));
 
-  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
+  auto packed_w = is_packed ? mat2 : convert_weight_packed(mat2);
 
   CHECK_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scales1);
   CHECK_INPUT(scales2);
   CHECK_DIM(2, mat1);
-  if (!is_vnni) {
+  if (!is_packed) {
     CHECK_DIM(2, mat2);
   }
 
@@ -293,7 +299,7 @@ at::Tensor int8_scaled_mm_cpu(
   int64_t K = mat1.size(1);
   int64_t N = mat2.size(0);
 
-  if (is_vnni) {
+  if (is_packed) {
     N = scales2.numel();
   } else {
     CHECK_EQ(scales2.numel(), N);
@@ -334,7 +340,7 @@ at::Tensor int8_scaled_mm_cpu(
     int8_scaled_mm_kernel_impl<scalar_t>(
         out.data_ptr<scalar_t>(),
         reinterpret_cast<const int8_t*>(mat1.data_ptr()),
-        reinterpret_cast<const int8_t*>(mat2.data_ptr()),
+        reinterpret_cast<const int8_t*>(packed_w.data_ptr()),
         scales1_1d.data_ptr<float>(),
         scales2_1d.data_ptr<float>(),
         bias_data,
@@ -352,16 +358,19 @@ at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& scales2,
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
-    bool is_vnni) {
+    // is_packed: true = weight already in RVV block-N format, skip repacking.
+    // Declaration uses is_vnni for API consistency with x86 backend;
+    // renamed here because RVV has no VNNI hardware — is_vnni is misleading.
+    bool is_packed) {
   RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales2, bias}));
 
-  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
+  auto packed_w = is_packed ? mat2 : convert_weight_packed(mat2);
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scales2);
   CHECK_DIM(2, mat1);
-  if (!is_vnni) {
+  if (!is_packed) {
     CHECK_DIM(2, mat2);
   }
 
@@ -369,7 +378,7 @@ at::Tensor int8_scaled_mm_with_quant(
   int64_t K = mat1.size(1);
   int64_t N = mat2.size(0);
 
-  if (is_vnni) {
+  if (is_packed) {
     N = scales2.numel();
   }
 
@@ -382,7 +391,11 @@ at::Tensor int8_scaled_mm_with_quant(
   TORCH_CHECK(mat2.scalar_type() == at::kChar, "int8_scaled_mm_with_quant: expect mat2 to be int8.");
   TORCH_CHECK(scales2.scalar_type() == at::kFloat, "int8_scaled_mm_with_quant: expect scales to be float32.");
 
-  const int64_t buffer_size = M * K + M * sizeof(float);
+  // Round M*K up to a float boundary so As_data (placed after Aq) is float-aligned.
+  // alignof(float) == sizeof(float) == 4 on all supported targets.
+  constexpr int64_t kFloatAlign = static_cast<int64_t>(alignof(float));
+  const int64_t aq_bytes = ((M * K + kFloatAlign - 1) / kFloatAlign) * kFloatAlign;
+  const int64_t buffer_size = aq_bytes + M * static_cast<int64_t>(sizeof(float));
   auto buffer = at::empty({buffer_size}, mat1.options().dtype(at::kChar));
   auto out = at::empty({M, N}, mat1.options().dtype(out_dtype));
 
@@ -396,7 +409,7 @@ at::Tensor int8_scaled_mm_with_quant(
   AT_DISPATCH_RVV_TYPES(out_dtype, "int8_scaled_mm_with_quant_kernel_impl", [&]() {
     int8_t* __restrict__ buffer_ptr = buffer.data_ptr<int8_t>();
     int8_t* __restrict__ Aq_data = buffer_ptr;
-    float* __restrict__ As_data = reinterpret_cast<float*>(buffer_ptr + M * K);
+    float* __restrict__ As_data = reinterpret_cast<float*>(buffer_ptr + aq_bytes);
     const scalar_t* __restrict__ A_data = mat1.data_ptr<scalar_t>();
 
     at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {

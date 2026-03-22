@@ -200,6 +200,20 @@ at::Tensor convert_scale_packed(at::Tensor& scale);
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
 
+// gemm
+at::Tensor
+weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
+
+// gemm fusion
+#if !defined(CPU_CAPABILITY_RVV)
+at::Tensor fused_linear_sigmoid_mul(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    const std::optional<at::Tensor>& bias,
+    bool is_vnni,
+    const at::Tensor& post_mul_mat);
+#endif
+
 // igemm
 at::Tensor int8_scaled_mm_cpu(
     at::Tensor& mat1,
@@ -245,18 +259,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
     at::Tensor scales,   // awq: (*, K / group_size, N) ||  gptq: (*, K / group_size, N) , bfloat16
     int64_t quant_method_4bit);
 #endif
-
-// gemm
-at::Tensor
-weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
-
-// gemm fusion
-at::Tensor fused_linear_sigmoid_mul(
-    at::Tensor& mat1,
-    at::Tensor& mat2,
-    const std::optional<at::Tensor>& bias,
-    bool is_vnni,
-    const at::Tensor& post_mul_mat);
 
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
@@ -576,6 +578,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
 
+  // gemm
+  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");
+  m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
+
+  // gemm fusion
+#if !defined(CPU_CAPABILITY_RVV)
+  m.def(
+      "fused_linear_sigmoid_mul(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, Tensor post_mul_mat) -> Tensor");
+  m.impl("fused_linear_sigmoid_mul", torch::kCPU, &fused_linear_sigmoid_mul);
+#endif
+
   // igemm
   m.def(
       "int8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales1, Tensor scales2, Tensor? bias, ScalarType "
@@ -609,15 +622,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor, Tensor)");
   m.impl("convert_weight_packed_scale_zp", torch::kCPU, &convert_weight_packed_scale_zp);
 #endif
-
-  // gemm
-  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");
-  m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
-
-  // gemm fusion
-  m.def(
-      "fused_linear_sigmoid_mul(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, Tensor post_mul_mat) -> Tensor");
-  m.impl("fused_linear_sigmoid_mul", torch::kCPU, &fused_linear_sigmoid_mul);
 
   // bmm
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");
@@ -699,10 +703,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
 
   // multimodal rope
+#if !defined(CPU_CAPABILITY_RVV)
   m.def(
       "multimodal_rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor "
       "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> (Tensor, Tensor)");
   m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
+#endif
 
   // CPU and memory binding
 #if !defined(SGLANG_RISCV_NO_NUMA)
