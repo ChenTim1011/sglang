@@ -1,7 +1,11 @@
 """Shared helpers and numeric tolerances for RVV CPU unit tests."""
 
-# Re-export shared CPU test helpers from test.srt.cpu.utils and keep RVV-only
-# references/tolerances local to this module.
+# Module boundary:
+# - Shared helpers are imported from test.srt.cpu.utils and re-exported here
+#   for RVV tests (GeluAndMul, SiluAndMul, native_w8a8_per_token_matmul,
+#   torch_naive_fused_moe).
+# - RVV-only helpers stay local in this file (op availability checks,
+#   decode/extend references, norm references, and RVV-specific tolerances).
 
 import importlib.util
 
@@ -11,6 +15,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from ..utils import (  # noqa: F401
     GeluAndMul,
     SiluAndMul,
+    native_w8a8_per_token_matmul,
     torch_naive_fused_moe,
 )
 
@@ -26,55 +31,26 @@ def has_sgl_kernel_op(op_name: str) -> bool:
         return False
 
 
-def native_w8a8_per_token_matmul(A, B, As, Bs, bias, output_dtype=torch.bfloat16):
-    """RVV/shared CPU W8A8 reference: activation is uint8, weight is int8."""
-    A = A.to(torch.int32) - 128
-    B = B.to(torch.int32)
-
-    assert A.shape[-1] == B.shape[-1], "Dimension mismatch"
-    assert B.ndim == 2 and B.is_contiguous(), "B must be a 2D contiguous tensor"
-
-    M = A.numel() // A.shape[-1]
-    K = A.shape[-1]
-    origin_C_shape = A.shape[:-1] + (B.shape[0],)
-    A = A.reshape(M, K)
-
-    C = torch.matmul(A, B.transpose(0, 1))
-
-    As = As.reshape(M, 1).to(torch.float32)
-    C = As * C.to(torch.float32) * Bs.view(1, -1).to(torch.float32)
-
-    if bias is not None:
-        C.add_(bias.view(1, -1).to(torch.float32))
-
-    return C.reshape(origin_C_shape).to(output_dtype)
-
-
-# Numeric tolerances for shared RVV test paths: precision[key][dtype].
-# Keep keys flat and searchable; one-off special cases should override locally.
+# Precision tolerances for RVV tests: precision[op][dtype].
+# "default" covers pointwise / activation ops.
+# "attention"       decode: kv-split exp() passes inflate FP16.
+# "extend_attention" extend: GEMM+softmax+GEMM; less accumulation than decode; FP16 3e-3.
+# "logit_cap"       tanh Horner adds rounding for both FP16 and BF16.
 precision = {
-    "pointwise_default": {
-        torch.bfloat16: 3e-2,
-        torch.float16: 1e-3,
-        torch.float32: 1e-5,
-    },
+    "default": {torch.bfloat16: 3e-2, torch.float16: 1e-3, torch.float32: 1e-5},
     # FP16 layernorm+bias path can show quantized-step residuals (~1/128) on RVV.
-    "norm_layer_bias": {
+    "layernorm_bias": {
         torch.bfloat16: 3e-2,
         torch.float16: 1e-2,
         torch.float32: 1e-5,
     },
-    "linear_gemm": {torch.bfloat16: 1.5e-1, torch.float16: 1e-1},
-    "rotary_embedding": {torch.bfloat16: 3e-2, torch.float16: 1e-2},
-    "attention_decode_int8": {torch.bfloat16: 0.15, torch.float16: 0.15},
-    "attention_extend_int8": {torch.bfloat16: 5e-2, torch.float16: 5e-2},
-    "attention_decode_logit_cap": {torch.float16: 1e-2, torch.bfloat16: 1e-1},
-    "attention_decode": {
-        torch.bfloat16: 1e-1,
-        torch.float16: 7e-2,
-        torch.float32: 1e-5,
-    },
-    "attention_extend": {
+    "gemm": {torch.bfloat16: 1.5e-1, torch.float16: 1e-1},
+    "rope": {torch.bfloat16: 3e-2, torch.float16: 1e-2},
+    "int8_decode": {torch.bfloat16: 0.15, torch.float16: 0.15},
+    "int8_extend": {torch.bfloat16: 0.5, torch.float16: 0.5},
+    "logit_cap": {torch.float16: 1e-2, torch.bfloat16: 1e-1},
+    "attention": {torch.bfloat16: 1e-1, torch.float16: 7e-2, torch.float32: 1e-5},
+    "extend_attention": {
         torch.bfloat16: 1e-1,
         torch.float16: 3e-3,
         torch.float32: 1e-5,
@@ -285,4 +261,4 @@ def helper_non_contiguous(t: torch.Tensor) -> torch.Tensor:
     """Return a non-contiguous view of t by striding the batch dimension 2x."""
     buf = torch.empty(t.shape[0] * 2, *t.shape[1:], dtype=t.dtype)
     buf[::2] = t
-    return buf[::2]
+    return buf[::2]  # stride[0] = 2 × original; is_contiguous() == False
