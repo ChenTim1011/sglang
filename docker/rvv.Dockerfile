@@ -1,16 +1,16 @@
-FROM python:3.13-slim
+FROM --platform=linux/riscv64 python:3.13-slim
 SHELL ["/bin/bash", "-c"]
 
 ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
 ARG VER_SGLANG=main
 
-# NOTE: Only torch 2.8.0+spacemit.1 is currently available as a riscv64 wheel
-# TODO: Update this ARG when a 2.9.0 wheel is released.
 ARG VER_TORCH=2.8.0+spacemit.1
 ARG VER_TORCHVISION=0.23.0
 ARG VER_TRITON=3.3.0+spacemit.a0
 ARG VER_PYARROW=21.0.0
 ARG VER_VLLM=0.11.0.post3+spacemit.0.cpu
+ARG VER_LLVM=19
+ARG VER_XGRAMMAR=0.1.31
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC \
@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl wget git vim tar gzip unzip \
     libnuma-dev numactl libomp-dev libssl-dev libopenmpi-dev libsleef-dev \
     libsndfile1 \
-    clang lld llvm ccache \
+    clang-${VER_LLVM} lld-${VER_LLVM} llvm-${VER_LLVM} ccache \
     libsqlite3-dev libtbb-dev \
     libgl1 libglib2.0-0 libxrender1 libx11-6 libxext6 && \
     rm -rf /var/lib/apt/lists/*
@@ -50,6 +50,7 @@ RUN uv pip install \
     "torchvision==${VER_TORCHVISION}" \
     "triton==${VER_TRITON}" \
     "pyarrow==${VER_PYARROW}" \
+    "xgrammar==${VER_XGRAMMAR}" \
     "vllm==${VER_VLLM}" \
     --index-strategy unsafe-best-match
 
@@ -61,9 +62,10 @@ RUN git clone ${SGLANG_REPO} sglang && \
 
 # 7. Compile sgl-kernel (CLANG REQUIRED for RVV)
 WORKDIR /sgl-workspace/sglang/sgl-kernel
-RUN cp pyproject_cpu.toml pyproject.toml && \
-    export CC=clang CXX=clang++ && \
+RUN cp pyproject_riscv64.toml pyproject.toml && \
+    export CC=clang-${VER_LLVM} CXX=clang++-${VER_LLVM} && \
     uv pip install . --no-build-isolation --index-strategy unsafe-best-match
+RUN python3 -c "import sgl_kernel; print('sgl_kernel import OK after sgl-kernel build')"
 
 # 8. Install SGLang (GCC REQUIRED for XGrammar compatibility)
 WORKDIR /sgl-workspace/sglang/python
@@ -73,11 +75,11 @@ RUN cp pyproject_cpu.toml pyproject.toml && \
 RUN unset CC CXX && \
     export CXXFLAGS="-Wno-error" && \
     export RISCV_OMP_LIB_PATH=/usr/lib/riscv64-linux-gnu/libomp.so.5 && \
-    # Override torch-ecosystem version pins: SpacemiT riscv64 wheels lag behind
-    # the versions required by pyproject_cpu.toml.
+    # Override pyproject pins to the preinstalled riscv64 wheel versions.
     # TODO: Remove these overrides when SpacemiT publishes wheels matching sglang's pinned versions.
-    printf "torch>=2.8.0\ntorchvision>=0.23\ntriton>=3.3\n" > /tmp/torch-override.txt && \
+    printf "torch==${VER_TORCH}\ntorchvision==${VER_TORCHVISION}\ntriton==${VER_TRITON}\nxgrammar==${VER_XGRAMMAR}\n" > /tmp/torch-override.txt && \
     uv pip install . --override /tmp/torch-override.txt --index-strategy unsafe-best-match
+RUN python3 -c "import sgl_kernel; print('sgl_kernel import OK in final image')"
 
 # 9. Final Configuration
 ENV LD_PRELOAD="/usr/lib/riscv64-linux-gnu/libomp.so.5"
