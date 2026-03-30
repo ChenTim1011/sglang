@@ -15,20 +15,16 @@ using namespace rvv_constants;
 
 namespace {
 
-template <typename scalar_t, bool has_bias, int BLOCK_N>
+template <typename scalar_t, bool has_bias>
 struct scale_C {
   // Called with vl <= vl_max; operates on exactly vl elements (no inner loop).
   static inline void apply(
       scalar_t* __restrict__ C,
-      const int32_t* __restrict__ Ctmp,
-      const int32_t* __restrict__ Bcomp,
+      vint32m4_t v_acc_i32,
       const float* __restrict__ bias,
       float As,
       const float* __restrict__ Bs,
       size_t vl) {
-    UNUSED(Bcomp);
-
-    vint32m4_t v_acc_i32 = __riscv_vle32_v_i32m4(Ctmp, vl);
     vfloat32m4_t v_acc = __riscv_vfcvt_f_x_v_f32m4(v_acc_i32, vl);
 
     // Dequantize: C * (As * Bs) — combine scales first for better precision
@@ -46,6 +42,82 @@ struct scale_C {
   }
 };
 
+// GEMV specialization (M=1) using int32 LMUL=8.
+// VLEN=256 → vl_max_e32m8 = 64 = BLOCK_N: one N-tile pass covers all columns.
+// Register budget: acc(m8=8) + v_b_i8(m2=2) + v_b_i16(m4=4) = 14 regs; UNROLL=4 safe.
+template <typename scalar_t, bool has_bias, int BLOCK_N>
+struct tinygemm_kernel_nn_gemv {
+  static inline void apply(
+      const int8_t* __restrict__ A,
+      const int8_t* __restrict__ B,
+      scalar_t* __restrict__ C,
+      const float* __restrict__ As,
+      const float* __restrict__ Bs,
+      const float* __restrict__ bias,
+      int64_t K,
+      int64_t lda,
+      int64_t ldc,
+      int64_t nb,
+      int64_t n_size) {
+    if constexpr (has_bias) {
+      TORCH_CHECK(bias != nullptr);
+    }
+
+    const int64_t n_start = nb * BLOCK_N;
+    size_t vl_max = __riscv_vsetvlmax_e32m8();
+    size_t vl = (n_size >= (int64_t)vl_max) ? vl_max : __riscv_vsetvl_e32m8(n_size);
+
+    constexpr int64_t UNROLL = 4;
+    constexpr int64_t PREFETCH_DIST = UNROLL * 2;
+    // KB: number of K-steps fitting in L1. For int8, each K-step loads BLOCK_N bytes.
+    // BLOCK_N = VLEN/4 bits / 8 = VLEN_bits/32 bytes. KB = L1 / BLOCK_N bytes.
+    constexpr int64_t KB = rvv_constants::L1_CACHE_BYTES * 4 / __riscv_v_fixed_vlen;
+
+    vint32m8_t v_acc = __riscv_vmv_v_x_i32m8(0, vl_max);
+    const int8_t* b_ptr_base = B + nb * K * BLOCK_N;
+
+    for (int64_t k_tile = 0; k_tile < K; k_tile += KB) {
+      const int64_t k_end = std::min(k_tile + KB, K);
+      int64_t k = k_tile;
+
+      for (; k + UNROLL - 1 < k_end; k += UNROLL) {
+        if (k + PREFETCH_DIST < K) __builtin_prefetch(b_ptr_base + (k + PREFETCH_DIST) * BLOCK_N, 0, 1);
+
+        // Load B as int8 m2 (64 elements = full BLOCK_N), sign-extend to int16 m4,
+        // then widen-multiply-accumulate into int32 m8. Reuse registers sequentially
+        // to stay at 14 regs total throughout the unroll body.
+        vint8m2_t v_b0 = __riscv_vle8_v_i8m2(b_ptr_base + (k + 0) * BLOCK_N, vl);
+        v_acc = __riscv_vwmacc_vx_i32m8(v_acc, (int16_t)A[k + 0], __riscv_vsext_vf2_i16m4(v_b0, vl), vl);
+
+        vint8m2_t v_b1 = __riscv_vle8_v_i8m2(b_ptr_base + (k + 1) * BLOCK_N, vl);
+        v_acc = __riscv_vwmacc_vx_i32m8(v_acc, (int16_t)A[k + 1], __riscv_vsext_vf2_i16m4(v_b1, vl), vl);
+
+        vint8m2_t v_b2 = __riscv_vle8_v_i8m2(b_ptr_base + (k + 2) * BLOCK_N, vl);
+        v_acc = __riscv_vwmacc_vx_i32m8(v_acc, (int16_t)A[k + 2], __riscv_vsext_vf2_i16m4(v_b2, vl), vl);
+
+        vint8m2_t v_b3 = __riscv_vle8_v_i8m2(b_ptr_base + (k + 3) * BLOCK_N, vl);
+        v_acc = __riscv_vwmacc_vx_i32m8(v_acc, (int16_t)A[k + 3], __riscv_vsext_vf2_i16m4(v_b3, vl), vl);
+      }
+      for (; k < k_end; ++k) {
+        vint8m2_t v_b = __riscv_vle8_v_i8m2(b_ptr_base + k * BLOCK_N, vl);
+        v_acc = __riscv_vwmacc_vx_i32m8(v_acc, (int16_t)A[k], __riscv_vsext_vf2_i16m4(v_b, vl), vl);
+      }
+    }
+
+    // Dequantize: int32 → float → scale → (bias) → output dtype
+    vfloat32m8_t v_acc_f = __riscv_vfcvt_f_x_v_f32m8(v_acc, vl);
+    vfloat32m8_t v_bs = __riscv_vle32_v_f32m8(Bs + n_start, vl);
+    v_acc_f = __riscv_vfmul_vv_f32m8(v_acc_f, __riscv_vfmul_vf_f32m8(v_bs, As[0], vl), vl);
+
+    if constexpr (has_bias) {
+      v_acc_f = __riscv_vfadd_vv_f32m8(v_acc_f, __riscv_vle32_v_f32m8(bias + n_start, vl), vl);
+    }
+
+    alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M8];
+    store_from_float_m8(C + n_start, v_acc_f, vl, scratch);
+  }
+};
+
 template <typename scalar_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn {
   static_assert(BLOCK_M >= 1 && BLOCK_M <= 4, "BLOCK_M must be 1-4");
@@ -59,14 +131,12 @@ struct tinygemm_kernel_nn {
       scalar_t* __restrict__ C,
       const float* __restrict__ As,
       const float* __restrict__ Bs,
-      const int32_t* __restrict__ Bcomp,
       const float* __restrict__ bias,
       int64_t K,
       int64_t lda,
       int64_t ldc,
       int64_t nb,
       int64_t n_size) {
-    UNUSED(Bcomp);
     TORCH_CHECK(n_size >= 0 && n_size <= BLOCK_N);
     if constexpr (has_bias) {
       TORCH_CHECK(bias != nullptr);
@@ -75,8 +145,10 @@ struct tinygemm_kernel_nn {
     size_t vl_max = __riscv_vsetvlmax_e32m4();
     const int64_t n_start = nb * BLOCK_N;
 
-    // Compute and store per row
-    alignas(64) int32_t Ctmp_row[BLOCK_N];
+    // UNROLL=2: safe for all BLOCK_M (peak regs: BLOCK_M*m4 + 2*m1 + 2*m2 ≤ 28 for M=4).
+    constexpr int64_t UNROLL = 2;
+    constexpr int64_t PREFETCH_DIST = UNROLL * 2;
+    constexpr int64_t KB = rvv_constants::L1_CACHE_BYTES * 4 / __riscv_v_fixed_vlen;
 
     for (int64_t j = 0; j < n_size; j += vl_max) {
       size_t vl = (j + vl_max <= (size_t)n_size) ? vl_max : __riscv_vsetvl_e32m4(n_size - j);
@@ -89,37 +161,42 @@ struct tinygemm_kernel_nn {
       }
 
       // K loop: B layout is [NB, K, BLOCK_N]
-      // K-tiling: target B footprint ≈ L1/2; vl_max_m4 = VLEN/8; INT8: KB = L1*4/VLEN.
-      // Override L1 assumption: cmake -DRVV_L1_CACHE_KB=N (default 32KB).
+      // KB = L1_CACHE_BYTES / (BLOCK_N * sizeof(int8)) = L1 * 4 / VLEN_bits
+      // (BLOCK_N = VLEN/4 elements; each int8 element is 1 byte → BLOCK_N bytes per K-step)
+      // Override via cmake -DRVV_L1_CACHE_KB=N (default 32KB).
       const int8_t* b_ptr_base = B + nb * K * BLOCK_N + j;
-      constexpr int64_t KB = rvv_constants::L1_CACHE_BYTES * 4 / __riscv_v_fixed_vlen;
+
       for (int64_t k_tile = 0; k_tile < K; k_tile += KB) {
         const int64_t k_end = std::min(k_tile + KB, K);
-        for (int64_t k = k_tile; k < k_end; ++k) {
-          // Prefetch next B block
-          if (k + 2 < K) {
-            __builtin_prefetch(b_ptr_base + (k + 2) * BLOCK_N, 0, 1);
-          }
+        int64_t k = k_tile;
 
-          const int8_t* b_ptr = b_ptr_base + k * BLOCK_N;
-          vint8m1_t v_b_i8 = __riscv_vle8_v_i8m1(b_ptr, vl);
-          vint16m2_t v_b_i16 = __riscv_vsext_vf2_i16m2(v_b_i8, vl);
+        for (; k + UNROLL - 1 < k_end; k += UNROLL) {
+          if (k + PREFETCH_DIST < K) __builtin_prefetch(b_ptr_base + (k + PREFETCH_DIST) * BLOCK_N, 0, 1);
+
+          vint8m1_t v_b0_i8 = __riscv_vle8_v_i8m1(b_ptr_base + (k + 0) * BLOCK_N, vl);
+          vint16m2_t v_b0_i16 = __riscv_vsext_vf2_i16m2(v_b0_i8, vl);
+          vint8m1_t v_b1_i8 = __riscv_vle8_v_i8m1(b_ptr_base + (k + 1) * BLOCK_N, vl);
+          vint16m2_t v_b1_i16 = __riscv_vsext_vf2_i16m2(v_b1_i8, vl);
 
           for (int m = 0; m < BLOCK_M; ++m) {
-            int8_t a_val = A[m * lda + k];
-            if (a_val == 0) continue;
-            *v_acc[m] = __riscv_vwmacc_vx_i32m4(*v_acc[m], static_cast<int16_t>(a_val), v_b_i16, vl);
+            *v_acc[m] = __riscv_vwmacc_vx_i32m4(*v_acc[m], (int16_t)A[m * lda + k + 0], v_b0_i16, vl);
+            *v_acc[m] = __riscv_vwmacc_vx_i32m4(*v_acc[m], (int16_t)A[m * lda + k + 1], v_b1_i16, vl);
+          }
+        }
+        for (; k < k_end; ++k) {
+          vint8m1_t v_b_i8 = __riscv_vle8_v_i8m1(b_ptr_base + k * BLOCK_N, vl);
+          vint16m2_t v_b_i16 = __riscv_vsext_vf2_i16m2(v_b_i8, vl);
+          for (int m = 0; m < BLOCK_M; ++m) {
+            *v_acc[m] = __riscv_vwmacc_vx_i32m4(*v_acc[m], (int16_t)A[m * lda + k], v_b_i16, vl);
           }
         }
       }  // k_tile
 
       // Dequantize and store each row
       for (int m = 0; m < BLOCK_M; ++m) {
-        __riscv_vse32_v_i32m4(Ctmp_row, *v_acc[m], vl);
-        scale_C<scalar_t, has_bias, BLOCK_N>::apply(
+        scale_C<scalar_t, has_bias>::apply(
             C + m * ldc + n_start + j,
-            Ctmp_row,
-            /*Bcomp*/ nullptr,
+            *v_acc[m],
             has_bias ? (bias + n_start + j) : nullptr,
             As[m],
             Bs + n_start + j,
@@ -136,12 +213,26 @@ struct tinygemm_kernel_nn {
       C + mb_start * ldc,                                          \
       As + mb_start,                                               \
       Bs,                                                          \
-      /*Bcomp*/ nullptr,                                           \
       has_bias ? bias : nullptr,                                   \
       K,                                                           \
       lda,                                                         \
       ldc,                                                         \
       nb,                                                          \
+      nb_size);
+
+// M=1 GEMV path: uses int32 m8 accumulator (64 elements = BLOCK_N), UNROLL=4.
+#define LAUNCH_TINYGEMM_KERNEL_NN_GEMV(NB_SIZE)                \
+  tinygemm_kernel_nn_gemv<scalar_t, has_bias, NB_SIZE>::apply( \
+      A + mb_start * lda,                                      \
+      B,                                                       \
+      C + mb_start * ldc,                                      \
+      As + mb_start,                                           \
+      Bs,                                                      \
+      has_bias ? bias : nullptr,                               \
+      K,                                                       \
+      lda,                                                     \
+      ldc,                                                     \
+      nb,                                                      \
       nb_size);
 
 template <typename scalar_t, bool has_bias>
@@ -172,7 +263,9 @@ void tinygemm_kernel(
 
       switch (mb_size) {
         case 1:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, BLOCK_N);
+          // GEMV specialization: int32 m8 accumulator covers BLOCK_N=64 in one
+          // j-tile (vs two for m4), plus UNROLL=4 in the K loop.
+          LAUNCH_TINYGEMM_KERNEL_NN_GEMV(BLOCK_N);
           break;
         case 2:
           LAUNCH_TINYGEMM_KERNEL_NN(2, BLOCK_N);

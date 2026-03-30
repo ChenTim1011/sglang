@@ -15,9 +15,87 @@ constexpr float RVV_EXP_C4 = 0.00961812910f;
 constexpr float RVV_EXP_C5 = 0.00133335581f;
 constexpr float RVV_LOG2_E = 1.44269504089f;
 
-// Generic Exp template for LMUL={1,2,4,8}
+// Generic Exp template for LMUL={1,2,4,8} — all four specializations are provided.
 template <int LMUL>
 struct RVVExpImpl;
+
+// Specialization: LMUL=1
+template <>
+struct RVVExpImpl<1> {
+  using VFloat = vfloat32m1_t;
+  using VInt = vint32m1_t;
+
+  static inline VFloat compute(VFloat vx, size_t vl) {
+    vx = __riscv_vfmax_vf_f32m1(vx, -87.0f, vl);  // Clamp to avoid denormals
+    vx = __riscv_vfmin_vf_f32m1(vx, 88.0f, vl);
+
+    VFloat vz = __riscv_vfmul_vf_f32m1(vx, RVV_LOG2_E, vl);
+    // vfcvt_x_f uses fcsr.frm (assumes RNE = default rounding mode)
+    VInt vn_int = __riscv_vfcvt_x_f_v_i32m1(vz, vl);
+    VFloat vn = __riscv_vfcvt_f_x_v_f32m1(vn_int, vl);
+    VFloat vf = __riscv_vfsub_vv_f32m1(vz, vn, vl);
+
+    // Horner's method: ((((C5*f + C4)*f + C3)*f + C2)*f + C1)*f + C0
+    // vfmadd(vd, vs1, vs2) = vd * vs1 + vs2 — vd is the multiplicand
+    VFloat vC0 = __riscv_vfmv_v_f_f32m1(RVV_EXP_C0, vl);
+    VFloat vC1 = __riscv_vfmv_v_f_f32m1(RVV_EXP_C1, vl);
+    VFloat vC2 = __riscv_vfmv_v_f_f32m1(RVV_EXP_C2, vl);
+    VFloat vC3 = __riscv_vfmv_v_f_f32m1(RVV_EXP_C3, vl);
+    VFloat vC4 = __riscv_vfmv_v_f_f32m1(RVV_EXP_C4, vl);
+
+    VFloat poly = __riscv_vfmv_v_f_f32m1(RVV_EXP_C5, vl);
+    poly = __riscv_vfmadd_vv_f32m1(poly, vf, vC4, vl);  // C5*f + C4
+    poly = __riscv_vfmadd_vv_f32m1(poly, vf, vC3, vl);  // (C5*f+C4)*f + C3
+    poly = __riscv_vfmadd_vv_f32m1(poly, vf, vC2, vl);
+    poly = __riscv_vfmadd_vv_f32m1(poly, vf, vC1, vl);
+    poly = __riscv_vfmadd_vv_f32m1(poly, vf, vC0, vl);
+
+    VInt v_exp = __riscv_vadd_vx_i32m1(vn_int, 127, vl);
+    v_exp = __riscv_vsll_vx_i32m1(v_exp, 23, vl);
+    VFloat v_pow2n = __riscv_vreinterpret_v_i32m1_f32m1(v_exp);
+
+    return __riscv_vfmul_vv_f32m1(poly, v_pow2n, vl);
+  }
+};
+
+// Specialization: LMUL=2
+template <>
+struct RVVExpImpl<2> {
+  using VFloat = vfloat32m2_t;
+  using VInt = vint32m2_t;
+
+  static inline VFloat compute(VFloat vx, size_t vl) {
+    vx = __riscv_vfmax_vf_f32m2(vx, -87.0f, vl);  // Clamp to avoid denormals
+    vx = __riscv_vfmin_vf_f32m2(vx, 88.0f, vl);
+
+    VFloat vz = __riscv_vfmul_vf_f32m2(vx, RVV_LOG2_E, vl);
+    // vfcvt_x_f uses fcsr.frm (assumes RNE = default rounding mode)
+    VInt vn_int = __riscv_vfcvt_x_f_v_i32m2(vz, vl);
+    VFloat vn = __riscv_vfcvt_f_x_v_f32m2(vn_int, vl);
+    VFloat vf = __riscv_vfsub_vv_f32m2(vz, vn, vl);
+
+    // Horner's method: ((((C5*f + C4)*f + C3)*f + C2)*f + C1)*f + C0
+    // vfmadd(vd, vs1, vs2) = vd * vs1 + vs2 — vd is the multiplicand
+    VFloat vC0 = __riscv_vfmv_v_f_f32m2(RVV_EXP_C0, vl);
+    VFloat vC1 = __riscv_vfmv_v_f_f32m2(RVV_EXP_C1, vl);
+    VFloat vC2 = __riscv_vfmv_v_f_f32m2(RVV_EXP_C2, vl);
+    VFloat vC3 = __riscv_vfmv_v_f_f32m2(RVV_EXP_C3, vl);
+    VFloat vC4 = __riscv_vfmv_v_f_f32m2(RVV_EXP_C4, vl);
+
+    VFloat poly = __riscv_vfmv_v_f_f32m2(RVV_EXP_C5, vl);
+    poly = __riscv_vfmadd_vv_f32m2(poly, vf, vC4, vl);  // C5*f + C4
+    poly = __riscv_vfmadd_vv_f32m2(poly, vf, vC3, vl);  // (C5*f+C4)*f + C3
+    poly = __riscv_vfmadd_vv_f32m2(poly, vf, vC2, vl);
+    poly = __riscv_vfmadd_vv_f32m2(poly, vf, vC1, vl);
+    poly = __riscv_vfmadd_vv_f32m2(poly, vf, vC0, vl);
+
+    VInt v_exp = __riscv_vadd_vx_i32m2(vn_int, 127, vl);
+    v_exp = __riscv_vsll_vx_i32m2(v_exp, 23, vl);
+    VFloat v_pow2n = __riscv_vreinterpret_v_i32m2_f32m2(v_exp);
+
+    return __riscv_vfmul_vv_f32m2(poly, v_pow2n, vl);
+  }
+};
 
 // Specialization: LMUL=4
 template <>
@@ -30,6 +108,7 @@ struct RVVExpImpl<4> {
     vx = __riscv_vfmin_vf_f32m4(vx, 88.0f, vl);
 
     VFloat vz = __riscv_vfmul_vf_f32m4(vx, RVV_LOG2_E, vl);
+    // vfcvt_x_f uses fcsr.frm (assumes RNE = default rounding mode)
     VInt vn_int = __riscv_vfcvt_x_f_v_i32m4(vz, vl);
     VFloat vn = __riscv_vfcvt_f_x_v_f32m4(vn_int, vl);
     VFloat vf = __riscv_vfsub_vv_f32m4(vz, vn, vl);
@@ -45,7 +124,7 @@ struct RVVExpImpl<4> {
     VFloat poly = __riscv_vfmv_v_f_f32m4(RVV_EXP_C5, vl);
     poly = __riscv_vfmadd_vv_f32m4(poly, vf, vC4, vl);  // C5*f + C4
     poly = __riscv_vfmadd_vv_f32m4(poly, vf, vC3, vl);  // (C5*f+C4)*f + C3
-    poly = __riscv_vfmadd_vv_f32m4(poly, vf, vC2, vl);  // ...
+    poly = __riscv_vfmadd_vv_f32m4(poly, vf, vC2, vl);
     poly = __riscv_vfmadd_vv_f32m4(poly, vf, vC1, vl);
     poly = __riscv_vfmadd_vv_f32m4(poly, vf, vC0, vl);
 
@@ -68,11 +147,13 @@ struct RVVExpImpl<8> {
     vx = __riscv_vfmin_vf_f32m8(vx, 88.0f, vl);
 
     VFloat vz = __riscv_vfmul_vf_f32m8(vx, RVV_LOG2_E, vl);
+    // vfcvt_x_f uses fcsr.frm (assumes RNE = default rounding mode)
     VInt vn_int = __riscv_vfcvt_x_f_v_i32m8(vz, vl);
     VFloat vn = __riscv_vfcvt_f_x_v_f32m8(vn_int, vl);
     VFloat vf = __riscv_vfsub_vv_f32m8(vz, vn, vl);
 
     // Horner's method: ((((C5*f + C4)*f + C3)*f + C2)*f + C1)*f + C0
+    // vfmadd(vd, vs1, vs2) = vd * vs1 + vs2 — vd is the multiplicand
     VFloat vC0 = __riscv_vfmv_v_f_f32m8(RVV_EXP_C0, vl);
     VFloat vC1 = __riscv_vfmv_v_f_f32m8(RVV_EXP_C1, vl);
     VFloat vC2 = __riscv_vfmv_v_f_f32m8(RVV_EXP_C2, vl);
@@ -80,8 +161,8 @@ struct RVVExpImpl<8> {
     VFloat vC4 = __riscv_vfmv_v_f_f32m8(RVV_EXP_C4, vl);
 
     VFloat poly = __riscv_vfmv_v_f_f32m8(RVV_EXP_C5, vl);
-    poly = __riscv_vfmadd_vv_f32m8(poly, vf, vC4, vl);
-    poly = __riscv_vfmadd_vv_f32m8(poly, vf, vC3, vl);
+    poly = __riscv_vfmadd_vv_f32m8(poly, vf, vC4, vl);  // C5*f + C4
+    poly = __riscv_vfmadd_vv_f32m8(poly, vf, vC3, vl);  // (C5*f+C4)*f + C3
     poly = __riscv_vfmadd_vv_f32m8(poly, vf, vC2, vl);
     poly = __riscv_vfmadd_vv_f32m8(poly, vf, vC1, vl);
     poly = __riscv_vfmadd_vv_f32m8(poly, vf, vC0, vl);
@@ -95,6 +176,14 @@ struct RVVExpImpl<8> {
 };
 
 // Wrapper functions (delegate to template implementations)
+inline vfloat32m1_t vfexp_f32m1(vfloat32m1_t vx, size_t vl) {
+  return RVVExpImpl<1>::compute(vx, vl);
+}
+
+inline vfloat32m2_t vfexp_f32m2(vfloat32m2_t vx, size_t vl) {
+  return RVVExpImpl<2>::compute(vx, vl);
+}
+
 inline vfloat32m4_t vfexp_f32m4(vfloat32m4_t vx, size_t vl) {
   return RVVExpImpl<4>::compute(vx, vl);
 }
@@ -105,6 +194,21 @@ inline vfloat32m8_t vfexp_f32m8(vfloat32m8_t vx, size_t vl) {
 
 // Fast reciprocal: ~1/vd via vfrec7 + one Newton-Raphson step (~14-bit accuracy).
 // NR: r <- r * (2 - d * r).  Safe for any d > 0 (which holds for all our use sites).
+// NOT suitable for full FP32 precision (24-bit); sufficient for fp16/bf16 outputs only.
+inline vfloat32m1_t vrec_f32m1(vfloat32m1_t vd, size_t vl) {
+  vfloat32m1_t vr = __riscv_vfrec7_v_f32m1(vd, vl);
+  vfloat32m1_t vdr = __riscv_vfmul_vv_f32m1(vd, vr, vl);
+  vfloat32m1_t vcorr = __riscv_vfrsub_vf_f32m1(vdr, 2.0f, vl);  // 2 - d*r
+  return __riscv_vfmul_vv_f32m1(vr, vcorr, vl);
+}
+
+inline vfloat32m2_t vrec_f32m2(vfloat32m2_t vd, size_t vl) {
+  vfloat32m2_t vr = __riscv_vfrec7_v_f32m2(vd, vl);
+  vfloat32m2_t vdr = __riscv_vfmul_vv_f32m2(vd, vr, vl);
+  vfloat32m2_t vcorr = __riscv_vfrsub_vf_f32m2(vdr, 2.0f, vl);  // 2 - d*r
+  return __riscv_vfmul_vv_f32m2(vr, vcorr, vl);
+}
+
 inline vfloat32m4_t vrec_f32m4(vfloat32m4_t vd, size_t vl) {
   vfloat32m4_t vr = __riscv_vfrec7_v_f32m4(vd, vl);
   vfloat32m4_t vdr = __riscv_vfmul_vv_f32m4(vd, vr, vl);
@@ -122,6 +226,26 @@ inline vfloat32m8_t vrec_f32m8(vfloat32m8_t vd, size_t vl) {
 // tanh(x) = (e^2x - 1) / (e^2x + 1).  Clamped to ±9: at |x|=9, FP32 tanh ≈ 1-6e-8
 // (within 1 ULP of 1.0). FP32 saturates to exactly ±1.0 at |x|>=10; ±9 is a
 // conservative bound that also keeps exp(2x) < 65M, avoiding approximation breakdown.
+inline vfloat32m1_t vftanh_f32m1(vfloat32m1_t vx, size_t vl) {
+  vx = __riscv_vfmax_vf_f32m1(vx, -9.0f, vl);
+  vx = __riscv_vfmin_vf_f32m1(vx, 9.0f, vl);
+  vfloat32m1_t v2x = __riscv_vfmul_vf_f32m1(vx, 2.0f, vl);
+  vfloat32m1_t vex = vfexp_f32m1(v2x, vl);
+  vfloat32m1_t v_num = __riscv_vfsub_vf_f32m1(vex, 1.0f, vl);
+  vfloat32m1_t v_denom = __riscv_vfadd_vf_f32m1(vex, 1.0f, vl);
+  return __riscv_vfmul_vv_f32m1(v_num, vrec_f32m1(v_denom, vl), vl);
+}
+
+inline vfloat32m2_t vftanh_f32m2(vfloat32m2_t vx, size_t vl) {
+  vx = __riscv_vfmax_vf_f32m2(vx, -9.0f, vl);
+  vx = __riscv_vfmin_vf_f32m2(vx, 9.0f, vl);
+  vfloat32m2_t v2x = __riscv_vfmul_vf_f32m2(vx, 2.0f, vl);
+  vfloat32m2_t vex = vfexp_f32m2(v2x, vl);
+  vfloat32m2_t v_num = __riscv_vfsub_vf_f32m2(vex, 1.0f, vl);
+  vfloat32m2_t v_denom = __riscv_vfadd_vf_f32m2(vex, 1.0f, vl);
+  return __riscv_vfmul_vv_f32m2(v_num, vrec_f32m2(v_denom, vl), vl);
+}
+
 inline vfloat32m4_t vftanh_f32m4(vfloat32m4_t vx, size_t vl) {
   vx = __riscv_vfmax_vf_f32m4(vx, -9.0f, vl);
   vx = __riscv_vfmin_vf_f32m4(vx, 9.0f, vl);

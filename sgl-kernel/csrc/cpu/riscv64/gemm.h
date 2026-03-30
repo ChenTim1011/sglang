@@ -6,7 +6,7 @@
 #include <cassert>
 #include <cstdint>
 
-#include "riscv64/vector_helpers.h"  // defines MAX_HEAD_SIZE
+#include "riscv64/vector_helpers.h"
 
 // 4 m4-accumulators × 4 phys-regs = 16 of 32 VRs; leaves 16 for operands.
 static constexpr int GEMM_TILE_M = 4;
@@ -134,13 +134,13 @@ inline void gemm_nt_tiled_transposed(
     int block_n,
     int ldc,
     float scale) {
-  size_t vl_max = __riscv_vsetvlmax_e16m2();
+  size_t vl_max = __riscv_vsetvlmax_e32m4();
 
   for (int m_base = 0; m_base < M; m_base += GEMM_TILE_M) {
     int m_count = std::min(GEMM_TILE_M, M - m_base);
 
     for (int n_base = 0; n_base < N; n_base += vl_max) {
-      size_t vl = __riscv_vsetvl_e16m2(N - n_base);
+      size_t vl = __riscv_vsetvl_e32m4(N - n_base);
 
       vfloat32m4_t acc0 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
       vfloat32m4_t acc1 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
@@ -211,7 +211,7 @@ inline void gemm_nn_tiled(
     int m_count = std::min(GEMM_TILE_M, M - m_base);
     size_t vl;
     for (int d = 0; d < head_size_v; d += vl) {
-      vl = __riscv_vsetvl_e16m2(head_size_v - d);
+      vl = __riscv_vsetvl_e32m4(head_size_v - d);
 
       vfloat32m4_t acc0 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
       vfloat32m4_t acc1 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
@@ -291,6 +291,7 @@ inline void gemm_nt_tiled_transposed_int8(
     int m_count = std::min(GEMM_TILE_M, M - m_base);
 
     // Prepare Q quantization: Quantize GEMM_TILE_M rows of Q
+    TORCH_CHECK(head_size <= MAX_HEAD_SIZE, "head_size ", head_size, " exceeds MAX_HEAD_SIZE ", MAX_HEAD_SIZE);
     int8_t q_quant[GEMM_TILE_M][MAX_HEAD_SIZE];
     float q_scales[GEMM_TILE_M];
 
