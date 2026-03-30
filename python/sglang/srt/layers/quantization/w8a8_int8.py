@@ -24,10 +24,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.rvv_utils import (
-    _rvv_process_weight_after_loading,
-    rvv_linear_forward,
-)
+from sglang.srt.layers.rvv_utils import _rvv_process_weight_after_loading
 from sglang.srt.utils import (
     cpu_has_amx_support,
     cpu_has_rvv_support,
@@ -164,15 +161,13 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_cpu:
-            if _is_cpu_amx_available:
-                _amx_process_weight_after_loading(layer, ["weight"])
-            elif _is_cpu_rvv_available:
-                _rvv_process_weight_after_loading(layer, ["weight"])
-            else:
-                raise RuntimeError(
-                    "W8A8Int8LinearMethod on CPU requires Intel AMX or RISC-V RVV support"
-                )
+        if _is_cpu_rvv_available:
+            _rvv_process_weight_after_loading(layer, ["weight"])
+        elif _is_cpu:
+            assert (
+                _is_cpu_amx_available
+            ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
+            _amx_process_weight_after_loading(layer, ["weight"])
         else:
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
@@ -214,20 +209,14 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        if use_intel_amx_backend(layer):
+        if use_intel_amx_backend(layer) or use_riscv_rvv_backend(layer):
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
                 layer.weight_scale,
                 bias,
                 x.dtype,
-                True,  # is_vnni
-            )
-        elif use_riscv_rvv_backend(layer):
-            return rvv_linear_forward(x, layer, bias)
-        elif _is_cpu:
-            raise RuntimeError(
-                "W8A8Int8LinearMethod on CPU requires Intel AMX or RISC-V RVV support"
+                True,  # is_vnni / is_packed
             )
         x_q, x_scale = per_token_quant_int8(x)
 
@@ -327,13 +316,10 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
-            if _is_cpu_amx_available:
-                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-            else:
-                raise RuntimeError(
-                    "W8A8Int8MoEMethod on CPU requires Intel AMX. "
-                    "RVV is supported for dense INT8 linear but not for MoE."
-                )
+            assert (
+                _is_cpu_amx_available
+            ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         else:
             layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
             layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)

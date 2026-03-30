@@ -60,7 +60,6 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
-    is_host_cpu_riscv,
     is_npu,
     support_triton,
 )
@@ -77,7 +76,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
-_is_riscv = is_host_cpu_riscv()
 
 
 class ForwardMode(IntEnum):

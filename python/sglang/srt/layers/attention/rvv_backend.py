@@ -16,9 +16,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Number of KV splits for the decode kernel's partial-softmax reduction.
-# Set to 1 for single-core RISC-V boards
-# Increase this for future multi-core RISC-V hardware
-_NUM_KV_SPLITS = 1
+_NUM_KV_SPLITS = 2
 
 
 class RVVAttnBackend(AttentionBackend):
@@ -165,22 +163,15 @@ class RVVAttnBackend(AttentionBackend):
             fallback = getattr(layer, fallback_attr, None)
             if fallback is not None:
                 return float(fallback)
-            logger.warning(
-                "[RVV] %s and %s are both None on layer %s; defaulting scale to 1.0. "
-                "If this layer uses static quantization, the weight attribute name may be wrong.",
-                src_attr,
-                fallback_attr,
-                type(layer).__name__,
+            raise RuntimeError(
+                f"[RVV] {src_attr} (and {fallback_attr}) are both None on "
+                f"{type(layer).__name__}; INT8 attention requires valid quantization "
+                f"scales. Check that the model was loaded with INT8 KV-cache quantization."
             )
-            return 1.0
 
         k_scale = _resolve("k_scale", "k_scale_float")
         v_scale = _resolve("v_scale", "v_scale_float")
-        # Assign both scales before setting the done flag to avoid a partial-write
-        # race condition in tensor-parallel (another thread may check the flag after
-        # k_scale is written but before v_scale is written).
-        layer._cached_k_scale_float = k_scale
-        layer._cached_v_scale_float = v_scale
+        layer._cached_k_scale_float, layer._cached_v_scale_float = k_scale, v_scale
         layer._rvv_scales_cached = True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -281,8 +272,8 @@ class RVVAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         if self.use_rvv_kernels:
-            # Cross-attention: the RVV extend kernel only supports causal (self-)
-            # attention.  Fall back to TorchNative which correctly sets causal=False.
+            # Cross-attention requires Q and K/V from different sequences, which is
+            # not supported.  Fall back to TorchNative which handles this correctly.
             if layer.is_cross_attention:
                 logger.warning_once(
                     "[RVV] forward_extend: cross-attention is not supported by the RVV "
