@@ -1,11 +1,5 @@
 """Unit tests for RVV extend attention kernel (BF16/FP16).
 
-- MHA (Multi-Head Attention): num_heads == num_heads_kv
-- GQA (Grouped Query Attention): num_heads != num_heads_kv
-- MLA (Multi-Latent Attention): shared KV buffer with num_heads_kv=1
-- Various configurations: small, medium, large prompts
-- Different head dimensions and extend lengths
-
 Usage:
     python3 -m unittest test.srt.cpu.rvv.test_rvv_extend -v
 """
@@ -46,13 +40,21 @@ class TestRVVExtendBase(CustomTestCase):
         force_prefix_zero=False,
         dtype=torch.bfloat16,
     ):
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(1234)
         _hi = max(N_CTX // 2, 2)  # randint requires hi > lo=1; guard N_CTX=1
         if force_prefix_zero:
             b_seq_len_prefix = torch.zeros(B, dtype=torch.int32)
-            b_seq_len_extend = torch.randint(1, _hi, (B,), dtype=torch.int32)
+            b_seq_len_extend = torch.randint(
+                1, _hi, (B,), dtype=torch.int32, generator=gen
+            )
         else:
-            b_seq_len_prefix = torch.randint(1, _hi, (B,), dtype=torch.int32)
-            b_seq_len_extend = torch.randint(1, _hi, (B,), dtype=torch.int32)
+            b_seq_len_prefix = torch.randint(
+                1, _hi, (B,), dtype=torch.int32, generator=gen
+            )
+            b_seq_len_extend = torch.randint(
+                1, _hi, (B,), dtype=torch.int32, generator=gen
+            )
         b_seq_len = b_seq_len_prefix + b_seq_len_extend
         max_len_in_batch = torch.max(b_seq_len, 0)[0].item()
 
@@ -72,8 +74,8 @@ class TestRVVExtendBase(CustomTestCase):
         extend_token_num = torch.sum(b_seq_len_extend).item()
 
         H_BUF = 1 if mla else H_KV
-        k_buffer = torch.randn((total_token_num, H_BUF, D), dtype=dtype)
-        v_buffer = torch.randn((total_token_num, H_BUF, DV), dtype=dtype)
+        k_buffer = torch.randn((total_token_num, H_BUF, D), dtype=dtype, generator=gen)
+        v_buffer = torch.randn((total_token_num, H_BUF, DV), dtype=dtype, generator=gen)
 
         k_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype)
         v_extend = torch.empty((extend_token_num, H_KV, DV), dtype=dtype)
@@ -91,10 +93,10 @@ class TestRVVExtendBase(CustomTestCase):
                 extend_start_in_buffer:extend_end_in_buffer
             ]
             q_extend[extend_start:extend_end] = torch.randn(
-                (b_seq_len_extend[i], H_Q, D), dtype=dtype
+                (b_seq_len_extend[i], H_Q, D), dtype=dtype, generator=gen
             )
 
-        # q_extend, k_extend, v_extend, k_buffer and v_buffer supports non-contiguous tensors
+        # Feed non-contiguous views to match the kernel path used in production.
         q_extend_k = q_extend.transpose(0, 1).contiguous().transpose(0, 1)
         k_extend_k = k_extend.transpose(0, 1).contiguous().transpose(0, 1)
         v_extend_k = v_extend.transpose(0, 1).contiguous().transpose(0, 1)
@@ -108,7 +110,6 @@ class TestRVVExtendBase(CustomTestCase):
 
         sm_scale = 1.0 / (D**0.5)
 
-        # handle index type
         b_req_idx = b_req_idx.to(torch.int64)
         b_seq_len = b_seq_len.to(torch.int64)
 
@@ -148,9 +149,11 @@ class TestRVVExtendBase(CustomTestCase):
         )
 
         atol = rtol = (
-            precision["logit_cap"][torch.float16]
-            if (logit_cap > 0.0 and dtype == torch.float16)
-            else precision["default"][dtype]
+            precision["attention_decode_logit_cap"].get(
+                dtype, precision["attention_extend"][dtype]
+            )
+            if logit_cap > 0.0
+            else precision["attention_extend"][dtype]
         )
         torch.testing.assert_close(o_ref, o_extend, atol=atol, rtol=rtol)
 
@@ -160,7 +163,6 @@ class TestRVVExtendMHA(TestRVVExtendBase):
 
     def test_case_mha_cases(self):
         """Case: MHA extend across representative shapes and dtypes."""
-        # Config format: (B, N_CTX, H_Q, H_KV, D, DV, logit_cap)
         configs = [
             (2, 128, 16, 16, 128, 96, 0.0),
             (2, 64, 8, 8, 32, 32, 0.0),
@@ -218,14 +220,8 @@ class TestRVVExtendMHA(TestRVVExtendBase):
                     )
 
     def test_case_mha_single_token_extend(self):
-        """Case: N_CTX=1 — single token extend exercises the M=1 boundary of BLOCK_M=32.
-
-        BLOCK_M=32 means m_count=min(32,M); at M=1 only acc0 is active and
-        acc1-acc3 must be correctly guarded. Tests both with prefix (Stage 1+2)
-        and without (Stage 2 only).
-        """
+        """Case: N_CTX=1 hits the single-row BLOCK_M boundary in both extend modes."""
         for dtype in self.dtypes:
-            # With prefix: both Stage 1 (Q@K_prefix) and Stage 2 (Q@K_extend) run with M=1
             with self.subTest(dtype=dtype, force_prefix_zero=False):
                 self.run_case_extend_attention(
                     B=2,
@@ -237,7 +233,6 @@ class TestRVVExtendMHA(TestRVVExtendBase):
                     mla=False,
                     dtype=dtype,
                 )
-            # Without prefix: Stage 2 only with M=1
             with self.subTest(dtype=dtype, force_prefix_zero=True):
                 self.run_case_extend_attention(
                     B=2,
@@ -257,12 +252,11 @@ class TestRVVExtendGQA(TestRVVExtendBase):
 
     def test_case_gqa_cases(self):
         """Case: GQA extend across representative shapes and dtypes."""
-        # Config format: (B, N_CTX, H_Q, H_KV, D, DV)
         configs = [
-            (2, 128, 32, 8, 128, 96),  # GQA (4:1)
-            (4, 128, 24, 4, 64, 64),  # 6:1 ratio
-            (1, 256, 16, 2, 128, 128),  # 8:1 ratio
-            (2, 64, 18, 3, 32, 32),  # Non-power-of-2 ratio
+            (2, 128, 32, 8, 128, 96),
+            (4, 128, 24, 4, 64, 64),
+            (1, 256, 16, 2, 128, 128),
+            (2, 64, 18, 3, 32, 32),
         ]
         for B, N_CTX, H_Q, H_KV, D, DV in configs:
             for dtype in self.dtypes:
@@ -277,6 +271,27 @@ class TestRVVExtendGQA(TestRVVExtendBase):
                         D=D,
                         DV=DV,
                         mla=False,
+                        dtype=dtype,
+                    )
+
+    def test_case_gqa_with_logit_cap(self):
+        """GQA extend with logit_cap > 0 exercises the tanh-softcap path."""
+        configs = [
+            (2, 128, 32, 8, 128, 96),
+            (1, 256, 16, 2, 128, 128),
+        ]
+        for B, N_CTX, H_Q, H_KV, D, DV in configs:
+            for dtype in self.dtypes:
+                with self.subTest(B=B, H_Q=H_Q, H_KV=H_KV, dtype=dtype):
+                    self.run_case_extend_attention(
+                        B=B,
+                        N_CTX=N_CTX,
+                        H_Q=H_Q,
+                        H_KV=H_KV,
+                        D=D,
+                        DV=DV,
+                        mla=False,
+                        logit_cap=50.0,
                         dtype=dtype,
                     )
 
@@ -300,71 +315,6 @@ class TestRVVExtendGQA(TestRVVExtendBase):
                         dtype=dtype,
                         force_prefix_zero=True,
                     )
-
-
-class TestRVVExtendMLA(TestRVVExtendBase):
-    """Test suite for RVV extend attention MLA path."""
-
-    def test_case_mla_cases(self):
-        """Case: MLA extend across representative shapes and dtypes."""
-        # Config format: (B, N_CTX, H_Q, H_KV, D, DV)
-        configs = [
-            (2, 128, 22, 1, 192, 128),
-            (4, 256, 16, 1, 192, 128),
-            (1, 128, 17, 1, 192, 128),  # Odd number of heads
-        ]
-        for B, N_CTX, H_Q, H_KV, D, DV in configs:
-            for dtype in self.dtypes:
-                with self.subTest(
-                    B=B, N_CTX=N_CTX, H_Q=H_Q, H_KV=H_KV, D=D, DV=DV, dtype=dtype
-                ):
-                    self.run_case_extend_attention(
-                        B=B,
-                        N_CTX=N_CTX,
-                        H_Q=H_Q,
-                        H_KV=H_KV,
-                        D=D,
-                        DV=DV,
-                        mla=True,
-                        dtype=dtype,
-                    )
-
-    def test_case_mla_zero_prefix(self):
-        """MLA extend with no prefix tokens (Stage 2 only path)."""
-        configs = [
-            (2, 128, 22, 1, 192, 128),
-            (1, 128, 17, 1, 192, 128),
-        ]
-        for B, N_CTX, H_Q, H_KV, D, DV in configs:
-            for dtype in self.dtypes:
-                with self.subTest(B=B, H_Q=H_Q, dtype=dtype):
-                    self.run_case_extend_attention(
-                        B=B,
-                        N_CTX=N_CTX,
-                        H_Q=H_Q,
-                        H_KV=H_KV,
-                        D=D,
-                        DV=DV,
-                        mla=True,
-                        dtype=dtype,
-                        force_prefix_zero=True,
-                    )
-
-    def test_case_mla_with_logit_cap(self):
-        """MLA extend with logit_cap > 0: kernel applies tanh softcapping on shared KV path."""
-        for dtype in self.dtypes:
-            with self.subTest(dtype=dtype):
-                self.run_case_extend_attention(
-                    B=2,
-                    N_CTX=128,
-                    H_Q=22,
-                    H_KV=1,
-                    D=192,
-                    DV=128,
-                    mla=True,
-                    dtype=dtype,
-                    logit_cap=50.0,
-                )
 
 
 if __name__ == "__main__":

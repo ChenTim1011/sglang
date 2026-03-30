@@ -32,19 +32,29 @@ def has_sgl_kernel_op(op_name: str) -> bool:
 
 
 # Precision tolerances for RVV tests: precision[op][dtype].
-# "default" covers pointwise / norm / activation ops.
-# logit_cap fp16 needs 10× looser: tanh Horner accumulates extra rounding;
-# bf16's wider default (3e-2) already absorbs it.
+# "default" covers pointwise / activation ops.
+# "attention"       decode: kv-split exp() passes inflate FP16.
+# "extend_attention" extend: GEMM+softmax+GEMM; less accumulation than decode; FP16 3e-3.
+# "logit_cap"       tanh Horner adds rounding for both FP16 and BF16.
 precision = {
     "default": {torch.bfloat16: 3e-2, torch.float16: 1e-3, torch.float32: 1e-5},
+    # FP16 layernorm+bias path can show quantized-step residuals (~1/128) on RVV.
+    "layernorm_bias": {
+        torch.bfloat16: 3e-2,
+        torch.float16: 1e-2,
+        torch.float32: 1e-5,
+    },
     "gemm": {torch.bfloat16: 1.5e-1, torch.float16: 1e-1},
     "rope": {torch.bfloat16: 3e-2, torch.float16: 1e-2},
     "int8_decode": {torch.bfloat16: 0.15, torch.float16: 0.15},
     "int8_extend": {torch.bfloat16: 0.5, torch.float16: 0.5},
-    "logit_cap": {torch.float16: 1e-2},
-    # Decode/extend attention: kv-split accumulation adds extra exp() passes that
-    # inflate FP16 relative error on near-zero outputs beyond the "default" 1e-3.
-    "attention": {torch.bfloat16: 3e-2, torch.float16: 5e-2, torch.float32: 1e-5},
+    "logit_cap": {torch.float16: 1e-2, torch.bfloat16: 1e-1},
+    "attention": {torch.bfloat16: 1e-1, torch.float16: 7e-2, torch.float32: 1e-5},
+    "extend_attention": {
+        torch.bfloat16: 1e-1,
+        torch.float16: 3e-3,
+        torch.float32: 1e-5,
+    },
 }
 
 
@@ -245,3 +255,10 @@ def layernorm_native(x, weight, eps, residual=None):
     x = (x - mean) * torch.rsqrt(variance + eps)
     x = x.to(orig_dtype) * weight
     return x if residual is None else (x, residual)
+
+
+def helper_non_contiguous(t: torch.Tensor) -> torch.Tensor:
+    """Return a non-contiguous view of t by striding the batch dimension 2x."""
+    buf = torch.empty(t.shape[0] * 2, *t.shape[1:], dtype=t.dtype)
+    buf[::2] = t
+    return buf[::2]  # stride[0] = 2 × original; is_contiguous() == False

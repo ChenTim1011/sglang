@@ -1,7 +1,7 @@
 """Unit tests for RVV norm kernels.
 
-Tests run against Python reference implementations from utils.py and are
-skipped automatically on non-RISC-V builds where the kernels are unavailable.
+Tests run against local Python reference implementations and are skipped on
+non-RISC-V builds where the kernels are unavailable.
 
 Usage:
     python3 -m unittest test.srt.cpu.rvv.test_rvv_norm -v
@@ -19,19 +19,13 @@ from .rvv_utils import (
     gemma3_rmsnorm_native,
     gemma_rmsnorm_native,
     has_sgl_kernel_op,
+    helper_non_contiguous,
     layernorm_native,
     precision,
     rmsnorm_native,
 )
 
 torch.manual_seed(1234)
-
-
-def helper_non_contiguous(t: torch.Tensor) -> torch.Tensor:
-    """Return a non-contiguous view of t (stride-2 along the batch dim)."""
-    buf = torch.empty(t.shape[0] * 2, *t.shape[1:], dtype=t.dtype)
-    buf[::2] = t
-    return buf[::2]  # stride[0] = 2 × original; is_contiguous() == False
 
 
 @unittest.skipUnless(
@@ -54,7 +48,7 @@ class TestRVVNormCore(CustomTestCase):
 
         out = torch.ops.sgl_kernel.rmsnorm_cpu(x, weight, eps)
         ref = rmsnorm_native(x, weight, eps)
-        atol = rtol = precision["default"][dtype]
+        atol = rtol = precision["pointwise_default"][dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     def run_case_norm_rms_fused_add(self, m, n, dtype):
@@ -70,7 +64,7 @@ class TestRVVNormCore(CustomTestCase):
         torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(x, residual, weight, eps)
         ref_out, ref_res = rmsnorm_native(ref_x, weight, eps, ref_residual)
 
-        atol = rtol = precision["default"][dtype]
+        atol = rtol = precision["pointwise_default"][dtype]
         torch.testing.assert_close(x, ref_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_res, atol=atol, rtol=rtol)
 
@@ -80,11 +74,11 @@ class TestRVVNormCore(CustomTestCase):
         eps = 1e-6
 
         out = torch.ops.sgl_kernel.l2norm_cpu(x, eps)
-        # L2 norm is equivalent to rmsnorm with weight=1
+        # L2 norm matches RMSNorm with a unit weight vector.
         fake_weight = torch.ones(n, dtype=dtype)
         ref = rmsnorm_native(x, fake_weight, eps)
 
-        atol = rtol = precision["default"][dtype]
+        atol = rtol = precision["pointwise_default"][dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     def run_case_norm_gemma_rms(self, m, n, dtype):
@@ -95,7 +89,7 @@ class TestRVVNormCore(CustomTestCase):
 
         out = torch.ops.sgl_kernel.gemma_rmsnorm_cpu(x, weight, eps)
         ref = gemma_rmsnorm_native(x, weight, eps)
-        atol = rtol = precision["default"][dtype]
+        atol = rtol = precision["pointwise_default"][dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     def run_case_norm_gemma_rms_fused_add(self, m, n, dtype):
@@ -111,23 +105,22 @@ class TestRVVNormCore(CustomTestCase):
         torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(x, residual, weight, eps)
         ref_out, ref_res = gemma_rmsnorm_native(ref_x, weight, eps, ref_residual)
 
-        atol = rtol = precision["default"][dtype]
+        atol = rtol = precision["pointwise_default"][dtype]
         torch.testing.assert_close(x, ref_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_res, atol=atol, rtol=rtol)
 
     def run_case_norm_gemma3_rms(self, m, n, dtype):
         """Run one Gemma3 RMSNorm case for 2D and 4D tensors."""
-        # Test 2D input
         x_2d = torch.randn([m, n], dtype=dtype)
         weight = torch.randn(n, dtype=dtype)
         eps = 1e-6
 
         out_2d = torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x_2d, weight, eps)
         ref_2d = gemma3_rmsnorm_native(x_2d, weight, eps)
-        atol = rtol = precision["default"][dtype]
+        atol = rtol = precision["pointwise_default"][dtype]
         torch.testing.assert_close(ref_2d, out_2d, atol=atol, rtol=rtol)
 
-        # Test 4D input [1, num_head, seq_len, head_dim]
+        # Also cover the 4D layout used by attention blocks.
         x_4d = torch.randn([1, m, 2, n], dtype=dtype)
         out_4d = torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x_4d, weight, eps)
         ref_4d = gemma3_rmsnorm_native(x_4d, weight, eps)
@@ -169,6 +162,19 @@ class TestRVVNormCore(CustomTestCase):
             with self.subTest(m=m, n=n, dtype=dt):
                 self.run_case_norm_gemma3_rms(m, n, dt)
 
+    def test_case_gemma3_rmsnorm_4d_multi_batch(self):
+        """Case: Gemma3 RMSNorm 4D with batch_size > 1."""
+        for dt in self.dtype:
+            n = 4096
+            x = torch.randn([2, 4, 3, n], dtype=dt)
+            weight = torch.randn(n, dtype=dt)
+            eps = 1e-6
+            out = torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, weight, eps)
+            ref = gemma3_rmsnorm_native(x, weight, eps)
+            atol = rtol = precision["pointwise_default"][dt]
+            with self.subTest(dtype=dt):
+                torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
     def test_case_rmsnorm_non_contiguous(self):
         """Case: RMSNorm with non-contiguous input tensors."""
         for dt in self.dtype:
@@ -186,10 +192,28 @@ class TestRVVNormCore(CustomTestCase):
             ref_x, ref_res = rmsnorm_native(x.clone(), weight, eps, residual.clone())
             x_copy, res_copy = x.clone(), residual.clone()
             torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(x_copy, res_copy, weight, eps)
-            atol = rtol = precision["default"][dt]
+            atol = rtol = precision["pointwise_default"][dt]
             with self.subTest(dtype=dt):
                 torch.testing.assert_close(x_copy, ref_x, atol=atol, rtol=rtol)
                 torch.testing.assert_close(res_copy, ref_res, atol=atol, rtol=rtol)
+
+    def test_case_rmsnorm_small_n(self):
+        """Case: RMSNorm with N smaller than one full m4 vector (< 8 for VLEN=256)."""
+        for n, dt in itertools.product([1, 4, 7], self.dtype):
+            with self.subTest(n=n, dtype=dt):
+                self.run_case_norm_rms(4, n, dtype=dt)
+
+    def test_case_gemma_rmsnorm_non_contiguous(self):
+        """Case: Gemma RMSNorm with non-contiguous input tensors."""
+        for dt in self.dtype:
+            x = helper_non_contiguous(torch.randn(256, 4096, dtype=dt))
+            weight = torch.randn(4096, dtype=dt)
+            eps = 1e-6
+            out = torch.ops.sgl_kernel.gemma_rmsnorm_cpu(x, weight, eps)
+            ref = gemma_rmsnorm_native(x, weight, eps)
+            atol = rtol = precision["pointwise_default"][dt]
+            with self.subTest(dtype=dt):
+                torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
 
 @unittest.skipUnless(
@@ -212,7 +236,7 @@ class TestRVVNormLayer(CustomTestCase):
         out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, None, eps)
         ref = layernorm_native(x, weight, eps)
 
-        atol = rtol = precision["default"][dtype]
+        atol = rtol = precision["pointwise_default"][dtype]
         torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
     def run_case_norm_layer_fused_add(self, m, n, dtype):
@@ -230,7 +254,7 @@ class TestRVVNormLayer(CustomTestCase):
         )
         ref_out, ref_res = layernorm_native(ref_x, weight, eps, ref_residual)
 
-        atol = rtol = precision["default"][dtype]
+        atol = rtol = precision["pointwise_default"][dtype]
         torch.testing.assert_close(out, ref_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_res, atol=atol, rtol=rtol)
 
@@ -239,6 +263,35 @@ class TestRVVNormLayer(CustomTestCase):
         for m, n, dt in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=m, n=n, dtype=dt):
                 self.run_case_norm_layer(m, n, dt)
+
+    def test_case_layernorm_with_bias(self):
+        """Case: LayerNorm with non-None bias tensor."""
+        for m, n, dt in itertools.product([128, 257], [4096, 4109], self.dtype):
+            x = torch.randn([m, n], dtype=dt)
+            weight = torch.randn(n, dtype=dt)
+            bias = torch.randn(n, dtype=dt)
+            eps = 1e-6
+            out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, eps)
+            ref = layernorm_native(x, weight, eps)
+            ref = ref + bias
+            tol_map = precision.get("norm_layer_bias", precision["pointwise_default"])
+            atol = rtol = tol_map[dt]
+            if dt == torch.float16:
+                atol = rtol = max(atol, 1e-2)
+            with self.subTest(m=m, n=n, dtype=dt):
+                torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+
+    def test_case_layernorm_non_contiguous(self):
+        """Case: LayerNorm with non-contiguous input tensors."""
+        for dt in self.dtype:
+            x = helper_non_contiguous(torch.randn(256, 4096, dtype=dt))
+            weight = torch.randn(4096, dtype=dt)
+            eps = 1e-6
+            out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, None, eps)
+            ref = layernorm_native(x, weight, eps)
+            atol = rtol = precision["pointwise_default"][dt]
+            with self.subTest(dtype=dt):
+                torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
     def test_case_fused_add_layernorm(self):
         """Case: fused-add-LayerNorm across shape and dtype matrix."""
@@ -268,9 +321,7 @@ class TestRVVNormFusedGated(CustomTestCase):
         out = torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(x, weight, gate, eps)
         ref = fused_rmsnorm_gated_native(x, weight, gate, eps)
 
-        atol = rtol = (
-            precision["default"][dtype] * 2
-        )  # 2x: fused gate mul compounds BF16 rounding error
+        atol = rtol = precision["pointwise_default"][dtype] * 2
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     def test_case_fused_rmsnorm_gated(self):
@@ -278,6 +329,19 @@ class TestRVVNormFusedGated(CustomTestCase):
         for m, n, dt in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=m, n=n, dtype=dt):
                 self.run_case_norm_rms_gated(m, n, dt)
+
+    def test_case_fused_rmsnorm_gated_non_contiguous(self):
+        """Case: fused gated RMSNorm with non-contiguous input tensors."""
+        for dt in self.dtype:
+            x = helper_non_contiguous(torch.randn(256, 4096, dtype=dt))
+            gate = torch.randn(256, 4096, dtype=dt)  # gate must be contiguous
+            weight = torch.randn(4096, dtype=dt)
+            eps = 1e-6
+            out = torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(x, weight, gate, eps)
+            ref = fused_rmsnorm_gated_native(x, weight, gate, eps)
+            atol = rtol = precision["pointwise_default"][dt] * 2
+            with self.subTest(dtype=dt):
+                torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
