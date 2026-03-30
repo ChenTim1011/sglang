@@ -22,6 +22,7 @@ fi
 PODMAN_IMAGE="${PODMAN_IMAGE:-localhost/sglang-rvv:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-ci_sglang_rvv}"
 WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
+HF_HOME="${HF_HOME:-/root/.cache/huggingface}"
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -65,6 +66,7 @@ podman run -dt \
     --name "${CONTAINER_NAME}" \
     --ipc=host \
     -v "${WORKSPACE}:/workspace/sglang:z" \
+    -v "${HF_HOME}:/root/.cache/huggingface:z" \
     --security-opt no-new-privileges \
     --cpus=8 \
     --memory=16g \
