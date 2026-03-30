@@ -14,7 +14,6 @@
 
 #if defined(CPU_CAPABILITY_RVV)
 
-#include <omp.h>
 #include <riscv_vector.h>
 
 #include <algorithm>
@@ -27,27 +26,17 @@ void pack_weight(scalar_t* packed_w, const scalar_t* orig_w, int64_t N, int64_t 
   constexpr int64_t BN = rvv_constants::BLOCK_N;
   int64_t NB = (N + BN - 1) / BN;
 
-#pragma omp parallel for collapse(2)
-  for (int64_t nb = 0; nb < NB; ++nb) {
-    for (int64_t k = 0; k < K; ++k) {
+  at::parallel_for(0, NB * K, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
+      const int64_t nb = i / K;
+      const int64_t k = i % K;
       int64_t n_start = nb * BN;
       int64_t n_size = std::min(BN, N - n_start);
 
       scalar_t* dst = packed_w + nb * K * BN + k * BN;
 
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        size_t vl = 0;
-        for (int64_t j = 0; j < n_size; j += vl) {
-          vl = __riscv_vsetvl_e32m4(n_size - j);
-          vfloat32m4_t v_data = __riscv_vlse32_v_f32m4(orig_w + (n_start + j) * K + k, K * sizeof(float), vl);
-          __riscv_vse32_v_f32m4(dst + j, v_data, vl);
-        }
-        if (n_size < BN) {
-          size_t vl_pad = __riscv_vsetvl_e32m4(BN - n_size);
-          vfloat32m4_t v_zero = __riscv_vfmv_v_f_f32m4(0.0f, vl_pad);
-          __riscv_vse32_v_f32m4(dst + n_size, v_zero, vl_pad);
-        }
-      } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+      if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if defined(__riscv_zvfh) || defined(__riscv_v)
         size_t vl = 0;
         for (int64_t j = 0; j < n_size; j += vl) {
           vl = __riscv_vsetvl_e16m2(n_size - j);
@@ -60,6 +49,12 @@ void pack_weight(scalar_t* packed_w, const scalar_t* orig_w, int64_t N, int64_t 
           vfloat16m2_t v_zero = __riscv_vfmv_v_f_f16m2((_Float16)0.0f, vl_pad);
           __riscv_vse16_v_f16m2(reinterpret_cast<_Float16*>(dst + n_size), v_zero, vl_pad);
         }
+#else
+        for (int64_t j = 0; j < n_size; ++j)
+          dst[j] = orig_w[(n_start + j) * K + k];
+        for (int64_t j = n_size; j < BN; ++j)
+          dst[j] = static_cast<scalar_t>(0);
+#endif
       } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
         size_t vl = 0;
         for (int64_t j = 0; j < n_size; j += vl) {
@@ -82,7 +77,7 @@ void pack_weight(scalar_t* packed_w, const scalar_t* orig_w, int64_t N, int64_t 
         }
       }
     }
-  }
+  });
 }
 
 template <typename scalar_t, bool has_bias, int BLOCK_M, int BLOCK_N>
@@ -119,6 +114,9 @@ struct tinygemm_kernel_nn {
     // K-tiling: k_tile is the *outer* loop so A[m, k_tile] stays in cache
     // while all j (N) tiles are swept.  Correct loop order:
     //   for k_tile → for j → for k ∈ k_tile
+    // KB = L1_CACHE_BYTES / (BLOCK_N * sizeof(element)).
+    // Numerically: BLOCK_N*sizeof = (VLEN/4)*sizeof, which equals __riscv_v_fixed_vlen
+    // for float (4B) and __riscv_v_fixed_vlen/2 for fp16/bf16 (2B).
     constexpr int64_t KB = std::is_same_v<scalar_t, float> ? (rvv_constants::L1_CACHE_BYTES / __riscv_v_fixed_vlen)
                                                            : (rvv_constants::L1_CACHE_BYTES * 2 / __riscv_v_fixed_vlen);
 
@@ -133,7 +131,14 @@ struct tinygemm_kernel_nn {
           if constexpr (std::is_same_v<scalar_t, float>) {
             return __riscv_vle32_v_f32m4(ptr, vl);
           } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if defined(__riscv_zvfh) || defined(__riscv_v)
             return __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(reinterpret_cast<const _Float16*>(ptr), vl), vl);
+#else
+            alignas(64) float tmp[rvv_constants::MAX_VL_ELEMENTS_M4];
+            for (size_t i = 0; i < vl; ++i)
+              tmp[i] = static_cast<float>(ptr[i]);
+            return __riscv_vle32_v_f32m4(tmp, vl);
+#endif
           } else {
             return bf16_to_f32m4(reinterpret_cast<const uint16_t*>(ptr), vl);
           }
@@ -189,8 +194,15 @@ struct tinygemm_kernel_nn {
         if constexpr (std::is_same_v<scalar_t, float>) {
           __riscv_vse32_v_f32m4(c_ptr + j, v, vl);
         } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if defined(__riscv_zvfh) || defined(__riscv_v)
           vfloat16m2_t v_f16 = f32m4_to_f16(v, vl);
           __riscv_vse16_v_f16m2(reinterpret_cast<_Float16*>(c_ptr + j), v_f16, vl);
+#else
+          alignas(64) float tmp[rvv_constants::MAX_VL_ELEMENTS_M4];
+          __riscv_vse32_v_f32m4(tmp, v, vl);
+          for (size_t i = 0; i < vl; ++i)
+            c_ptr[j + i] = static_cast<scalar_t>(tmp[i]);
+#endif
         } else {
           vuint16m2_t v_bf16 = f32m4_to_bf16(v, vl);
           __riscv_vse16_v_u16m2(reinterpret_cast<uint16_t*>(c_ptr + j), v_bf16, vl);
@@ -373,8 +385,10 @@ void weight_packed_linear_kernel_impl(
   const int64_t NB = div_up(N, BLOCK_N);
 
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
-    parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-      loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+    at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t i = begin; i < end; ++i) {
+        const int64_t mb = i / NB;
+        const int64_t nb = i % NB;
         int64_t mb_start = mb * BLOCK_M;
         int64_t mb_size = std::min(M - mb_start, BLOCK_M);
         int64_t nb_start = nb * BLOCK_N;
@@ -382,7 +396,7 @@ void weight_packed_linear_kernel_impl(
 
         tinygemm_kernel<scalar_t, has_bias>(
             mat1 + mb_start * mat1_strideM,
-            mat2 + nb_start * K,  // pointer adjusted for NB block
+            mat2 + nb_start * K,
             out + mb_start * out_strideM + nb_start,
             bias ? bias + nb_start : nullptr,
             mb_size,
@@ -390,7 +404,7 @@ void weight_packed_linear_kernel_impl(
             K,
             mat1_strideM,
             out_strideM);
-      });
+      }
     });
   });
 }
@@ -407,16 +421,19 @@ void weight_packed_linear_fma_kernel_impl(
     int64_t mat1_strideM,
     int64_t out_strideM) {
   const size_t vl_max = __riscv_vsetvlmax_e32m4();
+  const int64_t NB = div_up(N, (int64_t)vl_max);
 
-#pragma omp parallel for if (M > 1)
-  for (int64_t m = 0; m < M; ++m) {
-    const scalar_t* a_row = mat1 + m * mat1_strideM;
-    scalar_t* c_row = out + m * out_strideM;
-
+  // Parallel over M × NB so all 8 cores are used even when M < num_threads.
+  at::parallel_for(0, M * NB, 0, [&](int64_t begin, int64_t end) {
     alignas(64) float linear_row[rvv_constants::MAX_VL_ELEMENTS_M4];
-
-    for (int64_t n_start = 0; n_start < N; n_start += vl_max) {
+    for (int64_t i = begin; i < end; ++i) {
+      const int64_t m = i / NB;
+      const int64_t nb = i % NB;
+      const int64_t n_start = nb * (int64_t)vl_max;
       size_t vl = __riscv_vsetvl_e32m4(N - n_start);
+
+      const scalar_t* a_row = mat1 + m * mat1_strideM;
+      scalar_t* c_row = out + m * out_strideM;
 
       // Initialize accumulator with bias or zero
       vfloat32m4_t v_acc =
@@ -432,7 +449,7 @@ void weight_packed_linear_fma_kernel_impl(
       __riscv_vse32_v_f32m4(linear_row, v_acc, vl);
       copy_stub(c_row + n_start, linear_row, vl);
     }
-  }
+  });
 }
 
 }  // anonymous namespace

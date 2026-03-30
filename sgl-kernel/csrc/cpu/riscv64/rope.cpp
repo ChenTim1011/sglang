@@ -27,7 +27,6 @@ void rotary_embedding_3D_kernel_impl(
     scalar_t* __restrict__ cos_sin_cache,
     int64_t num_tokens,
     int64_t num_heads,
-    int64_t num_kv_heads,
     int64_t head_size,
     int64_t rotary_dim,
     int64_t query_stride_s,
@@ -36,55 +35,70 @@ void rotary_embedding_3D_kernel_impl(
     int64_t key_stride_s,
     int64_t query_stride_h,
     int64_t query_out_stride_h) {
-  int64_t COFF = rotary_dim / 2;
-  at::parallel_for(0, num_tokens * num_heads, GRAIN_SIZE / rotary_dim, [&](int64_t begin, int64_t end) {
-    int64_t seq{0}, head_id{0};
-    data_index_init(begin, seq, num_tokens, head_id, num_heads);
-    for (int64_t i = begin; i < end; ++i) {
-      int64_t in_offset_q = seq * query_stride_s + head_id * query_stride_h;
-      int64_t out_offset_q = seq * query_out_stride_s + head_id * query_out_stride_h;
-      int64_t out_offset_k = seq * key_out_stride_s;
-      int64_t p = positions[seq];
-      scalar_t* sin_start = cos_sin_cache + p * rotary_dim + COFF;
-      scalar_t* cos_start = cos_sin_cache + p * rotary_dim;
+  int64_t embed_dim = rotary_dim / 2;
+  const ptrdiff_t stride = 2 * static_cast<ptrdiff_t>(sizeof(scalar_t));
 
-      for (int64_t h = 0; h < rotary_dim; h += 2) {
-        float cos_val = static_cast<float>(cos_start[h >> 1]);
-        float sin_val = static_cast<float>(sin_start[h >> 1]);
-        float q1 = static_cast<float>(query[in_offset_q + h]);
-        float q2 = static_cast<float>(query[in_offset_q + h + 1]);
-        query_out[out_offset_q + h] = static_cast<scalar_t>(q1 * cos_val - q2 * sin_val);
-        query_out[out_offset_q + h + 1] = static_cast<scalar_t>(q2 * cos_val + q1 * sin_val);
+  at::parallel_for(0, num_tokens * num_heads, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t idx = begin; idx < end; ++idx) {
+      int64_t seq = idx / num_heads;
+      int64_t head_id = idx % num_heads;
+      // Scratch only used by generic scalar fallback in load/store helpers; dead for BF16/FP16.
+      alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
+      int64_t p = positions[seq];
+      scalar_t* cos_ptr = cos_sin_cache + p * rotary_dim;
+      scalar_t* sin_ptr = cos_ptr + embed_dim;
+
+      // Vectorized adjacent-pair rotation for query (out-of-place).
+      scalar_t* q_in = query + seq * query_stride_s + head_id * query_stride_h;
+      scalar_t* q_out = query_out + seq * query_out_stride_s + head_id * query_out_stride_h;
+      size_t vl = 0;
+      for (int64_t j = 0; j < embed_dim; j += static_cast<int64_t>(vl)) {
+        vl = __riscv_vsetvl_e32m4(embed_dim - j);
+        vfloat32m4_t v_cos = load_as_float_m4(cos_ptr + j, vl, scratch);
+        vfloat32m4_t v_sin = load_as_float_m4(sin_ptr + j, vl, scratch);
+        vfloat32m4_t v_x = load_strided_as_float_m4(q_in + 2 * j, stride, vl, scratch);
+        vfloat32m4_t v_y = load_strided_as_float_m4(q_in + 2 * j + 1, stride, vl, scratch);
+        vfloat32m4_t v_out_x = __riscv_vfmul_vv_f32m4(v_x, v_cos, vl);
+        v_out_x = __riscv_vfnmsac_vv_f32m4(v_out_x, v_y, v_sin, vl);
+        vfloat32m4_t v_out_y = __riscv_vfmul_vv_f32m4(v_y, v_cos, vl);
+        v_out_y = __riscv_vfmacc_vv_f32m4(v_out_y, v_x, v_sin, vl);
+        store_strided_from_float_m4(q_out + 2 * j, stride, v_out_x, vl, scratch);
+        store_strided_from_float_m4(q_out + 2 * j + 1, stride, v_out_y, vl, scratch);
       }
-      for (int64_t h = rotary_dim; h < head_size; ++h) {
-        query_out[out_offset_q + h] = query[in_offset_q + h];
-      }
+      // Copy non-rotated tail of query.
+      for (int64_t h = rotary_dim; h < head_size; ++h)
+        q_out[h] = q_in[h];
+
       // Key has only 1 head in 3D layout (num_kv_heads == 1, enforced by CHECK_EQ).
       // Only the first query head writes the key output to avoid redundant stores.
       if (head_id == 0) {
-        int64_t k_pe_offset = seq * key_stride_s;
-        for (int64_t h = 0; h < rotary_dim; h += 2) {
-          float cos_val = static_cast<float>(cos_start[h >> 1]);
-          float sin_val = static_cast<float>(sin_start[h >> 1]);
-          float k1 = static_cast<float>(key[k_pe_offset + h]);
-          float k2 = static_cast<float>(key[k_pe_offset + h + 1]);
-          key_out[out_offset_k + h] = static_cast<scalar_t>(k1 * cos_val - k2 * sin_val);
-          key_out[out_offset_k + h + 1] = static_cast<scalar_t>(k2 * cos_val + k1 * sin_val);
+        scalar_t* k_in = key + seq * key_stride_s;
+        scalar_t* k_out = key_out + seq * key_out_stride_s;
+        size_t vl_k = 0;
+        for (int64_t j = 0; j < embed_dim; j += static_cast<int64_t>(vl_k)) {
+          vl_k = __riscv_vsetvl_e32m4(embed_dim - j);
+          vfloat32m4_t v_cos = load_as_float_m4(cos_ptr + j, vl_k, scratch);
+          vfloat32m4_t v_sin = load_as_float_m4(sin_ptr + j, vl_k, scratch);
+          vfloat32m4_t v_x = load_strided_as_float_m4(k_in + 2 * j, stride, vl_k, scratch);
+          vfloat32m4_t v_y = load_strided_as_float_m4(k_in + 2 * j + 1, stride, vl_k, scratch);
+          vfloat32m4_t v_out_x = __riscv_vfmul_vv_f32m4(v_x, v_cos, vl_k);
+          v_out_x = __riscv_vfnmsac_vv_f32m4(v_out_x, v_y, v_sin, vl_k);
+          vfloat32m4_t v_out_y = __riscv_vfmul_vv_f32m4(v_y, v_cos, vl_k);
+          v_out_y = __riscv_vfmacc_vv_f32m4(v_out_y, v_x, v_sin, vl_k);
+          store_strided_from_float_m4(k_out + 2 * j, stride, v_out_x, vl_k, scratch);
+          store_strided_from_float_m4(k_out + 2 * j + 1, stride, v_out_y, vl_k, scratch);
         }
         // Copy non-rotated tail of key.
-        for (int64_t h = rotary_dim; h < head_size; ++h) {
-          key_out[out_offset_k + h] = key[k_pe_offset + h];
-        }
+        for (int64_t h = rotary_dim; h < head_size; ++h)
+          k_out[h] = k_in[h];
       }
-
-      data_index_step(seq, num_tokens, head_id, num_heads);
     }
   });
 }
 
 // Neox 4D kernel: in-place
 // Paired indices: (j, embed_dim + j) — front half / back half
-// Cache layout: [cos(embed_dim) | sin(embed_dim)] per position
+// Cache layout: [cos(rotary_dim/2) | sin(rotary_dim/2)] per position
 template <typename scalar_t>
 void rotary_embedding_neox_4D_kernel_impl(
     int64_t* __restrict__ positions,
@@ -106,7 +120,7 @@ void rotary_embedding_neox_4D_kernel_impl(
   int64_t embed_dim = rotary_dim / 2;
 
   // scratch is per-call-site (inside lambda) to avoid data race under OMP parallel
-  auto compute_loop = [&](scalar_t* cache_ptr, scalar_t* qk, int64_t token_head) {
+  auto compute_head = [&](scalar_t* cache_ptr, scalar_t* qk, int64_t token_head) {
     alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
     size_t vl = 0;
     for (int64_t j = 0; j < embed_dim; j += vl) {
@@ -135,27 +149,28 @@ void rotary_embedding_neox_4D_kernel_impl(
     }
   };
 
-#pragma omp parallel for collapse(2)
-  for (int64_t bs = 0; bs < batch_size; ++bs) {
-    for (int64_t seq = 0; seq < seq_len; ++seq) {
+  at::parallel_for(0, batch_size * seq_len, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t idx = begin; idx < end; ++idx) {
+      int64_t bs = idx / seq_len;
+      int64_t seq = idx % seq_len;
       int64_t pos = positions[bs * seq_len + seq];
       scalar_t* cache_ptr = cos_sin_cache + pos * rotary_dim;
 
       for (int64_t i = 0; i < num_heads; ++i) {
         int64_t token_head = bs * query_stride_b + seq * query_stride_s + i * query_stride_h;
-        compute_loop(cache_ptr, query, token_head);
+        compute_head(cache_ptr, query, token_head);
       }
 
       for (int64_t i = 0; i < num_kv_heads; ++i) {
         int64_t token_head = bs * key_stride_b + seq * key_stride_s + i * key_stride_h;
-        compute_loop(cache_ptr, key, token_head);
+        compute_head(cache_ptr, key, token_head);
       }
     }
-  }
+  });
 }
 // Non-neox 4D kernel: in-place
 // Paired indices: (2j, 2j+1) — adjacent pairs
-// Cache layout: [cos(embed_dim) | sin(embed_dim)] per position
+// Cache layout: [cos(rotary_dim/2) | sin(rotary_dim/2)] per position
 template <typename scalar_t>
 void rotary_embedding_4D_kernel_impl(
     int64_t* __restrict__ positions,
@@ -177,10 +192,10 @@ void rotary_embedding_4D_kernel_impl(
   int64_t embed_dim = rotary_dim / 2;
 
   // Vectorized adjacent-pair rotation using stride-2 load/store.
-  // cache_ptr points to [cos(embed_dim) | sin(embed_dim)] for the token's position.
+  // cache_ptr points to [cos(rotary_dim/2) | sin(rotary_dim/2)] for the token's position.
   // head_ptr points to the start of one head: layout [x0, y0, x1, y1, ...].
   // stride = 2 * sizeof(scalar_t) so strided loads pick up every other element.
-  auto compute_body = [&](scalar_t* cache_ptr, scalar_t* head_ptr) {
+  auto compute_head = [&](scalar_t* cache_ptr, scalar_t* head_ptr) {
     alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
     scalar_t* cos_ptr = cache_ptr;
     scalar_t* sin_ptr = cache_ptr + embed_dim;
@@ -206,21 +221,22 @@ void rotary_embedding_4D_kernel_impl(
     }
   };
 
-#pragma omp parallel for collapse(2)
-  for (int64_t bs = 0; bs < batch_size; ++bs) {
-    for (int64_t seq = 0; seq < seq_len; ++seq) {
+  at::parallel_for(0, batch_size * seq_len, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t idx = begin; idx < end; ++idx) {
+      int64_t bs = idx / seq_len;
+      int64_t seq = idx % seq_len;
       int64_t pos = positions[bs * seq_len + seq];
       scalar_t* cache_ptr = cos_sin_cache + pos * rotary_dim;
       for (int64_t i = 0; i < num_heads; ++i) {
         int64_t token_head = bs * query_stride_b + seq * query_stride_s + i * query_stride_h;
-        compute_body(cache_ptr, query + token_head);
+        compute_head(cache_ptr, query + token_head);
       }
       for (int64_t i = 0; i < num_kv_heads; ++i) {
         int64_t token_head = bs * key_stride_b + seq * key_stride_s + i * key_stride_h;
-        compute_body(cache_ptr, key + token_head);
+        compute_head(cache_ptr, key + token_head);
       }
     }
-  }
+  });
 }
 
 }  // namespace
@@ -275,11 +291,17 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 
   int64_t query_stride_h = input_dim == 2 ? head_size : query.stride(-2);
   int64_t key_stride_h = input_dim == 2 ? head_size : key.stride(-2);
-  at::Tensor query_out = at::empty_like(query);
-  at::Tensor key_out = at::empty_like(key);
-  int64_t query_out_stride_s = query_out.stride(0);
-  int64_t key_out_stride_s = key_out.stride(0);
-  int64_t query_out_stride_h = input_dim == 3 ? query_out.stride(1) : -1;
+  // Output tensors: allocated here only for the 3D out-of-place path.
+  // 2D/4D in-place paths reassign query_out/key_out to the input tensors inside the dispatch.
+  at::Tensor query_out, key_out;
+  int64_t query_out_stride_s = 0, key_out_stride_s = 0, query_out_stride_h = 0;
+  if (input_dim == 3) {
+    query_out = at::empty_like(query);
+    key_out = at::empty_like(key);
+    query_out_stride_s = query_out.stride(0);
+    key_out_stride_s = key_out.stride(0);
+    query_out_stride_h = query_out.stride(1);
+  }
   int64_t batch_size = 1;
   int64_t seq_len = num_tokens;
   int64_t query_stride_b = 0;
@@ -351,7 +373,6 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
           cos_sin_cache.data_ptr<scalar_t>(),
           num_tokens,
           num_heads,
-          num_kv_heads,
           head_size,
           rotary_dim,
           query_stride_s,

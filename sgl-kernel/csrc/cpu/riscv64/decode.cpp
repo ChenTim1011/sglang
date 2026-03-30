@@ -2,8 +2,6 @@
 #pragma clang riscv intrinsic vector
 #endif
 
-#include <alloca.h>
-
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -327,12 +325,15 @@ inline void tinygemm_kernel_nn_scalar(
     int64_t max_tokens,
     float v_scale = 1.0f,                         // Static scale (used when v_scales_per_token==nullptr)
     const float* v_scales_per_token = nullptr) {  // Per-token scale array indexed by k (token position)
+  // Validate all V-cache token indices once before entering the computation loops.
+  for (int64_t k = 0; k < K; ++k) {
+    TORCH_CHECK(indices[k] < max_tokens, "token index out of scope!");
+  }
   for (int64_t m = 0; m < M; ++m) {
     for (int64_t n = 0; n < N; ++n) {
       C[m * ldc + n] *= scale[m];
       for (int64_t k = 0; k < K; ++k) {
         int64_t b_idx = indices[k];
-        TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
         float tok_v_scale = (v_scales_per_token && is_quantized<kv_t>::value) ? v_scales_per_token[k] : v_scale;
         float b_val = load_and_dequant(B + b_idx * ldb + n, tok_v_scale);
         C[m * ldc + n] += A[m * lda + k] * b_val;
@@ -343,7 +344,11 @@ inline void tinygemm_kernel_nn_scalar(
 // GEMM handles v' * scale + attn @ value (indexed)
 //   A : [M, K]
 //   B : [K, N] indexed
-//   C ：[M, N]
+//   C : [M, N]
+//
+// NOTE: C must be zero-initialized by the caller before the first call.
+// This kernel accumulates: C = C * scale + A @ B_indexed.
+// Callers must ensure zero-init via init_v_prime_split().
 //
 // Generic scalar fallback: delegates to tinygemm_kernel_nn_scalar.
 // kv_t=int8_t is now handled by the partial specialization below.
@@ -391,6 +396,11 @@ struct tinygemm_kernel_nn<at::BFloat16, at::BFloat16, index_t, BLOCK_M, BLOCK_N>
     size_t vl_max = __riscv_vsetvlmax_e32m1();
     int64_t tile_n = COLS * vl_max;
 
+    // Validate all V-cache token indices once before entering the tile loop.
+    for (int64_t k = 0; k < K; ++k) {
+      TORCH_CHECK(indices[k] < max_tokens, "token index out of scope!");
+    }
+
     // Outer loop: Tiling over N
     for (int64_t nb = 0; nb < BLOCK_N; nb += tile_n) {
       vf32m1_t vc[ROWS * COLS];
@@ -421,7 +431,6 @@ struct tinygemm_kernel_nn<at::BFloat16, at::BFloat16, index_t, BLOCK_M, BLOCK_N>
       // 3. Main Computation Loop (K)
       for (int64_t k = 0; k < K; ++k) {
         int64_t b_idx = indices[k];
-        TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
 
         // Prefetch next B row
         if (k + 1 < K) {
@@ -485,6 +494,11 @@ struct tinygemm_kernel_nn<at::Half, at::Half, index_t, BLOCK_M, BLOCK_N> {
     size_t vl_max = __riscv_vsetvlmax_e32m1();
     int64_t tile_n = COLS * vl_max;
 
+    // Validate all V-cache token indices once before entering the tile loop.
+    for (int64_t k = 0; k < K; ++k) {
+      TORCH_CHECK(indices[k] < max_tokens, "token index out of scope!");
+    }
+
     // Outer loop: Tiling over N
     for (int64_t nb = 0; nb < BLOCK_N; nb += tile_n) {
       vf32m1_t vc[ROWS * COLS];
@@ -515,7 +529,6 @@ struct tinygemm_kernel_nn<at::Half, at::Half, index_t, BLOCK_M, BLOCK_N> {
       // 3. Main Computation Loop (K)
       for (int64_t k = 0; k < K; ++k) {
         int64_t b_idx = indices[k];
-        TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
 
         // Prefetch next B row
         if (k + 1 < K) {
@@ -581,6 +594,11 @@ struct tinygemm_kernel_nn<scalar_t, int8_t, index_t, BLOCK_M, BLOCK_N> {
     size_t vl_max = __riscv_vsetvlmax_e32m1();
     int64_t tile_n = COLS * vl_max;
 
+    // Validate all V-cache token indices once before entering the tile loop.
+    for (int64_t k = 0; k < K; ++k) {
+      TORCH_CHECK(indices[k] < max_tokens, "token index out of scope!");
+    }
+
     for (int64_t nb = 0; nb < BLOCK_N; nb += tile_n) {
       vf32m1_t vc[ROWS * COLS];
       size_t vls[COLS];
@@ -606,7 +624,6 @@ struct tinygemm_kernel_nn<scalar_t, int8_t, index_t, BLOCK_M, BLOCK_N> {
       // 3. K loop: accumulate attn_score[m][k] * V[indices[k]][n].
       for (int64_t k = 0; k < K; ++k) {
         int64_t b_idx = indices[k];
-        TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
         if (k + 1 < K) __builtin_prefetch(B + indices[k + 1] * ldb + nb, 0, 1);
 
         // Fold per-token V dequant scale into the attention score scalar to
@@ -684,9 +701,9 @@ void index_gemm_kernel_nt(
   if (M == 1) {
     constexpr int64_t BLOCK_N = 8;
     const int64_t NB = div_up(N, BLOCK_N);
-    // lda/ldc shadow the function parameters intentionally: with M==1 the kernel
-    // only accesses row 0 (A[0*lda+k] == A[k]), so the actual stride is irrelevant.
-    int64_t mb_start = 0, lda = 1, ldc = 1;
+    // M==1: mb_start=0, so A+mb_start*lda==A and C+mb_start*ldc==C regardless
+    // of lda/ldc; the function-scope parameters are used directly via the macro.
+    int64_t mb_start = 0;
 
     for (int64_t nb = 0; nb < NB; ++nb) {
       int64_t nb_start = nb * BLOCK_N;
@@ -838,8 +855,11 @@ void index_gemm_kernel_nn(
     float v_scale = 1.0f,                         // Only used for INT8 dequantization
     const float* v_scales_per_token = nullptr) {  // Per-token scales; overrides v_scale if not null
   using kv_type = kv_t;
-  // N must be a multiple of kVecSize (16); non-aligned sizes fall through to scalar path.
-  constexpr int kVecSize = 16;
+  // kVecSize = vl_max_e32m1 = VLEN/32.
+  // __riscv_v_fixed_vlen is a compile-time constant injected by -mrvv-vector-bits=N,
+  constexpr int kVecSize = static_cast<int>(__riscv_v_fixed_vlen) / 32;
+  constexpr int kVecShift = __builtin_ctz(static_cast<unsigned int>(kVecSize));
+  // N must be a multiple of kVecSize; non-aligned sizes fall through to scalar path.
   if ((N & (kVecSize - 1)) != 0) {
     tinygemm_kernel_nn_scalar<scalar_t, kv_t, index_t>(
         A, B, C, indices, scale, M, N, K, lda, ldb, ldc, max_tokens, v_scale, v_scales_per_token);
@@ -848,40 +868,41 @@ void index_gemm_kernel_nn(
 
   // pattern: 1-8-8 for decode (M==1)
   if (M == 1) {
+    // BLOCK_N = 8 * kVecSize: 8 full vl_max-wide strips per tile.
     constexpr int64_t BLOCK_N = 8 * kVecSize;
     const int64_t NB = div_up(N, BLOCK_N);
-    // lda/ldc shadow the function parameters intentionally: with M==1 the kernel
-    // only accesses row 0 (A[0*lda+k] == A[k]), so the actual stride is irrelevant.
-    int64_t mb_start = 0, lda = 1, ldc = 1;
+    // M==1: mb_start=0, so A+mb_start*lda==A and C+mb_start*ldc==C regardless
+    // of lda/ldc; the function-scope parameters are used directly via the macro.
+    int64_t mb_start = 0;
 
     for (int64_t nb = 0; nb < NB; ++nb) {
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch (nb_size >> 4) {
+      switch (nb_size >> kVecShift) {
         case 1:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 16);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 1);
           break;
         case 2:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 32);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 2);
           break;
         case 3:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 48);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 3);
           break;
         case 4:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 64);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 4);
           break;
         case 5:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 80);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 5);
           break;
         case 6:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 96);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 6);
           break;
         case 7:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 112);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 7);
           break;
         case 8:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 128);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 8);
           break;
         default:
           TORCH_CHECK(false, "Unexpected block size, 1x", nb_size);
@@ -890,7 +911,8 @@ void index_gemm_kernel_nn(
     return;
   }
 
-  // Batch pattern: BLOCK_M x BLOCK_N tiling
+  // Batch pattern: BLOCK_M x BLOCK_N tiling.
+  // BLOCK_N = 6 * kVecSize: 6 full vl_max-wide strips per tile.
   constexpr int64_t BLOCK_M = 4;
   constexpr int64_t BLOCK_N = 6 * kVecSize;
   const int64_t MB = div_up(M, BLOCK_M);
@@ -903,82 +925,83 @@ void index_gemm_kernel_nn(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch (mb_size << 4 | nb_size >> 4) {
+      // Upper nibble: mb_size (1–4); lower nibble: nb_size / kVecSize (1–6).
+      switch (mb_size << 4 | nb_size >> kVecShift) {
         // mb_size = 1
         case 0x11:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 16);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 1);
           break;
         case 0x12:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 32);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 2);
           break;
         case 0x13:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 48);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 3);
           break;
         case 0x14:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 64);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 4);
           break;
         case 0x15:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 80);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 5);
           break;
         case 0x16:
-          LAUNCH_TINYGEMM_KERNEL_NN(1, 96);
+          LAUNCH_TINYGEMM_KERNEL_NN(1, kVecSize * 6);
           break;
         // mb_size = 2
         case 0x21:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 16);
+          LAUNCH_TINYGEMM_KERNEL_NN(2, kVecSize * 1);
           break;
         case 0x22:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 32);
+          LAUNCH_TINYGEMM_KERNEL_NN(2, kVecSize * 2);
           break;
         case 0x23:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 48);
+          LAUNCH_TINYGEMM_KERNEL_NN(2, kVecSize * 3);
           break;
         case 0x24:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 64);
+          LAUNCH_TINYGEMM_KERNEL_NN(2, kVecSize * 4);
           break;
         case 0x25:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 80);
+          LAUNCH_TINYGEMM_KERNEL_NN(2, kVecSize * 5);
           break;
         case 0x26:
-          LAUNCH_TINYGEMM_KERNEL_NN(2, 96);
+          LAUNCH_TINYGEMM_KERNEL_NN(2, kVecSize * 6);
           break;
         // mb_size = 3
         case 0x31:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 16);
+          LAUNCH_TINYGEMM_KERNEL_NN(3, kVecSize * 1);
           break;
         case 0x32:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 32);
+          LAUNCH_TINYGEMM_KERNEL_NN(3, kVecSize * 2);
           break;
         case 0x33:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 48);
+          LAUNCH_TINYGEMM_KERNEL_NN(3, kVecSize * 3);
           break;
         case 0x34:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 64);
+          LAUNCH_TINYGEMM_KERNEL_NN(3, kVecSize * 4);
           break;
         case 0x35:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 80);
+          LAUNCH_TINYGEMM_KERNEL_NN(3, kVecSize * 5);
           break;
         case 0x36:
-          LAUNCH_TINYGEMM_KERNEL_NN(3, 96);
+          LAUNCH_TINYGEMM_KERNEL_NN(3, kVecSize * 6);
           break;
         // mb_size = 4
         case 0x41:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 16);
+          LAUNCH_TINYGEMM_KERNEL_NN(4, kVecSize * 1);
           break;
         case 0x42:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 32);
+          LAUNCH_TINYGEMM_KERNEL_NN(4, kVecSize * 2);
           break;
         case 0x43:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 48);
+          LAUNCH_TINYGEMM_KERNEL_NN(4, kVecSize * 3);
           break;
         case 0x44:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 64);
+          LAUNCH_TINYGEMM_KERNEL_NN(4, kVecSize * 4);
           break;
         case 0x45:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 80);
+          LAUNCH_TINYGEMM_KERNEL_NN(4, kVecSize * 5);
           break;
         case 0x46:
-          LAUNCH_TINYGEMM_KERNEL_NN(4, 96);
+          LAUNCH_TINYGEMM_KERNEL_NN(4, kVecSize * 6);
           break;
         default:
           TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", nb_size);
@@ -1019,6 +1042,7 @@ void decode_set_kv_buffer(
         int64_t next_bs = bs, next_head = head_kv_id;
         data_index_step(next_bs, batches, next_head, num_heads_kv);
         __builtin_prefetch(key + next_bs * nk_strideN + next_head * nk_strideH, 0, 1);
+        __builtin_prefetch(value + next_bs * nv_strideN + next_head * nv_strideH, 0, 1);
       }
 
       copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size);
@@ -1048,7 +1072,11 @@ void decode_set_kv_buffer_int8_copy(
     int64_t nk_strideN,
     int64_t nk_strideH,
     int64_t nv_strideN,
-    int64_t nv_strideH) {
+    int64_t nv_strideH,
+    float k_scale = 1.0f,            // Written to k_scale_buf if non-null
+    float v_scale = 1.0f,            // Written to v_scale_buf if non-null
+    float* k_scale_buf = nullptr,    // [max_tokens, num_kv_heads]; per-token K scales
+    float* v_scale_buf = nullptr) {  // [max_tokens, num_kv_heads]; per-token V scales
   at::parallel_for(0, batches * num_heads_kv, 0, [&](int64_t begin, int64_t end) {
     int64_t bs{0}, head_kv_id{0};
     data_index_init(begin, bs, batches, head_kv_id, num_heads_kv);
@@ -1069,6 +1097,9 @@ void decode_set_kv_buffer_int8_copy(
       buffer_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
       const buffer_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
       copy_stub<buffer_t>(v_buffer_ptr, new_value_ptr, head_size_v);
+
+      if (k_scale_buf) k_scale_buf[loc_val * num_heads_kv + head_kv_id] = k_scale;
+      if (v_scale_buf) v_scale_buf[loc_val * num_heads_kv + head_kv_id] = v_scale;
 
       data_index_step(bs, batches, head_kv_id, num_heads_kv);
     }
@@ -1096,8 +1127,8 @@ void decode_set_kv_buffer_int8_quantize(
     int64_t nv_strideH,
     float k_scale,
     float v_scale,
-    float* k_scale_buf = nullptr,    // [max_tokens * num_heads_kv] — written when k_scale==1.0
-    float* v_scale_buf = nullptr) {  // [max_tokens * num_heads_kv] — written when v_scale==1.0
+    float* k_scale_buf = nullptr,    // [max_tokens * num_heads_kv] — written when non-null
+    float* v_scale_buf = nullptr) {  // [max_tokens * num_heads_kv] — written when non-null
   at::parallel_for(0, batches * num_heads_kv, 0, [&](int64_t begin, int64_t end) {
     int64_t bs{0}, head_kv_id{0};
     data_index_init(begin, bs, batches, head_kv_id, num_heads_kv);
@@ -1107,19 +1138,22 @@ void decode_set_kv_buffer_int8_quantize(
       int8_t* k_buffer_ptr = reinterpret_cast<int8_t*>(k_buffer + loc_val * k_strideN + head_kv_id * k_strideH);
       const scalar_t* new_key_ptr = key + bs * nk_strideN + head_kv_id * nk_strideH;
       float* k_scale_out = k_scale_buf ? (k_scale_buf + loc_val * num_heads_kv + head_kv_id) : nullptr;
-      quantize_and_copy(k_buffer_ptr, new_key_ptr, head_size, k_scale, k_scale_out);
 
-      int8_t* v_buffer_ptr = reinterpret_cast<int8_t*>(v_buffer + loc_val * v_strideN + head_kv_id * v_strideH);
-      const scalar_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
-      float* v_scale_out = v_scale_buf ? (v_scale_buf + loc_val * num_heads_kv + head_kv_id) : nullptr;
-      quantize_and_copy(v_buffer_ptr, new_value_ptr, head_size_v, v_scale, v_scale_out);
-
+      // Prefetch next iteration's source data before the current copy to
+      // maximize cache lead time (matches decode_set_kv_buffer pattern).
       if (i + 1 < end) {
         int64_t next_bs = bs, next_head = head_kv_id;
         data_index_step(next_bs, batches, next_head, num_heads_kv);
         __builtin_prefetch(key + next_bs * nk_strideN + next_head * nk_strideH, 0, 1);
         __builtin_prefetch(value + next_bs * nv_strideN + next_head * nv_strideH, 0, 1);
       }
+
+      quantize_and_copy(k_buffer_ptr, new_key_ptr, head_size, k_scale, k_scale_out);
+
+      int8_t* v_buffer_ptr = reinterpret_cast<int8_t*>(v_buffer + loc_val * v_strideN + head_kv_id * v_strideH);
+      const scalar_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
+      float* v_scale_out = v_scale_buf ? (v_scale_buf + loc_val * num_heads_kv + head_kv_id) : nullptr;
+      quantize_and_copy(v_buffer_ptr, new_value_ptr, head_size_v, v_scale, v_scale_out);
 
       data_index_step(bs, batches, head_kv_id, num_heads_kv);
     }
@@ -1500,15 +1534,20 @@ void decode_attention_grouped_kernel_impl(
             /* k_scales_per_token */ k_scales_ptr);
 
         if (has_logit_cap) {
-          const int64_t total_size = h_size * BLOCK_N;
+          // Apply per-row, up to n_size only. h_size rows × BLOCK_N columns,
+          // but only n_size elements per row are valid (partial last block).
+          // Reading s_i[h*BLOCK_N + n_size..BLOCK_N-1] is C++ UB (uninitialized).
           size_t vl_max = __riscv_vsetvlmax_e32m4();
-          for (int64_t idx = 0; idx < total_size; idx += vl_max) {
-            size_t vl = __riscv_vsetvl_e32m4(total_size - idx);
-            vfloat32m4_t vx = __riscv_vle32_v_f32m4(s_i + idx, vl);
-            vx = __riscv_vfmul_vf_f32m4(vx, rlogit_cap, vl);
-            vx = vftanh_f32m4(vx, vl);
-            vx = __riscv_vfmul_vf_f32m4(vx, logit_cap, vl);
-            __riscv_vse32_v_f32m4(s_i + idx, vx, vl);
+          for (int64_t h = 0; h < h_size; ++h) {
+            float* row = s_i + h * BLOCK_N;
+            for (int64_t idx = 0; idx < n_size; idx += vl_max) {
+              size_t vl = __riscv_vsetvl_e32m4(n_size - idx);
+              vfloat32m4_t vx = __riscv_vle32_v_f32m4(row + idx, vl);
+              vx = __riscv_vfmul_vf_f32m4(vx, rlogit_cap, vl);
+              vx = vftanh_f32m4(vx, vl);
+              vx = __riscv_vfmul_vf_f32m4(vx, logit_cap, vl);
+              __riscv_vse32_v_f32m4(row + idx, vx, vl);
+            }
           }
         }
 
@@ -1586,7 +1625,7 @@ void decode_attention_grouped_kernel_impl(
             vv = __riscv_vfmul_vf_f32m8(vv, s, vl);
             __riscv_vse32_v_f32m8(v_ptr + d, vv, vl);
           }
-          v_ptr[head_size_v] = m_prime[h] + std::log(s_prime[h]);
+          v_ptr[head_size_v] = m_prime[h] + std::log(safe_s_prime);
         }
       }
 
@@ -1652,6 +1691,16 @@ void decode_attention_cpu(
   int64_t head_size = query.size(2);
   int64_t head_size_v = v_buffer.size(2);
 
+  TORCH_CHECK(
+      head_size <= MAX_HEAD_SIZE && head_size_v <= MAX_HEAD_SIZE,
+      "decode_attention_cpu: head_size (",
+      head_size,
+      ") or head_size_v (",
+      head_size_v,
+      ") exceeds MAX_HEAD_SIZE (",
+      MAX_HEAD_SIZE,
+      "). Recompile with a larger MAX_HEAD_SIZE to support this configuration.");
+
   int64_t num_kv_splits = attn_logits.size(2);
 
   CHECK_EQ(loc.numel(), num_seqs);
@@ -1659,6 +1708,9 @@ void decode_attention_cpu(
   CHECK_EQ(attn_logits.size(1), num_heads);
   CHECK_EQ(attn_logits.size(3), head_size_v + 1);
   CHECK_EQ(attn_logits.scalar_type(), at::kFloat);
+  // decode_accumulate_kv_splits writes output as output + i*head_size_v
+  // (flat contiguous indexing). Verify the tensor is actually contiguous.
+  TORCH_CHECK(output.is_contiguous(), "decode_attention_cpu: output must be contiguous");
 
   int64_t q_strideM = query.stride(0);
   int64_t q_strideH = query.stride(1);
@@ -1854,6 +1906,10 @@ void decode_attention_int8_cpu(
       "decode_attention_int8_cpu: v_scale must be finite and positive, got ",
       v_scale);
 
+  // decode_accumulate_kv_splits writes output as output + i*head_size_v
+  // (flat contiguous indexing). Verify the tensor is actually contiguous.
+  TORCH_CHECK(output.is_contiguous(), "decode_attention_int8_cpu: output must be contiguous");
+
   int64_t num_kv_splits = attn_logits.size(2);
 
   int64_t q_strideM = query.stride(0);
@@ -1888,7 +1944,8 @@ void decode_attention_int8_cpu(
       AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
         // Update KV buffer with INT8 quantization
         if (key.scalar_type() == at::kByte || key.scalar_type() == at::kChar) {
-          // Input already INT8: just copy
+          // Input already INT8: copy data and record the caller-supplied scale in
+          // the per-token scale buffer so downstream reads see a consistent value.
           decode_set_kv_buffer_int8_copy<int8_t>(
               (int8_t*)k_buffer_data,
               (int8_t*)v_buffer_data,
@@ -1906,7 +1963,11 @@ void decode_attention_int8_cpu(
               nk_strideN,
               nk_strideH,
               nv_strideN,
-              nv_strideH);
+              nv_strideH,
+              k_scale,
+              v_scale,
+              k_scale_buf_ptr,
+              v_scale_buf_ptr);
         } else {
           AT_DISPATCH_RVV_TYPES(key.scalar_type(), "decode_set_kv_buffer_quantize", [&] {
             {
