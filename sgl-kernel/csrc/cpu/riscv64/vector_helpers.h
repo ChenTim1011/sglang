@@ -19,7 +19,7 @@ struct is_quantized<int8_t> : std::true_type {};
 namespace rvv_constants {
 // BLOCK_N = VLEN/4: weight packing tile size; each tile spans 2 vector iterations (m4).
 inline constexpr int BLOCK_N = __riscv_v_fixed_vlen / 4;
-// MAX_VL_ELEMENTS_M{4,8}: max elements per vsetvlmax for LMUL=4 and LMUL=8.
+// MAX_VL_ELEMENTS_M{4,8}: compile-time max VL for LMUL=4 and LMUL=8
 inline constexpr size_t MAX_VL_ELEMENTS_M4 = __riscv_v_fixed_vlen / 8;
 inline constexpr size_t MAX_VL_ELEMENTS_M8 = __riscv_v_fixed_vlen / 4;
 // L1 cache size for K-tiling. Set by -DRVV_L1_CACHE_KB=N at cmake time (default 32KB).
@@ -69,10 +69,6 @@ typedef vfloat32m1_t vf32m1_t __attribute__((riscv_rvv_vector_bits(__riscv_v_fix
 #define CPU_DISPATCH_PACKED_TYPES_RVV(TYPE, ...)                 \
   [&] {                                                          \
     switch (TYPE) {                                              \
-      case at::ScalarType::Float: {                              \
-        using packed_t = float;                                  \
-        return __VA_ARGS__();                                    \
-      }                                                          \
       case at::ScalarType::BFloat16: {                           \
         using packed_t = at::BFloat16;                           \
         return __VA_ARGS__();                                    \
@@ -126,9 +122,11 @@ inline vfloat32m4_t int8_to_f32m4(const int8_t* ptr, size_t vl) {
 // --- FP32 to BF16 ---
 // Extract upper 16 bits (sign + exp + upper 7 mantissa)
 
+#if defined(__riscv_zvfh) || defined(__riscv_v)
 inline vfloat16m2_t f32m4_to_f16(vfloat32m4_t v, size_t vl) {
   return __riscv_vfncvt_f_f_w_f16m2(v, vl);
 }
+#endif
 
 inline vuint16m2_t f32m4_to_bf16(vfloat32m4_t v_f32, size_t vl) {
   vuint32m4_t v_u32 = __riscv_vreinterpret_v_f32m4_u32m4(v_f32);
@@ -169,8 +167,14 @@ inline vfloat32m4_t load_as_float_m4(const scalar_t* ptr, size_t vl, float* scra
   if constexpr (std::is_same_v<scalar_t, float>) {
     return __riscv_vle32_v_f32m4(ptr, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if defined(__riscv_zvfh) || defined(__riscv_v)
     vfloat16m2_t v_f16 = __riscv_vle16_v_f16m2(reinterpret_cast<const _Float16*>(ptr), vl);
     return __riscv_vfwcvt_f_f_v_f32m4(v_f16, vl);
+#else
+    for (size_t i = 0; i < vl; ++i)
+      scratch[i] = static_cast<float>(ptr[i]);
+    return __riscv_vle32_v_f32m4(scratch, vl);
+#endif
   } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
     return bf16_to_f32m4(reinterpret_cast<const uint16_t*>(ptr), vl);
   } else if constexpr (std::is_same_v<scalar_t, int8_t>) {
@@ -187,8 +191,14 @@ inline vfloat32m8_t load_as_float_m8(const scalar_t* ptr, size_t vl, float* scra
   if constexpr (std::is_same_v<scalar_t, float>) {
     return __riscv_vle32_v_f32m8(ptr, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if defined(__riscv_zvfh) || defined(__riscv_v)
     vfloat16m4_t v_f16 = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(ptr), vl);
     return __riscv_vfwcvt_f_f_v_f32m8(v_f16, vl);
+#else
+    for (size_t i = 0; i < vl; ++i)
+      scratch[i] = static_cast<float>(ptr[i]);
+    return __riscv_vle32_v_f32m8(scratch, vl);
+#endif
   } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
     return bf16_to_f32m8(reinterpret_cast<const uint16_t*>(ptr), vl);
   } else {
@@ -203,8 +213,17 @@ inline vfloat32m4_t load_strided_as_float_m4(const scalar_t* ptr, ptrdiff_t stri
   if constexpr (std::is_same_v<scalar_t, float>) {
     return __riscv_vlse32_v_f32m4(ptr, stride_byte, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if defined(__riscv_zvfh) || defined(__riscv_v)
     vfloat16m2_t v_f16 = __riscv_vlse16_v_f16m2(reinterpret_cast<const _Float16*>(ptr), stride_byte, vl);
     return __riscv_vfwcvt_f_f_v_f32m4(v_f16, vl);
+#else
+    for (size_t i = 0; i < vl; ++i) {
+      const scalar_t* elem_ptr =
+          reinterpret_cast<const scalar_t*>(reinterpret_cast<const char*>(ptr) + i * stride_byte);
+      scratch[i] = static_cast<float>(*elem_ptr);
+    }
+    return __riscv_vle32_v_f32m4(scratch, vl);
+#endif
   } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
     // Manual strided load + convert for BF16
     vuint16m2_t v_bf16 = __riscv_vlse16_v_u16m2(reinterpret_cast<const uint16_t*>(ptr), stride_byte, vl);
@@ -227,8 +246,16 @@ store_strided_from_float_m4(scalar_t* ptr, ptrdiff_t stride_byte, vfloat32m4_t v
   if constexpr (std::is_same_v<scalar_t, float>) {
     __riscv_vsse32_v_f32m4(ptr, stride_byte, v, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if defined(__riscv_zvfh) || defined(__riscv_v)
     vfloat16m2_t v_f16 = __riscv_vfncvt_f_f_w_f16m2(v, vl);
     __riscv_vsse16_v_f16m2(reinterpret_cast<_Float16*>(ptr), stride_byte, v_f16, vl);
+#else
+    __riscv_vse32_v_f32m4(scratch, v, vl);
+    for (size_t i = 0; i < vl; ++i) {
+      scalar_t* elem = reinterpret_cast<scalar_t*>(reinterpret_cast<char*>(ptr) + i * stride_byte);
+      *elem = static_cast<scalar_t>(scratch[i]);
+    }
+#endif
   } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
     vuint16m2_t v_bf16 = f32m4_to_bf16(v, vl);
     __riscv_vsse16_v_u16m2(reinterpret_cast<uint16_t*>(ptr), stride_byte, v_bf16, vl);
@@ -270,8 +297,14 @@ inline void store_from_float_m2(scalar_t* ptr, vfloat32m2_t v, size_t vl, float*
   if constexpr (std::is_same_v<scalar_t, float>) {
     __riscv_vse32_v_f32m2(ptr, v, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if defined(__riscv_zvfh) || defined(__riscv_v)
     vfloat16m1_t v_f16 = __riscv_vfncvt_f_f_w_f16m1(v, vl);
     __riscv_vse16_v_f16m1(reinterpret_cast<_Float16*>(ptr), v_f16, vl);
+#else
+    __riscv_vse32_v_f32m2(scratch, v, vl);
+    for (size_t i = 0; i < vl; ++i)
+      ptr[i] = static_cast<scalar_t>(scratch[i]);
+#endif
   } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
     vuint32m2_t v_u32 = __riscv_vreinterpret_v_f32m2_u32m2(v);
     vuint16m1_t v_bf16 = __riscv_vnsrl_wx_u16m1(v_u32, 16, vl);
@@ -288,8 +321,14 @@ inline void store_from_float_m4(scalar_t* ptr, vfloat32m4_t v, size_t vl, float*
   if constexpr (std::is_same_v<scalar_t, float>) {
     __riscv_vse32_v_f32m4(ptr, v, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if defined(__riscv_zvfh) || defined(__riscv_v)
     vfloat16m2_t v_f16 = __riscv_vfncvt_f_f_w_f16m2(v, vl);
     __riscv_vse16_v_f16m2(reinterpret_cast<_Float16*>(ptr), v_f16, vl);
+#else
+    __riscv_vse32_v_f32m4(scratch, v, vl);
+    for (size_t i = 0; i < vl; ++i)
+      ptr[i] = static_cast<scalar_t>(scratch[i]);
+#endif
   } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
     vuint16m2_t v_bf16 = f32m4_to_bf16(v, vl);
     __riscv_vse16_v_u16m2(reinterpret_cast<uint16_t*>(ptr), v_bf16, vl);
@@ -305,8 +344,14 @@ inline void store_from_float_m8(scalar_t* ptr, vfloat32m8_t v, size_t vl, float*
   if constexpr (std::is_same_v<scalar_t, float>) {
     __riscv_vse32_v_f32m8(ptr, v, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if defined(__riscv_zvfh) || defined(__riscv_v)
     vfloat16m4_t v_f16 = __riscv_vfncvt_f_f_w_f16m4(v, vl);
     __riscv_vse16_v_f16m4(reinterpret_cast<_Float16*>(ptr), v_f16, vl);
+#else
+    __riscv_vse32_v_f32m8(scratch, v, vl);
+    for (size_t i = 0; i < vl; ++i)
+      ptr[i] = static_cast<scalar_t>(scratch[i]);
+#endif
   } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
     vuint16m4_t v_bf16 = f32m8_to_bf16(v, vl);
     __riscv_vse16_v_u16m4(reinterpret_cast<uint16_t*>(ptr), v_bf16, vl);
@@ -330,6 +375,7 @@ inline void fill_stub(scalar_t* __restrict__ out, float val, int64_t size) {
       __riscv_vse32_v_f32m4(out + d, v_val, vl);
     }
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
+#if defined(__riscv_zvfh) || defined(__riscv_v)
     // FP16: use hardware narrowing convert
     for (int64_t d = 0; d < size; d += vl) {
       vl = __riscv_vsetvl_e16m2(size - d);
@@ -337,6 +383,14 @@ inline void fill_stub(scalar_t* __restrict__ out, float val, int64_t size) {
       vfloat16m2_t v_f16 = __riscv_vfncvt_f_f_w_f16m2(v_f32, vl);
       __riscv_vse16_v_f16m2(reinterpret_cast<_Float16*>(out + d), v_f16, vl);
     }
+#else
+    const scalar_t hval = static_cast<scalar_t>(val);
+    for (int64_t d = 0; d < size; d += vl) {
+      vl = __riscv_vsetvl_e16m2(size - d);
+      for (size_t i = 0; i < vl; ++i)
+        out[d + i] = hval;
+    }
+#endif
   } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
     // BF16: use bit-shift method (BF16 is upper 16 bits of FP32)
     for (int64_t d = 0; d < size; d += vl) {
@@ -510,6 +564,9 @@ inline void quantize_row_int8_symmetric_auto(
 template <typename scalar_t>
 inline void quantize_and_copy(
     int8_t* __restrict__ dst, const scalar_t* __restrict__ src, int64_t size, float scale, float* scale_out = nullptr) {
+  // scale==1.0f is the sentinel for dynamic (per-token) quantization:
+  // auto-compute the scale from the data. Any other positive value is a
+  // static scale passed by the caller (e.g. from a pre-calibrated k_scale).
   if (scale != 1.0f && scale > 0.0f) {
     quantize_row_int8_symmetric<scalar_t>(dst, src, size, scale);
     if (scale_out) *scale_out = scale;

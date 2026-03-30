@@ -36,15 +36,20 @@ static int compute_buffer_size_per_thread(int head_size, int head_size_v) {
   // 4. k_trans: scalar_t[head_size * BLOCK_N]
   // 5. v_buf: scalar_t[BLOCK_N * head_size_v]
 
-  int size = 0;
-  size += BLOCK_M * BLOCK_N * sizeof(float);
-  size += BLOCK_M * head_size_v * sizeof(float);
-  size += BLOCK_N * std::max(head_size, head_size_v) * 4;  // worst case sizeof(scalar_t)=4
-  size += MAX_HEAD_SIZE * BLOCK_N * 4;                     // k_trans: head_size * BLOCK_N
-  size += BLOCK_N * MAX_HEAD_SIZE * 4;                     // v_buf: BLOCK_N * head_size_v
+  // Worst-case element size: sizeof(float)=4 covers BF16/FP16 (2) and FP32/INT8 paths.
+  // INT8 quantize path stores fp32 in Btmp/k_trans/v_buf, so sizeof(float) is correct.
+  constexpr int MAX_ELEM = sizeof(float);
 
-  // Add alignment overhead (64 bytes per allocation, worst case)
-  return size + 64 * 5;
+  int size = 0;
+  size += BLOCK_M * BLOCK_N * sizeof(float);                      // s_i score tile
+  size += BLOCK_M * head_size_v * sizeof(float);                  // v_prime accumulator
+  size += BLOCK_N * std::max(head_size, head_size_v) * MAX_ELEM;  // Btmp (Q@K and S@V)
+  size += MAX_HEAD_SIZE * BLOCK_N * MAX_ELEM;                     // k_trans transposed key
+  size += BLOCK_N * MAX_HEAD_SIZE * MAX_ELEM;                     // v_buf value gather
+
+  // 5 AlignedArena allocations above, each padded to 64-byte cache line alignment.
+  constexpr int NUM_ALLOCS = 5;
+  return size + 64 * NUM_ALLOCS;
 }
 
 inline void softmax_update_row(
@@ -248,6 +253,9 @@ void extend_attention_kernel_impl(
                 }
               }
             }
+            // k_scale is the global static fallback; k_scales_block (always populated
+            // above) takes per-token precedence inside the gemm. k_scale is never
+            // reached here but the API requires it for the nullptr-k_scales case.
             gemm_nt_tiled_transposed_int8(
                 q_ptr,
                 k_trans_buf_int8,
@@ -389,11 +397,25 @@ void extend_attention_kernel_impl(
         gemm_nt_tiled_transposed(
             q_ptr, k_trans_buf_fp, s_i, m_size, n_size, head_size, q_strideM, BLOCK_N, BLOCK_N, scaling);
 
-        // Causal mask: key position must be <= query position
+        // Causal mask: key position must be <= query position.
         for (int r = 0; r < m_size; ++r) {
           int m_pos = m_start + r;
           float* row = s_i + r * BLOCK_N;
 
+          // Step 1: apply logit cap to raw scores (all finite here).
+          if (logit_cap > 0.0f) {
+            size_t vl_max = __riscv_vsetvlmax_e32m8();
+            for (int c = 0; c < n_size; c += vl_max) {
+              size_t vl = __riscv_vsetvl_e32m8(n_size - c);
+              vfloat32m8_t v_s = __riscv_vle32_v_f32m8(row + c, vl);
+              v_s = __riscv_vfmul_vf_f32m8(v_s, 1.0f / logit_cap, vl);
+              v_s = vftanh_f32m8(v_s, vl);
+              v_s = __riscv_vfmul_vf_f32m8(v_s, logit_cap, vl);
+              __riscv_vse32_v_f32m8(row + c, v_s, vl);
+            }
+          }
+
+          // Step 2: apply causal mask (overwrites future positions with -inf).
           size_t vl_max = __riscv_vsetvlmax_e32m2();
           for (int c = 0; c < n_size; c += vl_max) {
             size_t vl = __riscv_vsetvl_e32m2(n_size - c);
@@ -401,7 +423,6 @@ void extend_attention_kernel_impl(
             vuint32m2_t vid = __riscv_vid_v_u32m2(vl);
             vuint32m2_t vn_pos = __riscv_vadd_vx_u32m2(vid, n_start + c, vl);
 
-            // Causal mask: set k_pos > q_pos to -inf
             vbool16_t mask = __riscv_vmsgtu_vx_u32m2_b16(vn_pos, (uint32_t)m_pos, vl);
             vfloat32m2_t v_inf = __riscv_vfmv_v_f_f32m2(-std::numeric_limits<float>::infinity(), vl);
             vfloat32m2_t v_row = __riscv_vle32_v_f32m2(row + c, vl);
@@ -409,8 +430,9 @@ void extend_attention_kernel_impl(
             __riscv_vse32_v_f32m2(row + c, v_row, vl);
           }
 
+          // Step 3: online softmax — cap already applied, pass 0.0f to skip it.
           softmax_update_row(
-              s_i + r * BLOCK_N, v_prime + r * head_size_v, m_acc[r], l_acc[r], n_size, head_size_v, logit_cap);
+              s_i + r * BLOCK_N, v_prime + r * head_size_v, m_acc[r], l_acc[r], n_size, head_size_v, 0.0f);
         }
 
         const scalar_t* v_src_base = v_extend + start_loc * ve_strideN + head_kv_id * ve_strideH;
@@ -426,6 +448,8 @@ void extend_attention_kernel_impl(
       // Write Output
       for (int r = 0; r < m_size; ++r) {
         float l_val = l_acc[r];
+        // Guard against division by zero when all positions are masked (l_val ≈ 0).
+        // Threshold is well above FP32 underflow (~1e-38) but below any real sum.
         float inv_l = (l_val > 1e-6f) ? 1.0f / l_val : 0.0f;
         float* vp_row = v_prime + r * head_size_v;
         scalar_t* o_row = o_ptr + r * o_strideM;
@@ -522,8 +546,22 @@ static ExtendBatchInfo validate_extend_inputs(
       extend_seq_lens.scalar_type() == p.index_dtype && extend_start_loc.scalar_type() == p.index_dtype,
       "extend: expect extend_seq_lens and extend_start_loc to have same dtype as req_to_token.");
 
-  TORCH_CHECK(p.head_size % 32 == 0, "invalid head_size ", p.head_size);
-  TORCH_CHECK(p.head_size_v % 32 == 0, "invalid head_size_v ", p.head_size_v);
+  // EXTEND_BLOCK_N is VLEN/8 (compile-time). head_size must be a multiple so that
+  // the transposed K buffer (head_size × BLOCK_N) is indexed without padding.
+  TORCH_CHECK(
+      p.head_size % EXTEND_BLOCK_N == 0,
+      "invalid head_size ",
+      p.head_size,
+      " (must be a multiple of EXTEND_BLOCK_N=",
+      EXTEND_BLOCK_N,
+      " for this VLEN)");
+  TORCH_CHECK(
+      p.head_size_v % EXTEND_BLOCK_N == 0,
+      "invalid head_size_v ",
+      p.head_size_v,
+      " (must be a multiple of EXTEND_BLOCK_N=",
+      EXTEND_BLOCK_N,
+      " for this VLEN)");
 
   return p;
 }
@@ -531,12 +569,12 @@ static ExtendBatchInfo validate_extend_inputs(
 // q_extend, k_extend, v_extend, o_extend: contiguous tensors
 // k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
 //
-// q_extend: [num_tokens, num_heads, head_size]
-// k_extend: [num_extend_tokens, num_heads, head_size]
-// v_extend: [num_extend_tokens, num_heads, head_size]
-// o_extend: [num_tokens, num_heads, head_size]
-// k_buffer: [max_total_num_tokens, num_heads, head_size]
-// v_buffer: [max_total_num_tokens, num_heads, head_size]
+// q_extend: [num_tokens,        num_heads,    head_size]
+// k_extend: [num_extend_tokens, num_heads_kv, head_size]
+// v_extend: [num_extend_tokens, num_heads_kv, head_size_v]
+// o_extend: [num_tokens,        num_heads,    head_size_v]
+// k_buffer: [max_total_num_tokens, num_heads_kv, head_size]
+// v_buffer: [max_total_num_tokens, num_heads_kv, head_size_v]
 // req_to_token: [max_num_reqs, max_context_len] int32 or int64
 // req_pool_indices: [num_seqs] int64
 // seq_lens: [num_seqs] int64
@@ -663,8 +701,8 @@ void extend_set_kv_buffer_int8_quantize(
     int64_t max_context_len,
     float k_scale,
     float v_scale,
-    float* k_scale_buf = nullptr,    // [max_tokens * num_heads_kv]; written when k_scale==1.0
-    float* v_scale_buf = nullptr) {  // [max_tokens * num_heads_kv]; written when v_scale==1.0
+    float* k_scale_buf = nullptr,    // [max_tokens * num_heads_kv]; written when non-null
+    float* v_scale_buf = nullptr) {  // [max_tokens * num_heads_kv]; written when non-null
   at::parallel_for(0, num_seqs * num_heads_kv, 0, [&](int64_t begin, int64_t end) {
     int64_t seq_idx{0}, head_kv_id{0};
     int64_t num_seqs_i64 = static_cast<int64_t>(num_seqs);
