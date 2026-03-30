@@ -309,37 +309,19 @@ def use_intel_amx_backend(layer):
     return getattr(layer, "use_intel_amx_backend", False)
 
 
-_is_rvv_kernel_available: "bool | None" = None
-
-
+@lru_cache(maxsize=1)
 def cpu_has_rvv_support() -> bool:
-    global _is_rvv_kernel_available
-    if get_bool_env_var("SGLANG_DISABLE_RVV_KERNELS"):
-        _is_rvv_kernel_available = False
+    try:
+        if not is_host_cpu_riscv():
+            return False
+        _probe = torch.ops.sgl_kernel.weight_packed_linear  # noqa: F841
+        return True
+    except AttributeError:
+        logger.warning(
+            "cpu_has_rvv_support: sgl_kernel.weight_packed_linear not found on RISC-V host."
+            " RVV backend disabled. Rebuild sgl-kernel with RVV support."
+        )
         return False
-    if _is_rvv_kernel_available is None:
-        try:
-            if not is_host_cpu_riscv():
-                _is_rvv_kernel_available = False
-            else:
-                _probe = torch.ops.sgl_kernel.weight_packed_linear  # noqa: F841
-                _is_rvv_kernel_available = True
-        except AttributeError:
-            # AttributeError here means we are on RISC-V (is_host_cpu_riscv() was True)
-            # but the op is missing — the kernel was not built with RVV support.
-            _is_rvv_kernel_available = False
-            logger.warning(
-                "cpu_has_rvv_support: sgl_kernel.weight_packed_linear not found on RISC-V host."
-                " RVV backend disabled. Rebuild sgl-kernel with RVV support."
-            )
-        except Exception:
-            logger.warning(
-                "cpu_has_rvv_support: unexpected error probing sgl_kernel.weight_packed_linear."
-                " RVV kernels will be disabled.",
-                exc_info=True,
-            )
-            _is_rvv_kernel_available = False
-    return bool(_is_rvv_kernel_available)
 
 
 def use_riscv_rvv_backend(layer):
@@ -3114,10 +3096,8 @@ def parse_lscpu_topology():
                 continue
             cpu = int(parts[0])  # CPU id must always be present
             try:
-                core = int(parts[1])
-                socket = int(parts[2])
                 # RISC-V lscpu may have empty Node field; treat as NUMA node 0.
-                node = int(parts[3]) if parts[3].strip() else 0
+                core, socket, node = [int(p) if p.strip() else 0 for p in parts[1:]]
             except ValueError as exc:
                 logger.warning(
                     "Skipping lscpu line with non-integer field (error: %s): %r",
