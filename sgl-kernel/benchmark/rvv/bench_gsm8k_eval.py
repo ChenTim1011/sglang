@@ -27,21 +27,34 @@ except ImportError:
     HAS_SGLANG = False
     print("sglang not found")
     sys.exit(1)
-MODEL = "meta-llama/Llama-3.2-1B-Instruct"
+MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+W8A8_MODEL = "RedHatAI/Qwen2.5-1.5B-quantized.w8a8"
 BASE_URL = DEFAULT_URL_FOR_TEST
 INVALID = -9999999
 
-# Named presets for model/KV dtype, with optional eval-size overrides.
+# Named presets for model/quantization/KV dtype, with optional eval-size overrides.
 GSM8K_EXPERIMENT_CONFIGS = {
     "default": {
         "model": MODEL,
+        "quantization": None,
         "kv_int8": False,
     },
     "int8_kv": {
         "model": MODEL,
+        "quantization": None,
         "kv_int8": True,
         "num_questions": 10,
         "num_shots": 8,
+    },
+    "w8a8": {
+        "model": W8A8_MODEL,
+        "quantization": "w8a8_int8",
+        "kv_int8": False,
+    },
+    "w8a8_int8_kv": {
+        "model": W8A8_MODEL,
+        "quantization": "w8a8_int8",
+        "kv_int8": True,
     },
 }
 
@@ -186,6 +199,7 @@ def _kill_port(port: int) -> None:
 def run_benchmark(
     config: BenchmarkConfig,
     model: str,
+    quantization: str = None,
     kv_int8: bool = False,
 ):
     """Launch RVV server, run GSM8K questions, kill server, return BenchmarkResult."""
@@ -200,10 +214,11 @@ def run_benchmark(
         "--device",
         "cpu",
     ]
+    if quantization:
+        other_args += ["--quantization", quantization]
     if kv_int8:
         other_args += ["--kv-cache-dtype", "int8"]
     # Kill any stale server left from a previous crashed run.
-    import os as _os
     import re as _re
 
     _m = _re.search(r":(\d+)", BASE_URL)
@@ -283,12 +298,20 @@ def print_result(result: BenchmarkResult):
     print()
 
 
-def save_result(result: BenchmarkResult, output_dir="/tmp"):
+def save_result(
+    result: BenchmarkResult,
+    model: str,
+    quantization: str,
+    kv_int8: bool,
+    output_dir="/tmp",
+):
     result_file = os.path.join(output_dir, "rvv_gsm8k_results.json")
     data = {
         "task": "gsm8k-rvv",
         "backend": "rvv",
-        "model": MODEL,
+        "model": model,
+        "quantization": quantization or "none",
+        "kv_cache_dtype": "int8" if kv_int8 else "bfloat16",
         "num_questions": result.config.num_questions,
         "num_shots": result.config.num_shots,
         "accuracy": round(result.accuracy, 3),
@@ -344,11 +367,24 @@ def main():
         help="Use INT8 KV cache (RVV decode/extend int8 path). Requires RISC-V with RVV.",
     )
     parser.add_argument(
+        "--quantization",
+        type=str,
+        choices=["w8a8_int8"],
+        default=None,
+        help="Weight quantization mode. Use w8a8_int8 for RedHatAI W8A8 checkpoints.",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="Override the model path used for the benchmark.",
+    )
+    parser.add_argument(
         "--config",
         type=str,
         choices=list(GSM8K_EXPERIMENT_CONFIGS),
         default=None,
-        help="Named experiment: default, int8_kv (10q 8-shot INT8 KV).",
+        help="Named experiment: default, int8_kv, w8a8, w8a8_int8_kv.",
     )
     args = parser.parse_args()
 
@@ -360,15 +396,25 @@ def main():
         max_tokens = args.max_new_tokens
 
     run_model = MODEL
+    run_quantization = args.quantization
     run_kv_int8 = args.kv_int8
     if args.config:
         cfg = GSM8K_EXPERIMENT_CONFIGS[args.config]
         run_model = cfg["model"]
+        run_quantization = cfg.get("quantization", run_quantization)
         run_kv_int8 = cfg["kv_int8"]
         if "num_questions" in cfg:
             num_questions = cfg["num_questions"]
         if "num_shots" in cfg:
             num_shots = cfg["num_shots"]
+
+    # Explicit CLI flags override named preset fields.
+    if args.model_path:
+        run_model = args.model_path
+    if args.quantization:
+        run_quantization = args.quantization
+    if args.kv_int8:
+        run_kv_int8 = True
 
     lines, source = _load_dataset(
         args.platinum, args.data_path, num_questions, num_shots
@@ -379,7 +425,9 @@ def main():
         sys.exit(1)
     lines = lines[: num_shots + num_questions]
 
-    model_short = "Llama-3.2-1B-Instruct"
+    model_short = run_model.split("/")[-1]
+    if run_quantization:
+        model_short = f"{model_short} [{run_quantization}]"
     config = BenchmarkConfig(
         num_questions=num_questions,
         num_shots=num_shots,
@@ -393,6 +441,7 @@ def main():
     print("=" * 60)
     print(f"Platform: {platform.machine()}")
     print(f"Model   : {run_model}")
+    print(f"Quant   : {run_quantization or 'none'}")
     print(f"CI Mode : {IS_CI}")
     print(f"Data    : {source} ({num_questions} questions)")
     if run_kv_int8:
@@ -409,11 +458,17 @@ def main():
         result = run_benchmark(
             config,
             model=run_model,
+            quantization=run_quantization,
             kv_int8=run_kv_int8,
         )
         print_result(result)
         if args.save:
-            save_result(result)
+            save_result(
+                result,
+                model=run_model,
+                quantization=run_quantization,
+                kv_int8=run_kv_int8,
+            )
     except Exception as e:
         print(f"FAILED: {e}")
         raise

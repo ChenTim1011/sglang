@@ -1,7 +1,7 @@
-"""Unit tests for RVV rotary embedding kernel.
+"""Unit tests for RVV rotary embedding kernels.
 
-Tests run against RotaryEmbedding.forward_native / DeepseekScalingRotaryEmbedding
-and are skipped automatically on non-RISC-V builds.
+Tests run against Python rotary-embedding references and are skipped on
+non-RISC-V builds.
 
 Usage:
     python3 -m unittest test.srt.cpu.rvv.test_rvv_rope -v
@@ -18,7 +18,7 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
-from .rvv_utils import has_sgl_kernel_op, precision
+from .rvv_utils import has_sgl_kernel_op, helper_non_contiguous, precision
 
 torch.manual_seed(1234)
 
@@ -40,8 +40,7 @@ class TestRVVRopeCore(CustomTestCase):
         (128, 128, 2048, 10000, False, torch.float16, "cpu", 2, 512, 32, 8),
         (128, 128, 2048, 10000, False, torch.bfloat16, "cpu", 2, 512, 16, 4),
         (512, 128, 311, 10000, False, torch.bfloat16, "cpu", 3, 39, 4, 2),
-        # Non-neox tail case: rotary_dim=96 → embed_dim=48, vl_max=32 → tail of 16
-        # Exercises the j += vl loop when embed_dim % vl_max != 0 in compute_body.
+        # Non-neox tail case for partial-vector handling.
         (128, 96, 2048, 10000, False, torch.bfloat16, "cpu", 2, 64, 8, 2),
         (128, 96, 2048, 10000, False, torch.float16, "cpu", 2, 64, 8, 2),
     ]
@@ -86,7 +85,7 @@ class TestRVVRopeCore(CustomTestCase):
             device=device,
         )
         if dims == 3:
-            # 3D layout: [num_tokens, num_heads, head_size] — requires num_kv_heads == 1
+            # 3D layout requires num_kv_heads == 1.
             query = query.view(batch_size * seq_len, num_q_heads, head_size)
             key = key.view(batch_size * seq_len, num_kv_heads, head_size)
         elif dims == 4:
@@ -106,7 +105,7 @@ class TestRVVRopeCore(CustomTestCase):
             rope_ref.cos_sin_cache.to(query.dtype),
             rope_ref.is_neox_style,
         )
-        atol = rtol = precision["rope"][dtype]
+        atol = rtol = precision["rotary_embedding"][dtype]
         torch.testing.assert_close(query_ref_out, query_cpu_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(key_ref_out, key_cpu_out, atol=atol, rtol=rtol)
 
@@ -154,6 +153,51 @@ class TestRVVRopeCore(CustomTestCase):
                     dtype=dt,
                 )
 
+    def test_case_rope_2d_non_contiguous(self):
+        """Case: 2D RoPE with non-contiguous query/key (stride-2 batch dim)."""
+        head_size, rotary_dim, max_pos = 128, 128, 2048
+        base, is_neox = 10000, False
+        device = "cpu"
+        batch_size, seq_len, num_q_heads, num_kv_heads = 4, 32, 8, 2
+
+        for dtype in [torch.bfloat16, torch.float16]:
+            with self.subTest(dtype=dtype):
+                set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+                torch.manual_seed(100)
+                rope_ref = RotaryEmbedding(
+                    head_size, rotary_dim, max_pos, base, is_neox, dtype
+                ).to(device)
+                pos_ids = torch.arange(seq_len, device=device).repeat(batch_size)
+
+                query = helper_non_contiguous(
+                    torch.randn(
+                        batch_size * seq_len, num_q_heads * head_size, dtype=dtype
+                    )
+                )
+                key = helper_non_contiguous(
+                    torch.randn(
+                        batch_size * seq_len, num_kv_heads * head_size, dtype=dtype
+                    )
+                )
+                self.assertFalse(query.is_contiguous())
+
+                query_ref_out, key_ref_out = rope_ref.forward_native(
+                    pos_ids, query.clone(), key.clone()
+                )
+                query_out, key_out = torch.ops.sgl_kernel.rotary_embedding_cpu(
+                    pos_ids,
+                    query.clone(),
+                    key.clone(),
+                    rope_ref.head_size,
+                    rope_ref.cos_sin_cache.to(dtype),
+                    rope_ref.is_neox_style,
+                )
+                atol = rtol = precision["rotary_embedding"][dtype]
+                torch.testing.assert_close(
+                    query_ref_out, query_out, atol=atol, rtol=rtol
+                )
+                torch.testing.assert_close(key_ref_out, key_out, atol=atol, rtol=rtol)
+
 
 @unittest.skipUnless(
     has_sgl_kernel_op("rotary_embedding_cpu"),
@@ -194,7 +238,7 @@ class TestRVVRopeDeepseekV2(CustomTestCase):
         rope.register_buffer("cos_sin_cache", cos_sin_cache)
 
         for dtype in [torch.bfloat16, torch.float16]:
-            # cos_sin_cache and rope buffer must match the query dtype.
+            # Keep cache dtype aligned with the kernel inputs.
             cs_cache = cos_sin_cache.to(dtype)
             rope.register_buffer("cos_sin_cache", cs_cache)
 
@@ -225,7 +269,7 @@ class TestRVVRopeDeepseekV2(CustomTestCase):
                     False,
                 )
 
-                atol = rtol = precision["rope"][q_pe.dtype]
+                atol = rtol = precision["rotary_embedding"][q_pe.dtype]
                 torch.testing.assert_close(q_pe, q_pe_clone, atol=atol, rtol=rtol)
                 torch.testing.assert_close(k_pe, k_pe_clone, atol=atol, rtol=rtol)
 
@@ -237,12 +281,14 @@ class TestRVVRopeDeepseekV2(CustomTestCase):
 class TestRVVRope3D(TestRVVRopeCore):
     """Test suite for the 3D RoPE kernel path (num_kv_heads == 1, non-neox only)."""
 
-    # Config: (head_size, rotary_dim, max_pos, base, is_neox, dtype, device, batch, seq, q_heads, kv_heads)
-    # 3D requires num_kv_heads == 1 (enforced by TORCH_CHECK in rope.cpp)
+    # 3D requires num_kv_heads == 1.
     test_config_3d = [
         (128, 64, 2048, 10000, False, torch.bfloat16, "cpu", 2, 32, 8, 1),
         (64, 64, 512, 8000, False, torch.float16, "cpu", 4, 16, 4, 1),
         (128, 128, 2048, 10000, False, torch.bfloat16, "cpu", 2, 64, 16, 1),
+        # Tail case for partial-vector handling.
+        (128, 48, 2048, 10000, False, torch.bfloat16, "cpu", 2, 32, 4, 1),
+        (128, 48, 2048, 10000, False, torch.float16, "cpu", 2, 32, 4, 1),
     ]
 
     def test_case_rope_3d(self):
