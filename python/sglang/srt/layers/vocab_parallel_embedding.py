@@ -32,6 +32,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.rvv_utils import PackRVVWeightMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
     cpu_has_rvv_support,
@@ -561,6 +562,12 @@ class ParallelLMHead(VocabParallelEmbedding):
                 torch.float16,
             ]:
                 self.quant_method = PackWeightMethod(weight_names=["weight"])
+        elif _is_cpu and _is_cpu_rvv_available:
+            if hasattr(self, "weight") and self.weight.dtype in [
+                torch.bfloat16,
+                torch.float16,
+            ]:
+                self.quant_method = PackRVVWeightMethod(weight_names=["weight"])
 
         if bias:
             self.bias = Parameter(

@@ -22,10 +22,7 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.rvv_utils import (
-    _rvv_process_weight_after_loading,
-    rvv_linear_forward,
-)
+from sglang.srt.layers.rvv_utils import _rvv_process_weight_after_loading
 from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -52,6 +49,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_rvv_available = cpu_has_rvv_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -146,7 +144,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if use_intel_amx_backend(layer):
+        if use_intel_amx_backend(layer) or use_riscv_rvv_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:
                 x = x.view(-1, x.shape[-1])
@@ -154,13 +152,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 x,
                 layer.weight,
                 bias,
-                True,  # is_vnni
+                True,  # is_vnni / is_packed
             )
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
-        elif use_riscv_rvv_backend(layer):
-            return rvv_linear_forward(x, layer, bias)
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
