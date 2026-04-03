@@ -80,6 +80,11 @@ void pack_weight(scalar_t* packed_w, const scalar_t* orig_w, int64_t N, int64_t 
   });
 }
 
+template <>
+void pack_weight<int8_t>(int8_t* packed_w, const int8_t* orig_w, int64_t N, int64_t K) {
+  pack_weight_int8_with_comp(packed_w, orig_w, N, K, rvv_constants::BLOCK_N);
+}
+
 template <typename scalar_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn {
   static_assert(BLOCK_M >= 1 && BLOCK_M <= 4, "BLOCK_M must be 1-4");
@@ -212,10 +217,7 @@ struct tinygemm_kernel_nn {
   }
 };
 
-// GEMV specialization (M=1) using LMUL=8.
-// For VLEN=256: vl_max_m8=64=BLOCK_N → one N-tile pass covers all columns.
-// BF16/FP16: B-load m4 (4 regs) + acc m8 (8 regs), UNROLL=4 → 24 regs, safe.
-// FP32: B-load m8 (8 regs) + acc m8 (8 regs), UNROLL=2 → 24 regs, safe.
+// GEMV specialization (M=1) using LMUL=8. BF16/FP16 use UNROLL=4; FP32 uses UNROLL=2.
 template <typename scalar_t, bool has_bias, int BLOCK_N>
 struct tinygemm_kernel_gemv_m8 {
   static_assert(
@@ -327,7 +329,6 @@ void tinygemm_kernel(
     int64_t K,
     int64_t lda,
     int64_t ldc) {
-  // NB_SIZE template arg == BLOCK_N (pack stride); inner loop uses runtime nb_size for tail tiles.
   constexpr int64_t BLOCK_M = GEMM_TILE_M;
   constexpr int64_t BLOCK_N = rvv_constants::BLOCK_N;
   const int64_t MB = div_up(M, BLOCK_M);
@@ -341,7 +342,6 @@ void tinygemm_kernel(
 
       switch (mb_size) {
         case 1:
-          // M=1 (decode/GEMV): use LMUL=8 to cover full BLOCK_N in one vector pass.
           tinygemm_kernel_gemv_m8<scalar_t, has_bias, BLOCK_N>::apply(
               A + mb_start * lda,
               B + nb_start * K,
@@ -498,9 +498,10 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   TORCH_CHECK(weight.ndimension() == 2, "expect weight to be 2d, got ", weight.ndimension(), "d tensor.");
 
   constexpr int64_t BLOCK_N_RVV = rvv_constants::BLOCK_N;
-  // INT8 weights must always be packed (int8_scaled_mm_cpu rejects non-int8 mat2).
+  // INT8 weights must always be packed. RVV keeps the shared CPU packed layout:
+  // data [K, BLOCK_N] followed by one int32 compensation per output channel.
   // The float32-transpose fallback is only valid for FP types.
-  const bool is_int8 = (weight.scalar_type() == at::kChar || weight.scalar_type() == at::kByte);
+  const bool is_int8 = (weight.scalar_type() == at::kChar);
   if (!is_int8 && (weight.size(0) < BLOCK_N_RVV || weight.size(0) % BLOCK_N_RVV != 0)) {
     // Small OC shape: use fma linear path, which needs transpose not pack.
     return weight.to(at::kFloat).t().contiguous();
@@ -517,7 +518,8 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   auto packed_weight = at::empty({}, weight.options());
 
   CPU_DISPATCH_PACKED_TYPES_RVV(st, [&] {
-    const int64_t packed_block_size = IC * BLOCK_N_RVV;
+    const int64_t packed_block_size =
+        std::is_same_v<packed_t, int8_t> ? get_int8_packed_block_size(IC) : IC * BLOCK_N_RVV;
     packed_weight.resize_({NB, packed_block_size});
     packed_t* packed_data = packed_weight.data_ptr<packed_t>();
     const packed_t* w_data = weight.data_ptr<packed_t>();
@@ -556,8 +558,13 @@ at::Tensor weight_packed_linear(
     N = packed_w.size(1);
   } else {
     if (is_packed) {
-      // RVV packed: [NB, IC*BLOCK_N]; logical OC = NB * BLOCK_N
-      TORCH_CHECK(packed_w.dim() == 2, "RVV packed weight must be 2D [NB, IC*BLOCK_N]");
+      TORCH_CHECK(
+          packed_w.scalar_type() != at::kChar,
+          "weight_packed_linear: packed int8 weights are not supported through this API; ",
+          "use int8_scaled_mm_cpu/int8_scaled_mm_with_quant for RVV W8A8.");
+      // RVV packed int8 weight: [NB, BLOCK_N * (IC + sizeof(int32_t))].
+      // Floating-point packed weight remains [NB, IC * BLOCK_N].
+      TORCH_CHECK(packed_w.dim() == 2, "RVV packed weight must be 2D");
       N = packed_w.size(0) * rvv_constants::BLOCK_N;
     } else {
       N = mat2.size(0);
@@ -574,6 +581,28 @@ at::Tensor weight_packed_linear(
     }
   }
 
+  if (use_fma_gemm) {
+    TORCH_CHECK(
+        packed_w.scalar_type() == at::kFloat,
+        "weight_packed_linear: float packed weights required for FMA path, got ",
+        packed_w.scalar_type());
+  } else {
+    TORCH_CHECK(
+        packed_w.scalar_type() == mat1.scalar_type(),
+        "weight_packed_linear: mat1 and weight must have the same dtype for RVV packed GEMM, got mat1=",
+        mat1.scalar_type(),
+        ", weight=",
+        packed_w.scalar_type());
+  }
+  if (is_packed && !use_fma_gemm && packed_w.scalar_type() != at::kChar) {
+    TORCH_CHECK(
+        packed_w.size(1) == K * rvv_constants::BLOCK_N,
+        "weight_packed_linear: packed floating weight must have shape [NB, K * BLOCK_N], expected second dim ",
+        K * rvv_constants::BLOCK_N,
+        ", got ",
+        packed_w.size(1));
+  }
+
   auto dispatch_type = mat1.scalar_type();
   auto out = at::empty({M, N}, mat1.options());
   int64_t out_strideM = out.stride(0);
@@ -582,7 +611,13 @@ at::Tensor weight_packed_linear(
   const bool has_bias = bias.has_value();
   const float* bias_data = nullptr;
   if (has_bias) {
+    CHECK_INPUT(bias.value());
+    CHECK_DIM(1, bias.value());
     CHECK_EQ(bias.value().size(0), N);
+    TORCH_CHECK(
+        bias.value().scalar_type() == at::kFloat,
+        "weight_packed_linear: bias must be float32, got ",
+        bias.value().scalar_type());
     bias_data = bias.value().data_ptr<float>();
   }
 
