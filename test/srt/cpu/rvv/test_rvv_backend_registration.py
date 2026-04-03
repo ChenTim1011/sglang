@@ -27,7 +27,7 @@ class _RVVBackendTestMixin:
         from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
 
         with patch(
-            "sglang.srt.layers.attention.rvv_backend.is_rvv_attention_backend_available",
+            "sglang.srt.layers.attention.rvv_backend.cpu_has_rvv_support",
             return_value=False,
         ):
             mock_runner = MagicMock()
@@ -35,7 +35,6 @@ class _RVVBackendTestMixin:
             mock_runner.model_config.num_attention_heads = 8
             mock_runner.tp_size = 1
             mock_runner.req_to_token_pool.size = 4
-            mock_runner.token_to_kv_pool.full_attention_layer_id_mapping = {0: 0}
             kv_buf = MagicMock()
             kv_buf.shape = [16, 1, 64]
             kv_buf.dtype = torch.int8 if is_int8 else torch.bfloat16
@@ -93,12 +92,12 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
 
     def test_case_backend_selection_on_current_platform(self):
         """Case: runtime backend selection matches platform capabilities."""
-        import importlib.util
         from unittest.mock import Mock
 
         import torch
 
         from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
+        from sglang.srt.utils.common import cpu_has_rvv_support
 
         mock_runner = Mock()
         mock_runner.device = "cpu"
@@ -108,7 +107,6 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
         mock_runner.req_to_token_pool = Mock()
         mock_runner.req_to_token_pool.size = 4
         mock_runner.token_to_kv_pool = Mock()
-        mock_runner.token_to_kv_pool.full_attention_layer_id_mapping = {0: 0}
         kv_buf = Mock()
         kv_buf.shape = [16, 1, 128]
         kv_buf.dtype = torch.bfloat16
@@ -120,7 +118,7 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
         backend = RVVAttnBackend(mock_runner)
 
         if is_host_cpu_riscv():
-            if importlib.util.find_spec("sgl_kernel") is not None:
+            if cpu_has_rvv_support():
                 self.assertTrue(backend.use_rvv_kernels)
             else:
                 self.assertIsNotNone(backend.fallback_backend)
@@ -140,7 +138,6 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
         mock_runner.model_config.num_attention_heads = 8
         mock_runner.tp_size = 1
         mock_runner.req_to_token_pool.size = 4
-        mock_runner.token_to_kv_pool.full_attention_layer_id_mapping = {0: 0}
         kv_buf = MagicMock()
         kv_buf.shape = [16, 1, 64]
         kv_buf.dtype = torch.int8
@@ -150,7 +147,7 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
         )
 
         with patch(
-            "sglang.srt.layers.attention.rvv_backend.is_rvv_attention_backend_available",
+            "sglang.srt.layers.attention.rvv_backend.cpu_has_rvv_support",
             return_value=True,
         ), patch(
             "sglang.srt.layers.attention.rvv_backend.torch.ops",
@@ -172,7 +169,7 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
         mock_runner.server_args = MagicMock(kv_cache_dtype="int8")
 
         with patch(
-            "sglang.srt.layers.attention.rvv_backend.is_rvv_attention_backend_available",
+            "sglang.srt.layers.attention.rvv_backend.cpu_has_rvv_support",
             return_value=False,
         ):
             backend = RVVAttnBackend(mock_runner)
@@ -389,7 +386,7 @@ class TestRVVBackendCacheWiring(unittest.TestCase, _RVVBackendTestMixin):
 
 
 class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
-    """INT8 scale cache and buffer routing tests."""
+    """INT8 scale resolution and buffer routing tests."""
 
     def test_case_missing_layer_scales_use_dynamic_quant_sentinel(self):
         """Floating-point K/V may use the dynamic-quantization sentinel scales."""
@@ -402,7 +399,6 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
             v_scale=None,
             k_scale_float=None,
             v_scale_float=None,
-            _rvv_scales_cached=False,
         )
 
         RVVAttnBackend._ensure_cached_scales(
@@ -412,7 +408,6 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
         )
         self.assertTrue(isnan(layer._cached_k_scale_float))
         self.assertTrue(isnan(layer._cached_v_scale_float))
-        self.assertTrue(layer._rvv_scales_cached)
 
     def test_case_missing_layer_scales_raise_for_prequantized_kv(self):
         """Pre-quantized INT8 K/V must provide explicit scales."""
@@ -425,7 +420,6 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
             v_scale=None,
             k_scale_float=None,
             v_scale_float=None,
-            _rvv_scales_cached=False,
         )
 
         with self.assertRaisesRegex(
@@ -447,7 +441,6 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
             v_scale=None,
             k_scale_float=0.25,
             v_scale_float=None,
-            _rvv_scales_cached=False,
         )
 
         with self.assertRaisesRegex(RuntimeError, "Inconsistent INT8 KV-cache scales"):
@@ -464,17 +457,15 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
             v_scale=None,
             k_scale_float=None,
             v_scale_float=0.5,
-            _rvv_scales_cached=False,
         )
 
         RVVAttnBackend._ensure_cached_scales(layer)
 
         self.assertAlmostEqual(layer._cached_k_scale_float, 0.25, places=6)
         self.assertAlmostEqual(layer._cached_v_scale_float, 0.5, places=6)
-        self.assertTrue(layer._rvv_scales_cached)
 
-    def test_case_scale_cache_invalidates_when_layer_scales_change(self):
-        """Changing layer scales after first use must refresh cached floats."""
+    def test_case_resolved_scales_refresh_when_layer_scales_change(self):
+        """Changing layer scales after first use must refresh resolved floats."""
         import torch
 
         from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
@@ -484,7 +475,6 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
             v_scale=torch.tensor(0.5),
             k_scale_float=None,
             v_scale_float=None,
-            _rvv_scales_cached=False,
         )
 
         RVVAttnBackend._ensure_cached_scales(layer)
@@ -506,7 +496,6 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
             v_scale=None,
             k_scale_float=None,
             v_scale_float=None,
-            _rvv_scales_cached=False,
         )
 
         RVVAttnBackend._ensure_cached_scales(
@@ -525,8 +514,8 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
                 torch.randint(0, 10, (1, 1, 8), dtype=torch.int8),
             )
 
-    def test_case_int8_scale_buffers_use_full_attention_mapping_width(self):
-        """INT8 scale buffers should size by full-attention layers, not hidden layers."""
+    def test_case_int8_scale_buffers_use_hidden_layer_width(self):
+        """INT8 scale buffers should size by model hidden-layer count."""
         from unittest.mock import MagicMock, patch
 
         import torch
@@ -539,7 +528,6 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
         mock_runner.model_config.num_hidden_layers = 48
         mock_runner.tp_size = 1
         mock_runner.req_to_token_pool.size = 4
-        mock_runner.token_to_kv_pool.full_attention_layer_id_mapping = {3: 0, 7: 1}
         kv_buf = MagicMock()
         kv_buf.shape = [16, 2, 64]
         kv_buf.dtype = torch.int8
@@ -554,7 +542,7 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
         )
 
         with patch(
-            "sglang.srt.layers.attention.rvv_backend.is_rvv_attention_backend_available",
+            "sglang.srt.layers.attention.rvv_backend.cpu_has_rvv_support",
             return_value=True,
         ), patch(
             "sglang.srt.layers.attention.rvv_backend.torch.ops",
@@ -563,22 +551,9 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
             backend = RVVAttnBackend(mock_runner)
 
         self.assertTrue(backend.use_rvv_kernels)
-        self.assertEqual(tuple(backend._k_scale_buf.shape), (2, 16, 2))
-        self.assertEqual(tuple(backend._v_scale_buf.shape), (2, 16, 2))
-        self.assertEqual(backend._scale_buf_index(SimpleNamespace(layer_id=3)), 0)
-        self.assertEqual(backend._scale_buf_index(SimpleNamespace(layer_id=7)), 1)
-
-    def test_case_scale_buf_index_rejects_unknown_layer(self):
-        """Unknown layer ids should fail loudly instead of indexing wrong scales."""
-        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-
-        backend = object.__new__(RVVAttnBackend)
-        backend._full_attn_layer_mapping = {3: 0}
-
-        with self.assertRaisesRegex(
-            RuntimeError, "not registered in full_attention_layer_id_mapping"
-        ):
-            backend._scale_buf_index(SimpleNamespace(layer_id=9))
+        self.assertEqual(tuple(backend._k_scale_buf.shape), (48, 16, 2))
+        self.assertEqual(tuple(backend._v_scale_buf.shape), (48, 16, 2))
+        self.assertEqual(backend._scale_buf_index(SimpleNamespace(layer_id=3)), 3)
 
     def test_case_forward_decode_int8_passes_cached_scales_to_kernel(self):
         """INT8 decode should pass both side buffers and cached scalar scales."""

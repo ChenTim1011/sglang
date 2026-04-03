@@ -14,12 +14,20 @@ static constexpr int GEMM_TILE_M = 4;
 // Weight packing (RVV block-N format)
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
+inline int64_t get_int8_packed_row_size(int64_t K) {
+  return K + static_cast<int64_t>(sizeof(int32_t));
+}
+
+inline int64_t get_int8_packed_block_size(int64_t K) {
+  return rvv_constants::BLOCK_N * get_int8_packed_row_size(K);
+}
+
 // GEMM Kernel Declarations
 
 template <typename scalar_t>
 void int8_scaled_mm_kernel(
     scalar_t* __restrict__ out,
-    const int8_t* __restrict__ mat1,
+    const uint8_t* __restrict__ mat1,
     const int8_t* __restrict__ mat2,
     const float* __restrict__ scales1,
     const float* __restrict__ scales2,
@@ -31,7 +39,7 @@ void int8_scaled_mm_kernel(
 
 extern template void int8_scaled_mm_kernel<float>(
     float* out,
-    const int8_t* mat1,
+    const uint8_t* mat1,
     const int8_t* mat2,
     const float* scales1,
     const float* scales2,
@@ -43,7 +51,7 @@ extern template void int8_scaled_mm_kernel<float>(
 
 extern template void int8_scaled_mm_kernel<at::Half>(
     at::Half* out,
-    const int8_t* mat1,
+    const uint8_t* mat1,
     const int8_t* mat2,
     const float* scales1,
     const float* scales2,
@@ -55,7 +63,7 @@ extern template void int8_scaled_mm_kernel<at::Half>(
 
 extern template void int8_scaled_mm_kernel<at::BFloat16>(
     at::BFloat16* out,
-    const int8_t* mat1,
+    const uint8_t* mat1,
     const int8_t* mat2,
     const float* scales1,
     const float* scales2,
@@ -80,10 +88,10 @@ void tinygemm_kernel(
     int64_t ldc,
     bool brg);
 
-// TinyGEMM Interface for INT8 (RVV) - uses int8_t for symmetric quantization
+// TinyGEMM Interface for INT8 (RVV W8A8) - activation is uint8, weight is int8.
 template <typename scalar_t>
 void tinygemm_kernel(
-    const int8_t* __restrict__ A,
+    const uint8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     scalar_t* __restrict__ C,
     const float* __restrict__ As,
@@ -96,9 +104,8 @@ void tinygemm_kernel(
     int64_t ldc,
     bool brg);
 
-// TinyGEMM Interface for INT8 (uint8_t A) - x86-compatible interface used by
-// callers (e.g. qkv_proj.cpp) that include cpu/gemm.h.  The implementation in
-// riscv64/gemm_int8.cpp casts A to int8_t and delegates to the int8 overload.
+// TinyGEMM Interface matching the shared CPU declaration used by callers that
+// include cpu/gemm.h.
 template <typename scalar_t>
 void tinygemm_kernel(
     const uint8_t* __restrict__ A,

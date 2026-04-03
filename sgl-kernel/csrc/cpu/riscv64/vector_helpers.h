@@ -6,6 +6,7 @@
 #include <riscv_vector.h>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 #include "vector_math.h"
@@ -15,6 +16,14 @@ template <typename T>
 struct is_quantized : std::false_type {};
 template <>
 struct is_quantized<int8_t> : std::true_type {};
+
+inline bool is_dynamic_quant_scale(float scale) {
+  return std::isnan(scale);
+}
+
+inline bool is_valid_static_quant_scale(float scale) {
+  return std::isfinite(scale) && scale > 0.0f;
+}
 
 namespace rvv_constants {
 // BLOCK_N = VLEN/4: weight packing tile size; each tile spans 2 vector iterations (m4).
@@ -122,7 +131,7 @@ inline vfloat32m4_t int8_to_f32m4(const int8_t* ptr, size_t vl) {
 // --- FP32 to BF16 ---
 // Extract upper 16 bits (sign + exp + upper 7 mantissa)
 
-#if defined(__riscv_zvfh) || defined(__riscv_v)
+#if defined(__riscv_zvfh)
 inline vfloat16m2_t f32m4_to_f16(vfloat32m4_t v, size_t vl) {
   return __riscv_vfncvt_f_f_w_f16m2(v, vl);
 }
@@ -145,7 +154,7 @@ inline vfloat32m1_t load_as_float_m1(const scalar_t* ptr, size_t vl, float* scra
   if constexpr (std::is_same_v<scalar_t, float>) {
     return __riscv_vle32_v_f32m1(ptr, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-#if defined(__riscv_zvfh) || defined(__riscv_v)
+#if defined(__riscv_zvfh)
     vfloat16mf2_t v_f16 = __riscv_vle16_v_f16mf2(reinterpret_cast<const _Float16*>(ptr), vl);
     return __riscv_vfwcvt_f_f_v_f32m1(v_f16, vl);
 #else
@@ -167,7 +176,7 @@ inline vfloat32m4_t load_as_float_m4(const scalar_t* ptr, size_t vl, float* scra
   if constexpr (std::is_same_v<scalar_t, float>) {
     return __riscv_vle32_v_f32m4(ptr, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-#if defined(__riscv_zvfh) || defined(__riscv_v)
+#if defined(__riscv_zvfh)
     vfloat16m2_t v_f16 = __riscv_vle16_v_f16m2(reinterpret_cast<const _Float16*>(ptr), vl);
     return __riscv_vfwcvt_f_f_v_f32m4(v_f16, vl);
 #else
@@ -191,7 +200,7 @@ inline vfloat32m8_t load_as_float_m8(const scalar_t* ptr, size_t vl, float* scra
   if constexpr (std::is_same_v<scalar_t, float>) {
     return __riscv_vle32_v_f32m8(ptr, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-#if defined(__riscv_zvfh) || defined(__riscv_v)
+#if defined(__riscv_zvfh)
     vfloat16m4_t v_f16 = __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16*>(ptr), vl);
     return __riscv_vfwcvt_f_f_v_f32m8(v_f16, vl);
 #else
@@ -213,7 +222,7 @@ inline vfloat32m4_t load_strided_as_float_m4(const scalar_t* ptr, ptrdiff_t stri
   if constexpr (std::is_same_v<scalar_t, float>) {
     return __riscv_vlse32_v_f32m4(ptr, stride_byte, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-#if defined(__riscv_zvfh) || defined(__riscv_v)
+#if defined(__riscv_zvfh)
     vfloat16m2_t v_f16 = __riscv_vlse16_v_f16m2(reinterpret_cast<const _Float16*>(ptr), stride_byte, vl);
     return __riscv_vfwcvt_f_f_v_f32m4(v_f16, vl);
 #else
@@ -246,7 +255,7 @@ store_strided_from_float_m4(scalar_t* ptr, ptrdiff_t stride_byte, vfloat32m4_t v
   if constexpr (std::is_same_v<scalar_t, float>) {
     __riscv_vsse32_v_f32m4(ptr, stride_byte, v, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-#if defined(__riscv_zvfh) || defined(__riscv_v)
+#if defined(__riscv_zvfh)
     vfloat16m2_t v_f16 = __riscv_vfncvt_f_f_w_f16m2(v, vl);
     __riscv_vsse16_v_f16m2(reinterpret_cast<_Float16*>(ptr), stride_byte, v_f16, vl);
 #else
@@ -273,7 +282,7 @@ inline void store_from_float_m1(scalar_t* ptr, vfloat32m1_t v, size_t vl, float*
   if constexpr (std::is_same_v<scalar_t, float>) {
     __riscv_vse32_v_f32m1(ptr, v, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-#if defined(__riscv_zvfh) || defined(__riscv_v)
+#if defined(__riscv_zvfh)
     vfloat16mf2_t v_f16 = __riscv_vfncvt_f_f_w_f16mf2(v, vl);
     __riscv_vse16_v_f16mf2(reinterpret_cast<_Float16*>(ptr), v_f16, vl);
 #else
@@ -297,7 +306,7 @@ inline void store_from_float_m2(scalar_t* ptr, vfloat32m2_t v, size_t vl, float*
   if constexpr (std::is_same_v<scalar_t, float>) {
     __riscv_vse32_v_f32m2(ptr, v, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-#if defined(__riscv_zvfh) || defined(__riscv_v)
+#if defined(__riscv_zvfh)
     vfloat16m1_t v_f16 = __riscv_vfncvt_f_f_w_f16m1(v, vl);
     __riscv_vse16_v_f16m1(reinterpret_cast<_Float16*>(ptr), v_f16, vl);
 #else
@@ -321,7 +330,7 @@ inline void store_from_float_m4(scalar_t* ptr, vfloat32m4_t v, size_t vl, float*
   if constexpr (std::is_same_v<scalar_t, float>) {
     __riscv_vse32_v_f32m4(ptr, v, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-#if defined(__riscv_zvfh) || defined(__riscv_v)
+#if defined(__riscv_zvfh)
     vfloat16m2_t v_f16 = __riscv_vfncvt_f_f_w_f16m2(v, vl);
     __riscv_vse16_v_f16m2(reinterpret_cast<_Float16*>(ptr), v_f16, vl);
 #else
@@ -344,7 +353,7 @@ inline void store_from_float_m8(scalar_t* ptr, vfloat32m8_t v, size_t vl, float*
   if constexpr (std::is_same_v<scalar_t, float>) {
     __riscv_vse32_v_f32m8(ptr, v, vl);
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-#if defined(__riscv_zvfh) || defined(__riscv_v)
+#if defined(__riscv_zvfh)
     vfloat16m4_t v_f16 = __riscv_vfncvt_f_f_w_f16m4(v, vl);
     __riscv_vse16_v_f16m4(reinterpret_cast<_Float16*>(ptr), v_f16, vl);
 #else
@@ -375,7 +384,7 @@ inline void fill_stub(scalar_t* __restrict__ out, float val, int64_t size) {
       __riscv_vse32_v_f32m4(out + d, v_val, vl);
     }
   } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-#if defined(__riscv_zvfh) || defined(__riscv_v)
+#if defined(__riscv_zvfh)
     // FP16: use hardware narrowing convert
     for (int64_t d = 0; d < size; d += vl) {
       vl = __riscv_vsetvl_e16m2(size - d);
@@ -505,10 +514,10 @@ inline void copy_stub<int8_t>(int8_t* __restrict__ out, const int8_t* __restrict
 
 // Quantization Operations
 
-// Symmetric Quantization (Scale Provided)
+// Symmetric quantization with caller-provided scale.
 template <typename scalar_t>
-inline void
-quantize_row_int8_symmetric(int8_t* __restrict__ Aq, const scalar_t* __restrict__ A, int64_t K, float scale) {
+inline void quantize_row_int8_symmetric_with_scale(
+    int8_t* __restrict__ Aq, const scalar_t* __restrict__ A, int64_t K, float scale) {
   // Guard against zero or negative scale to prevent NaN/Inf
   const float safe_scale = (scale > 1e-9f) ? scale : 1e-9f;
   const float inv_scale = 1.0f / safe_scale;
@@ -530,9 +539,8 @@ quantize_row_int8_symmetric(int8_t* __restrict__ Aq, const scalar_t* __restrict_
   }
 }
 
-// Dynamic Quantization (Compute Scale -> Symmetric Quantize)
 template <typename scalar_t>
-inline void quantize_row_int8_symmetric_auto(
+inline void quantize_row_int8_symmetric_infer_scale(
     int8_t* __restrict__ Aq, float& scale_out, const scalar_t* __restrict__ A, int64_t K, float eps = 1e-7) {
   float max_val = 0.f;
   size_t vl;
@@ -555,8 +563,8 @@ inline void quantize_row_int8_symmetric_auto(
   max_val = std::max(max_val, eps);
   const float scale = max_val / 127.0f;
 
-  // Pass 2: Quantize
-  quantize_row_int8_symmetric(Aq, A, K, scale);
+  // Pass 2: Quantize with the inferred scale.
+  quantize_row_int8_symmetric_with_scale(Aq, A, K, scale);
 
   scale_out = scale;
 }
@@ -564,16 +572,123 @@ inline void quantize_row_int8_symmetric_auto(
 template <typename scalar_t>
 inline void quantize_and_copy(
     int8_t* __restrict__ dst, const scalar_t* __restrict__ src, int64_t size, float scale, float* scale_out = nullptr) {
-  // scale==1.0f is the sentinel for dynamic (per-token) quantization:
-  // auto-compute the scale from the data. Any other positive value is a
-  // static scale passed by the caller (e.g. from a pre-calibrated k_scale).
-  if (scale != 1.0f && scale > 0.0f) {
-    quantize_row_int8_symmetric<scalar_t>(dst, src, size, scale);
+  // NaN is the sentinel for dynamic (per-token) quantization:
+  // infer the scale from the data. Any other finite positive value is a
+  // literal static scale passed by the caller, including 1.0f.
+  if (is_valid_static_quant_scale(scale)) {
+    quantize_row_int8_symmetric_with_scale<scalar_t>(dst, src, size, scale);
     if (scale_out) *scale_out = scale;
   } else {
+    TORCH_CHECK(is_dynamic_quant_scale(scale), "quantize_and_copy: invalid quantization scale");
     float computed_scale;
-    quantize_row_int8_symmetric_auto<scalar_t>(dst, computed_scale, src, size);
+    quantize_row_int8_symmetric_infer_scale<scalar_t>(dst, computed_scale, src, size);
     if (scale_out) *scale_out = computed_scale;
+  }
+}
+
+template <typename scalar_t>
+inline void quantize_row_uint8_asymmetric_with_scale(
+    uint8_t* __restrict__ Aq, const scalar_t* __restrict__ A, int64_t K, float scale) {
+  const float safe_scale = (scale > 1e-9f) ? scale : 1e-9f;
+  const float inv_scale = 1.0f / safe_scale;
+  size_t vl;
+  alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
+
+  for (int64_t k = 0; k < K; k += vl) {
+    vl = __riscv_vsetvl_e32m4(K - k);
+
+    vfloat32m4_t v_val = load_as_float_m4(A + k, vl, scratch);
+    vfloat32m4_t v_scaled = __riscv_vfmul_vf_f32m4(v_val, inv_scale, vl);
+    vint32m4_t v_i32 = __riscv_vfcvt_x_f_v_i32m4(v_scaled, vl);
+    v_i32 = __riscv_vadd_vx_i32m4(v_i32, 128, vl);
+    v_i32 = __riscv_vmax_vx_i32m4(v_i32, 0, vl);
+    v_i32 = __riscv_vmin_vx_i32m4(v_i32, 255, vl);
+    vuint32m4_t v_u32 = __riscv_vreinterpret_v_i32m4_u32m4(v_i32);
+    vuint16m2_t v_u16 = __riscv_vnclipu_wx_u16m2(v_u32, 0, __RISCV_VXRM_RNU, vl);
+    vuint8m1_t v_u8 = __riscv_vnclipu_wx_u8m1(v_u16, 0, __RISCV_VXRM_RNU, vl);
+    __riscv_vse8_v_u8m1(Aq + k, v_u8, vl);
+  }
+}
+
+template <typename scalar_t>
+inline void quantize_row_uint8_asymmetric_infer_scale(
+    uint8_t* __restrict__ Aq, float& scale_out, const scalar_t* __restrict__ A, int64_t K, float eps = 1e-7f) {
+  float max_val = 0.f;
+  size_t vl;
+  alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
+  vfloat32m4_t v_max_acc = __riscv_vfmv_v_f_f32m4(0.0f, __riscv_vsetvlmax_e32m4());
+
+  for (int64_t k = 0; k < K; k += vl) {
+    vl = __riscv_vsetvl_e32m4(K - k);
+    vfloat32m4_t v_val = load_as_float_m4(A + k, vl, scratch);
+    vfloat32m4_t v_abs = __riscv_vfsgnjx_vv_f32m4(v_val, v_val, vl);
+    v_max_acc = __riscv_vfmax_vv_f32m4_tu(v_max_acc, v_max_acc, v_abs, vl);
+  }
+
+  vfloat32m1_t v_max_scalar =
+      __riscv_vfredmax_vs_f32m4_f32m1(v_max_acc, __riscv_vfmv_s_f_f32m1(0.0f, 1), __riscv_vsetvlmax_e32m4());
+  max_val = __riscv_vfmv_f_s_f32m1_f32(v_max_scalar);
+  max_val = std::max(max_val, eps);
+  const float scale = max_val / 127.0f;
+  quantize_row_uint8_asymmetric_with_scale(Aq, A, K, scale);
+  scale_out = scale;
+}
+
+inline void pretransform_u8_to_centered_i8(int8_t* __restrict__ dst, const uint8_t* __restrict__ src, int64_t size) {
+  size_t vl;
+  for (int64_t k = 0; k < size; k += vl) {
+    vl = __riscv_vsetvl_e8m1(size - k);
+    vuint8m1_t v_u8 = __riscv_vle8_v_u8m1(src + k, vl);
+    // Map uint8 [0, 255] into centered int8 [-128, 127] by flipping the sign bit.
+    v_u8 = __riscv_vxor_vx_u8m1(v_u8, 0x80, vl);
+    vint8m1_t v_i8 = __riscv_vreinterpret_v_u8m1_i8m1(v_u8);
+    __riscv_vse8_v_i8m1(dst + k, v_i8, vl);
+  }
+}
+
+inline void pack_weight_int8_with_comp(
+    int8_t* __restrict__ packed_w, const int8_t* __restrict__ orig_w, int64_t N, int64_t K, int64_t block_n) {
+  const int64_t packed_data_size = K * block_n;
+  int32_t* packed_comp = reinterpret_cast<int32_t*>(packed_w + packed_data_size);
+  size_t vl;
+
+  // Zero-initialize compensation buffer once, then accumulate while packing.
+  for (int64_t j = 0; j < block_n; j += vl) {
+    vl = __riscv_vsetvl_e32m4(block_n - j);
+    vint32m4_t v_zero = __riscv_vmv_v_x_i32m4(0, vl);
+    __riscv_vse32_v_i32m4(packed_comp + j, v_zero, vl);
+  }
+
+  for (int64_t k = 0; k < K; ++k) {
+    int8_t* dst = packed_w + k * block_n;
+    int64_t j = 0;
+    while (j < N) {
+      vl = __riscv_vsetvl_e8m1(N - j);
+      vint8m1_t v_data = __riscv_vlse8_v_i8m1(orig_w + (j * K + k), K, vl);
+      __riscv_vse8_v_i8m1(dst + j, v_data, vl);
+
+      vint16m2_t v_i16 = __riscv_vsext_vf2_i16m2(v_data, vl);
+      vint32m4_t v_i32 = __riscv_vsext_vf2_i32m4(v_i16, vl);
+      vint32m4_t v_acc = __riscv_vle32_v_i32m4(packed_comp + j, vl);
+      v_acc = __riscv_vadd_vv_i32m4(v_acc, v_i32, vl);
+      __riscv_vse32_v_i32m4(packed_comp + j, v_acc, vl);
+
+      j += vl;
+    }
+    while (j < block_n) {
+      vl = __riscv_vsetvl_e8m1(block_n - j);
+      vint8m1_t v_zero = __riscv_vmv_v_x_i8m1(0, vl);
+      __riscv_vse8_v_i8m1(dst + j, v_zero, vl);
+      j += vl;
+    }
+  }
+
+  // Finalize shared-CPU-compatible compensation: 128 * sum(weight_col).
+  for (int64_t j = 0; j < block_n; j += vl) {
+    vl = __riscv_vsetvl_e32m4(block_n - j);
+    vint32m4_t v_comp = __riscv_vle32_v_i32m4(packed_comp + j, vl);
+    v_comp = __riscv_vmul_vx_i32m4(v_comp, 128, vl);
+    __riscv_vse32_v_i32m4(packed_comp + j, v_comp, vl);
   }
 }
 

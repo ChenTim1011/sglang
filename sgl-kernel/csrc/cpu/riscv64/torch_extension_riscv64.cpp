@@ -200,7 +200,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "decode_attention_int8_cpu(Tensor query, Tensor k_cache, Tensor v_cache, Tensor(a!) output, Tensor key, "
       "Tensor value, Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, "
       "float sm_scale, float logit_cap, "
-      "Tensor k_scale_buf, Tensor v_scale_buf, float k_scale=1.0, float v_scale=1.0) -> ()");
+      "Tensor k_scale_buf, Tensor v_scale_buf, float k_scale, float v_scale) -> ()");
   m.impl("decode_attention_int8_cpu", torch::kCPU, &decode_attention_int8_cpu);
 
   // extend
@@ -214,7 +214,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "k_buffer, Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor "
       "extend_seq_lens, "
       "Tensor extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, "
-      "Tensor k_scale_buf, Tensor v_scale_buf, float k_scale=1.0, float v_scale=1.0) -> ()");
+      "Tensor k_scale_buf, Tensor v_scale_buf, float k_scale, float v_scale) -> ()");
   m.impl("extend_attention_int8_cpu", torch::kCPU, &extend_attention_int8_cpu);
 
   // weight prepack
