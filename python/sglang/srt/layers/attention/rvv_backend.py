@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import cpu_has_rvv_support
+from sglang.srt.utils.common import cpu_has_rvv_support
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -20,7 +20,7 @@ _NUM_KV_SPLITS = 2
 
 
 class RVVAttnBackend(AttentionBackend):
-    """Attention backend for RISC-V Vector Extension (RVV) on SpacemiT K1.
+    """Attention backend for RISC-V Vector Extension (RVV).
 
     Known limitations on RISC-V (features disabled via CPU_CAPABILITY_RVV guards):
       - No MoE support (fused_experts_cpu excluded from RVV build)
@@ -50,17 +50,8 @@ class RVVAttnBackend(AttentionBackend):
     def _try_init_rvv_kernels(self, model_runner: ModelRunner):
         try:
             ops = torch.ops.sgl_kernel
-
-            # Read all needed fields immediately; do not retain model_runner.
             pool = model_runner.token_to_kv_pool
             layer_id = 0
-            if hasattr(pool, "full_attention_layer_id_mapping"):
-                layer_id = next(iter(pool.full_attention_layer_id_mapping))
-            else:
-                logger.debug(
-                    "[RVV] pool has no full_attention_layer_id_mapping; "
-                    "using layer_id=0 for buffer shape probing."
-                )
 
             self.num_head = (
                 model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -96,9 +87,6 @@ class RVVAttnBackend(AttentionBackend):
                     )
 
             if kernels_available:
-                # Pre-allocate attn_logits pool once; sliced per batch at runtime.
-                # The decode kernel zero-initialises each used slice (fill_stub),
-                # so torch.empty is safe and avoids redundant zeroing.
                 max_bs = model_runner.req_to_token_pool.size
                 self._attn_logits_pool = torch.empty(
                     (max_bs, self.num_head, _NUM_KV_SPLITS, self.v_head_dim + 1),
@@ -106,8 +94,6 @@ class RVVAttnBackend(AttentionBackend):
                     device="cpu",
                 )
 
-                # Per-layer per-token per-KV-head scale buffers for dynamic INT8
-                # quantization.  Shape: [num_layers, max_tokens, num_kv_heads].
                 if self.is_int8:
                     max_tokens, num_kv_heads = k_buffer.shape[0], k_buffer.shape[1]
                     num_layers = model_runner.model_config.num_hidden_layers
@@ -121,18 +107,11 @@ class RVVAttnBackend(AttentionBackend):
                         dtype=torch.float32,
                         device="cpu",
                     )
-                # Mark kernels ready only after all buffers are successfully allocated.
                 self.use_rvv_kernels = True
                 logger.info(
                     f"[RVV] Initialized. Mode={'INT8' if self.is_int8 else 'FLOAT'}"
                 )
 
-        except StopIteration:
-            logger.warning(
-                "[RVV] Init failed: full_attention_layer_id_mapping is empty — "
-                "pool may be uninitialized or model has no full-attention layers. "
-                "Falling back to TorchNative."
-            )
         except (AttributeError, RuntimeError, MemoryError) as e:
             logger.warning(
                 "[RVV] Init failed, falling back to TorchNative. Reason: %s",
@@ -147,32 +126,62 @@ class RVVAttnBackend(AttentionBackend):
             )
             raise
 
-    @staticmethod
-    def _ensure_cached_scales(layer: RadixAttention):
-        """Cache quantization scales on first call to avoid repeated .item() calls."""
-        if getattr(layer, "_rvv_scales_cached", False):
-            return
+    def _scale_buf_index(self, layer: RadixAttention) -> int:
+        return layer.layer_id
 
-        def _resolve(src_attr: str, fallback_attr: str) -> float:
+    @staticmethod
+    def _ensure_cached_scales(
+        layer: RadixAttention,
+        key: torch.Tensor | None = None,
+        value: torch.Tensor | None = None,
+    ):
+        """Resolve per-layer KV scales for RVV INT8 attention."""
+
+        def _resolve(src_attr: str, fallback_attr: str):
             src = getattr(layer, src_attr, None)
             if isinstance(src, torch.Tensor):
-                return src.item()
+                return src.item(), True
             if isinstance(src, (int, float)):
-                return float(src)
-            # src is None — try the float-cache attribute (may also be None).
+                return float(src), True
+
             fallback = getattr(layer, fallback_attr, None)
             if fallback is not None:
-                return float(fallback)
+                return float(fallback), True
+            return None, False
+
+        key_is_quantized = key is not None and key.dtype in (torch.int8, torch.uint8)
+        value_is_quantized = value is not None and value.dtype in (
+            torch.int8,
+            torch.uint8,
+        )
+
+        k_scale, has_k_scale = _resolve("k_scale", "k_scale_float")
+        v_scale, has_v_scale = _resolve("v_scale", "v_scale_float")
+
+        if has_k_scale != has_v_scale:
             raise RuntimeError(
-                f"[RVV] {src_attr} (and {fallback_attr}) are both None on "
-                f"{type(layer).__name__}; INT8 attention requires valid quantization "
-                f"scales. Check that the model was loaded with INT8 KV-cache quantization."
+                "[RVV] Inconsistent INT8 KV-cache scales on "
+                f"{type(layer).__name__}: k_scale present={has_k_scale}, "
+                f"v_scale present={has_v_scale}. Both scales must be provided "
+                "together for RVV INT8 attention."
             )
 
-        k_scale = _resolve("k_scale", "k_scale_float")
-        v_scale = _resolve("v_scale", "v_scale_float")
+        if not has_k_scale:
+            if key_is_quantized or value_is_quantized:
+                raise RuntimeError(
+                    "[RVV] Missing k_scale/v_scale on "
+                    f"{type(layer).__name__}; pre-quantized INT8 K/V inputs require "
+                    "explicit dequantization scales."
+                )
+
+            logger.warning_once(
+                f"[RVV] Missing k_scale/v_scale on {type(layer).__name__}; using "
+                "dynamic per-token quantization sentinel scales (NaN, NaN)."
+            )
+            k_scale = float("nan")
+            v_scale = float("nan")
+
         layer._cached_k_scale_float, layer._cached_v_scale_float = k_scale, v_scale
-        layer._rvv_scales_cached = True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if not self.use_rvv_kernels:
@@ -193,6 +202,45 @@ class RVVAttnBackend(AttentionBackend):
                 max_extend_len = forward_batch.extend_seq_lens.max().item()
 
         self.forward_metadata = (attn_logits, max_extend_len)
+
+    def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
+        del max_bs, max_num_tokens
+        logger.warning_once(
+            "[RVV] CPU graph / torch.compile is not supported for the RVV attention "
+            "backend yet. Use eager CPU execution or switch to another backend."
+        )
+
+    def get_cpu_graph_seq_len_fill_value(self):
+        logger.warning_once(
+            "[RVV] get_cpu_graph_seq_len_fill_value called on unsupported RVV CPU "
+            "graph path; using fill value 1 before the capture path raises."
+        )
+        return 1
+
+    def init_forward_metadata_capture_cpu_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens,
+        forward_mode,
+        spec_info,
+    ):
+        del (
+            bs,
+            num_tokens,
+            req_pool_indices,
+            seq_lens,
+            encoder_lens,
+            forward_mode,
+            spec_info,
+        )
+        raise RuntimeError(
+            "[RVV] CPU graph / torch.compile is not supported for the RVV attention "
+            "backend yet. Disable --enable-torch-compile or use a different "
+            "attention backend."
+        )
 
     def forward_decode(
         self,
@@ -244,10 +292,11 @@ class RVVAttnBackend(AttentionBackend):
                 layer.logit_cap,
             )
             if self.is_int8:
-                self._ensure_cached_scales(layer)
+                self._ensure_cached_scales(layer, k, v)
+                scale_buf_idx = self._scale_buf_index(layer)
                 args += (
-                    self._k_scale_buf[layer.layer_id],
-                    self._v_scale_buf[layer.layer_id],
+                    self._k_scale_buf[scale_buf_idx],
+                    self._v_scale_buf[scale_buf_idx],
                 )
                 args += (layer._cached_k_scale_float, layer._cached_v_scale_float)
 
@@ -323,11 +372,12 @@ class RVVAttnBackend(AttentionBackend):
                 layer.logit_cap,
             )
             if self.is_int8:
-                self._ensure_cached_scales(layer)
+                self._ensure_cached_scales(layer, k, v)
+                scale_buf_idx = self._scale_buf_index(layer)
                 # Order matches schema: k_scale_buf, v_scale_buf, k_scale, v_scale
                 args += (
-                    self._k_scale_buf[layer.layer_id],
-                    self._v_scale_buf[layer.layer_id],
+                    self._k_scale_buf[scale_buf_idx],
+                    self._v_scale_buf[scale_buf_idx],
                 )
                 args += (layer._cached_k_scale_float, layer._cached_v_scale_float)
 

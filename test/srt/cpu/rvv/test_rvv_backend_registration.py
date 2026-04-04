@@ -637,8 +637,8 @@ class TestRVVLMHeadPacking(unittest.TestCase):
         with patch.object(
             rvv_utils, "cpu_has_rvv_support", return_value=True
         ), patch.object(rvv_utils, "_convert_weight_packed", side_effect=fake_convert):
-            packed_1 = rvv_utils.get_rvv_lm_head_weight(lm_head)
-            packed_2 = rvv_utils.get_rvv_lm_head_weight(lm_head)
+            packed_1 = rvv_utils.resolve_rvv_lm_head_weight(lm_head)
+            packed_2 = rvv_utils.resolve_rvv_lm_head_weight(lm_head)
             self.assertEqual(len(pack_calls), 1)
             self.assertTrue(torch.equal(packed_1, packed_2))
 
@@ -647,7 +647,7 @@ class TestRVVLMHeadPacking(unittest.TestCase):
                     torch.tensor([[5.0, 6.0], [7.0, 8.0]], dtype=torch.float16)
                 )
 
-            packed_3 = rvv_utils.get_rvv_lm_head_weight(lm_head)
+            packed_3 = rvv_utils.resolve_rvv_lm_head_weight(lm_head)
 
         self.assertEqual(len(pack_calls), 2)
         self.assertTrue(
@@ -687,7 +687,8 @@ class TestRVVLMHeadPacking(unittest.TestCase):
             rvv_utils, "cpu_has_rvv_support", return_value=True
         ), patch.object(rvv_utils, "_get_convert_weight_packed_op") as mock_get_op:
             self.assertFalse(rvv_utils.use_rvv_lm_head_backend(lm_head))
-            self.assertIsNone(rvv_utils.get_rvv_lm_head_weight(lm_head))
+            with self.assertRaises(RuntimeError):
+                rvv_utils.resolve_rvv_lm_head_weight(lm_head)
 
         mock_get_op.assert_not_called()
 
@@ -706,7 +707,8 @@ class TestRVVLMHeadPacking(unittest.TestCase):
             rvv_utils, "cpu_has_rvv_support", return_value=True
         ), patch.object(rvv_utils, "_convert_weight_packed", return_value=object()):
             self.assertFalse(rvv_utils.use_rvv_lm_head_backend(lm_head))
-            self.assertIsNone(rvv_utils.get_rvv_lm_head_weight(lm_head))
+            with self.assertRaises(RuntimeError):
+                rvv_utils.resolve_rvv_lm_head_weight(lm_head)
 
 
 if __name__ == "__main__":
