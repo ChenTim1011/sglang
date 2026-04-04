@@ -115,6 +115,7 @@ void act_gelu_inner(
 // output  : {num_tokens, d}
 at::Tensor silu_and_mul_cpu(at::Tensor& input) {
   RECORD_FUNCTION("sgl-kernel::silu_and_mul_cpu", std::vector<c10::IValue>({input}));
+  auto input_contig = input.contiguous();
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
   int64_t d = sizes[last_dim] / 2;
@@ -122,8 +123,8 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input) {
   int64_t num_tokens = input.numel() / input.size(-1);
   at::Tensor out = at::empty(sizes, input.options());
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "silu_and_mul", [&] {
-    const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input_contig.scalar_type(), "silu_and_mul", [&] {
+    const scalar_t* in_ptr = input_contig.data_ptr<scalar_t>();
     scalar_t* out_ptr = out.data_ptr<scalar_t>();
     at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
       for (int64_t i = begin; i < end; ++i) {
@@ -137,6 +138,7 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input) {
 
 at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
   RECORD_FUNCTION("sgl-kernel::gelu_tanh_and_mul_cpu", std::vector<c10::IValue>({input}));
+  auto input_contig = input.contiguous();
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
   int64_t d = sizes[last_dim] / 2;
@@ -144,8 +146,8 @@ at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
   int64_t num_tokens = input.numel() / input.size(-1);
   at::Tensor out = at::empty(sizes, input.options());
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul", [&] {
-    const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input_contig.scalar_type(), "gelu_tanh_and_mul", [&] {
+    const scalar_t* in_ptr = input_contig.data_ptr<scalar_t>();
     scalar_t* out_ptr = out.data_ptr<scalar_t>();
     at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
       for (int64_t i = begin; i < end; ++i) {
@@ -159,6 +161,7 @@ at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
 
 at::Tensor gelu_and_mul_cpu(const at::Tensor& input) {
   RECORD_FUNCTION("sgl-kernel::gelu_and_mul_cpu", std::vector<c10::IValue>({input}));
+  auto input_contig = input.contiguous();
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
   int64_t d = sizes[last_dim] / 2;
@@ -166,8 +169,8 @@ at::Tensor gelu_and_mul_cpu(const at::Tensor& input) {
   int64_t num_tokens = input.numel() / input.size(-1);
   at::Tensor out = at::empty(sizes, input.options());
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gelu_and_mul", [&] {
-    const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input_contig.scalar_type(), "gelu_and_mul", [&] {
+    const scalar_t* in_ptr = input_contig.data_ptr<scalar_t>();
     scalar_t* out_ptr = out.data_ptr<scalar_t>();
     at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
       for (int64_t i = begin; i < end; ++i) {
