@@ -1680,6 +1680,10 @@ void decode_attention_cpu(
   CHECK_DIM(3, key);
   CHECK_DIM(3, value);
   CHECK_DIM(1, loc);
+  TORCH_CHECK(
+      query.scalar_type() == key.scalar_type() && query.scalar_type() == value.scalar_type() &&
+          query.scalar_type() == k_buffer.scalar_type() && query.scalar_type() == v_buffer.scalar_type(),
+      "decode_attention_cpu: expect query, key, value, k_buffer, and v_buffer to have the same dtype");
 
   int64_t num_seqs = seq_lens.size(0);
   int64_t max_num_reqs = req_to_token.size(0);
@@ -1871,6 +1875,12 @@ void decode_attention_int8_cpu(
       v_buffer.scalar_type() == at::kByte || v_buffer.scalar_type() == at::kChar,
       "decode_int8: v_buffer must be int8/uint8, got ",
       v_buffer.scalar_type());
+  TORCH_CHECK(
+      key.scalar_type() == value.scalar_type(),
+      "decode_attention_int8_cpu: expect key and value to have the same dtype");
+  TORCH_CHECK(
+      (key.scalar_type() == at::kByte || key.scalar_type() == at::kChar) || key.scalar_type() == query.scalar_type(),
+      "decode_attention_int8_cpu: expect floating key/value to match query dtype");
 
   int64_t num_seqs = seq_lens.size(0);
   int64_t max_num_reqs = req_to_token.size(0);
@@ -1898,12 +1908,12 @@ void decode_attention_int8_cpu(
       "decode_attention_int8_cpu: sm_scale must be finite and positive, got ",
       sm_scale);
   TORCH_CHECK(
-      std::isfinite(k_scale) && k_scale > 0.0,
-      "decode_attention_int8_cpu: k_scale must be finite and positive, got ",
+      (std::isfinite(k_scale) && k_scale > 0.0) || std::isnan(k_scale),
+      "decode_attention_int8_cpu: k_scale must be finite and positive, or NaN for dynamic quantization, got ",
       k_scale);
   TORCH_CHECK(
-      std::isfinite(v_scale) && v_scale > 0.0,
-      "decode_attention_int8_cpu: v_scale must be finite and positive, got ",
+      (std::isfinite(v_scale) && v_scale > 0.0) || std::isnan(v_scale),
+      "decode_attention_int8_cpu: v_scale must be finite and positive, or NaN for dynamic quantization, got ",
       v_scale);
 
   // decode_accumulate_kv_splits writes output as output + i*head_size_v
@@ -1936,6 +1946,46 @@ void decode_attention_int8_cpu(
 
   // Per-token scale buffers: shape [max_tokens, num_kv_heads], float32
   // When k_scale==1.0 (dynamic quant), quantize writes here and attention reads back.
+  if (k_scale_buf.defined()) {
+    CHECK_INPUT(k_scale_buf);
+    CHECK_DIM(2, k_scale_buf);
+    TORCH_CHECK(
+        k_scale_buf.scalar_type() == at::kFloat,
+        "decode_attention_int8_cpu: k_scale_buf must be float32, got ",
+        k_scale_buf.scalar_type());
+    TORCH_CHECK(
+        k_scale_buf.size(0) == max_total_num_tokens && k_scale_buf.size(1) == num_heads_kv,
+        "decode_attention_int8_cpu: k_scale_buf must have shape [",
+        max_total_num_tokens,
+        ", ",
+        num_heads_kv,
+        "], got ",
+        k_scale_buf.sizes());
+  }
+  if (v_scale_buf.defined()) {
+    CHECK_INPUT(v_scale_buf);
+    CHECK_DIM(2, v_scale_buf);
+    TORCH_CHECK(
+        v_scale_buf.scalar_type() == at::kFloat,
+        "decode_attention_int8_cpu: v_scale_buf must be float32, got ",
+        v_scale_buf.scalar_type());
+    TORCH_CHECK(
+        v_scale_buf.size(0) == max_total_num_tokens && v_scale_buf.size(1) == num_heads_kv,
+        "decode_attention_int8_cpu: v_scale_buf must have shape [",
+        max_total_num_tokens,
+        ", ",
+        num_heads_kv,
+        "], got ",
+        v_scale_buf.sizes());
+  }
+  if (std::isnan(k_scale) || std::isnan(v_scale)) {
+    TORCH_CHECK(
+        !(key.scalar_type() == at::kByte || key.scalar_type() == at::kChar),
+        "decode_attention_int8_cpu: dynamic quantization scales require floating key/value inputs");
+    TORCH_CHECK(
+        k_scale_buf.defined() && v_scale_buf.defined(),
+        "decode_attention_int8_cpu: dynamic quantization scales require k_scale_buf and v_scale_buf");
+  }
   float* k_scale_buf_ptr = k_scale_buf.defined() ? k_scale_buf.data_ptr<float>() : nullptr;
   float* v_scale_buf_ptr = v_scale_buf.defined() ? v_scale_buf.data_ptr<float>() : nullptr;
 
