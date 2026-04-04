@@ -40,6 +40,10 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.rvv_utils import (
+    resolve_rvv_lm_head_weight,
+    use_rvv_lm_head_backend,
+)
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     compute_temp_top_p_normalized_logprobs,
@@ -58,7 +62,6 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import (
     is_npu,
     use_intel_amx_backend,
-    use_riscv_rvv_backend,
 )
 
 logger = logging.getLogger(__name__)
@@ -886,20 +889,26 @@ class LogitsProcessor(nn.Module):
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
-            # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
         elif hasattr(lm_head, "weight"):
-            # Normal linear layer
             if self.use_fp32_lm_head:
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
                 )
-            elif use_intel_amx_backend(lm_head) or use_riscv_rvv_backend(lm_head):
+            elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
                     lm_head.weight,
                     None,  # bias
-                    True,  # is_vnni / is_packed
+                    True,  # is_vnni
+                )
+            elif use_rvv_lm_head_backend(lm_head):
+                rvv_weight = resolve_rvv_lm_head_weight(lm_head)
+                logits = torch.ops.sgl_kernel.weight_packed_linear(
+                    hidden_states.to(rvv_weight.dtype),
+                    rvv_weight,
+                    None,  # bias
+                    True,  # is_packed
                 )
             elif get_global_server_args().rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
