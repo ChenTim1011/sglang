@@ -797,9 +797,70 @@ void extend_attention_int8_cpu(
       extend_seq_lens,
       extend_start_loc);
 
+  TORCH_CHECK(
+      k_extend.scalar_type() == v_extend.scalar_type(),
+      "extend_attention_int8_cpu: expect k_extend and v_extend to have the same dtype");
+  TORCH_CHECK(
+      (k_extend.scalar_type() == at::kByte || k_extend.scalar_type() == at::kChar) ||
+          k_extend.scalar_type() == q_extend.scalar_type(),
+      "extend_attention_int8_cpu: expect floating k_extend/v_extend to match q_extend dtype");
+  TORCH_CHECK(
+      std::isfinite(sm_scale) && sm_scale > 0.0,
+      "extend_attention_int8_cpu: sm_scale must be finite and positive, got ",
+      sm_scale);
+  TORCH_CHECK(
+      (std::isfinite(k_scale) && k_scale > 0.0) || std::isnan(k_scale),
+      "extend_attention_int8_cpu: k_scale must be finite and positive, or NaN for dynamic quantization, got ",
+      k_scale);
+  TORCH_CHECK(
+      (std::isfinite(v_scale) && v_scale > 0.0) || std::isnan(v_scale),
+      "extend_attention_int8_cpu: v_scale must be finite and positive, or NaN for dynamic quantization, got ",
+      v_scale);
+
   int buffer_size = compute_buffer_size_per_thread(p.head_size, p.head_size_v);
   int num_threads = at::get_num_threads();
   auto buffer = at::empty({num_threads, buffer_size}, q_extend.options().dtype(at::kChar));
+
+  if (k_scale_buf.defined()) {
+    CHECK_INPUT(k_scale_buf);
+    CHECK_DIM(2, k_scale_buf);
+    TORCH_CHECK(
+        k_scale_buf.scalar_type() == at::kFloat,
+        "extend_attention_int8_cpu: k_scale_buf must be float32, got ",
+        k_scale_buf.scalar_type());
+    TORCH_CHECK(
+        k_scale_buf.size(0) == p.max_total_num_tokens && k_scale_buf.size(1) == p.num_heads_kv,
+        "extend_attention_int8_cpu: k_scale_buf must have shape [",
+        p.max_total_num_tokens,
+        ", ",
+        p.num_heads_kv,
+        "], got ",
+        k_scale_buf.sizes());
+  }
+  if (v_scale_buf.defined()) {
+    CHECK_INPUT(v_scale_buf);
+    CHECK_DIM(2, v_scale_buf);
+    TORCH_CHECK(
+        v_scale_buf.scalar_type() == at::kFloat,
+        "extend_attention_int8_cpu: v_scale_buf must be float32, got ",
+        v_scale_buf.scalar_type());
+    TORCH_CHECK(
+        v_scale_buf.size(0) == p.max_total_num_tokens && v_scale_buf.size(1) == p.num_heads_kv,
+        "extend_attention_int8_cpu: v_scale_buf must have shape [",
+        p.max_total_num_tokens,
+        ", ",
+        p.num_heads_kv,
+        "], got ",
+        v_scale_buf.sizes());
+  }
+  if (std::isnan(k_scale) || std::isnan(v_scale)) {
+    TORCH_CHECK(
+        !(k_extend.scalar_type() == at::kByte || k_extend.scalar_type() == at::kChar),
+        "extend_attention_int8_cpu: dynamic quantization scales require floating k_extend/v_extend inputs");
+    TORCH_CHECK(
+        k_scale_buf.defined() && v_scale_buf.defined(),
+        "extend_attention_int8_cpu: dynamic quantization scales require k_scale_buf and v_scale_buf");
+  }
 
   float* k_scale_buf_ptr = k_scale_buf.defined() ? k_scale_buf.data_ptr<float>() : nullptr;
   float* v_scale_buf_ptr = v_scale_buf.defined() ? v_scale_buf.data_ptr<float>() : nullptr;

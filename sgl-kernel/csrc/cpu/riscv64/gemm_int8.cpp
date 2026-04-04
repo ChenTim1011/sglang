@@ -426,6 +426,7 @@ at::Tensor int8_scaled_mm_cpu(
       "int8_scaled_mm_cpu: scales2 must be 1D with N elements, got shape ",
       scales2.sizes());
   if (is_packed) {
+    const int64_t expected_nb = div_up(N, static_cast<int64_t>(rvv_constants::BLOCK_N));
     TORCH_CHECK(mat2.dim() == 2, "int8_scaled_mm_cpu: packed mat2 must be 2D [NB, BLOCK_N*(K+4)].");
     TORCH_CHECK(
         mat2.size(1) == get_int8_packed_block_size(K),
@@ -434,9 +435,9 @@ at::Tensor int8_scaled_mm_cpu(
         ", got ",
         mat2.size(1));
     TORCH_CHECK(
-        mat2.size(0) == div_up(N, rvv_constants::BLOCK_N),
+        mat2.size(0) == expected_nb,
         "int8_scaled_mm_cpu: packed mat2 has invalid block count, expected ",
-        div_up(N, rvv_constants::BLOCK_N),
+        expected_nb,
         ", got ",
         mat2.size(0));
   }
@@ -515,6 +516,7 @@ at::Tensor int8_scaled_mm_with_quant(
   TORCH_CHECK(mat2.scalar_type() == at::kChar, "int8_scaled_mm_with_quant: expect mat2 to be int8.");
   TORCH_CHECK(scales2.scalar_type() == at::kFloat, "int8_scaled_mm_with_quant: expect scales to be float32.");
   if (is_packed) {
+    const int64_t expected_nb = div_up(N, static_cast<int64_t>(rvv_constants::BLOCK_N));
     TORCH_CHECK(mat2.dim() == 2, "int8_scaled_mm_with_quant: packed mat2 must be 2D [NB, BLOCK_N*(K+4)].");
     TORCH_CHECK(
         mat2.size(1) == get_int8_packed_block_size(K),
@@ -523,9 +525,9 @@ at::Tensor int8_scaled_mm_with_quant(
         ", got ",
         mat2.size(1));
     TORCH_CHECK(
-        mat2.size(0) == div_up(N, rvv_constants::BLOCK_N),
+        mat2.size(0) == expected_nb,
         "int8_scaled_mm_with_quant: packed mat2 has invalid block count, expected ",
-        div_up(N, rvv_constants::BLOCK_N),
+        expected_nb,
         ", got ",
         mat2.size(0));
   }
