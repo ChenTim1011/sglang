@@ -1,11 +1,4 @@
-"""Unit tests for RVV attention backend registration and integration.
-
-Verifies registry presence, backend init behavior, fallback semantics, cache
-location wiring, forward-metadata guards, and INT8 scale plumbing.
-
-Usage:
-    python3 -m unittest test.srt.cpu.rvv.test_rvv_backend_registration -v
-"""
+"""Unit tests for RVV attention backend registration and integration."""
 
 import unittest
 from math import isnan
@@ -85,13 +78,13 @@ class _RVVBackendTestMixin:
 class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin):
     """Init and registry tests."""
 
-    def test_case_backend_registry_structure(self):
-        """Case: registry contains the RVV backend key."""
+    def test_registry_structure(self):
+        """RVV backend must be registered so dispatchers can look it up by name."""
         self.assertIsInstance(ATTENTION_BACKENDS, dict)
         self.assertIn("rvv", ATTENTION_BACKENDS)
 
-    def test_case_backend_selection_on_current_platform(self):
-        """Case: runtime backend selection matches platform capabilities."""
+    def test_backend_selection(self):
+        """Backend selection must match runtime platform capabilities (RVV or fallback)."""
         from unittest.mock import Mock
 
         import torch
@@ -125,7 +118,7 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
         else:
             self.assertIsNotNone(backend.fallback_backend)
 
-    def test_case_int8_init_falls_back_when_kernels_missing(self):
+    def test_int8_init_falls_back_when_kernels_missing(self):
         """INT8 KV cache should fall back if RVV INT8 kernels are unavailable."""
         from unittest.mock import MagicMock, patch
 
@@ -159,7 +152,7 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
         self.assertFalse(backend.use_rvv_kernels)
         self.assertIsNotNone(backend.fallback_backend)
 
-    def test_case_int8_requested_without_rvv_support_falls_back(self):
+    def test_int8_requested_without_rvv_support_falls_back(self):
         """If int8 KV cache is requested, lack of RVV support should fall back."""
         from unittest.mock import MagicMock, patch
 
@@ -181,8 +174,8 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
 class TestRVVForwardMetadataGuards(unittest.TestCase, _RVVBackendTestMixin):
     """Forward-metadata guard behavior."""
 
-    def test_case_init_forward_metadata_rejects_batch_larger_than_pool(self):
-        """Metadata init should fail loudly instead of slicing beyond the pool."""
+    def test_metadata_rejects_oversized_batch(self):
+        """Batch larger than the pool must fail loudly instead of silently slicing OOB."""
         import torch
 
         backend = self._make_backend_with_rvv_kernels()
@@ -197,8 +190,8 @@ class TestRVVForwardMetadataGuards(unittest.TestCase, _RVVBackendTestMixin):
         with self.assertRaisesRegex(RuntimeError, "exceeds pre-allocated pool size"):
             backend.init_forward_metadata(forward_batch)
 
-    def test_case_init_forward_metadata_extend_tracks_max_extend_len(self):
-        """Extend-mode metadata should cache the batch max extend length."""
+    def test_metadata_tracks_max_extend_len(self):
+        """max_extend_len must be cached so extend kernels know their iteration bound."""
         import torch
 
         backend = self._make_backend_with_rvv_kernels()
@@ -219,8 +212,8 @@ class TestRVVForwardMetadataGuards(unittest.TestCase, _RVVBackendTestMixin):
 class TestRVVBackendFallbackSemantics(unittest.TestCase, _RVVBackendTestMixin):
     """Fallback behavior and non-regression semantics."""
 
-    def test_case_forward_decode_save_kv_cache_false_uses_fallback(self):
-        """forward_decode with save_kv_cache=False must call TorchNative fallback."""
+    def test_decode_no_save_uses_fallback(self):
+        """save_kv_cache=False bypasses RVV; must delegate to TorchNative fallback."""
         from unittest.mock import MagicMock
 
         import torch
@@ -243,8 +236,8 @@ class TestRVVBackendFallbackSemantics(unittest.TestCase, _RVVBackendTestMixin):
         )
         self.assertIs(result, sentinel)
 
-    def test_case_forward_extend_int8_save_kv_cache_false_uses_fallback(self):
-        """INT8 extend with save_kv_cache=False must call TorchNative fallback."""
+    def test_int8_extend_no_save_uses_fallback(self):
+        """INT8 extend with save_kv_cache=False must delegate to TorchNative fallback."""
         from unittest.mock import MagicMock
 
         import torch
@@ -267,7 +260,7 @@ class TestRVVBackendFallbackSemantics(unittest.TestCase, _RVVBackendTestMixin):
         )
         self.assertIs(result, sentinel)
 
-    def test_case_forward_extend_cross_attention_uses_fallback(self):
+    def test_cross_attn_uses_fallback(self):
         """Cross-attention extend must never hit the RVV kernel path."""
         from unittest.mock import MagicMock
 
@@ -297,8 +290,8 @@ class TestRVVBackendFallbackSemantics(unittest.TestCase, _RVVBackendTestMixin):
 class TestRVVBackendCacheWiring(unittest.TestCase, _RVVBackendTestMixin):
     """Cache location and metadata wiring tests."""
 
-    def test_case_forward_decode_cross_attention_prefers_encoder_cache_loc(self):
-        """Cross-attention decode must use encoder_out_cache_loc."""
+    def test_decode_cross_attn_uses_encoder_loc(self):
+        """Cross-attention decode must use encoder_out_cache_loc, not out_cache_loc."""
         from unittest.mock import MagicMock
 
         import torch
@@ -318,8 +311,8 @@ class TestRVVBackendCacheWiring(unittest.TestCase, _RVVBackendTestMixin):
         args = backend.decode_fwd_impl.call_args.args
         self.assertTrue(torch.equal(args[6], batch.encoder_out_cache_loc))
 
-    def test_case_forward_decode_self_attention_uses_out_cache_loc(self):
-        """Self-attention decode must keep using out_cache_loc."""
+    def test_decode_self_attn_uses_out_loc(self):
+        """Self-attention decode must use out_cache_loc, not the encoder variant."""
         from unittest.mock import MagicMock
 
         import torch
@@ -339,8 +332,8 @@ class TestRVVBackendCacheWiring(unittest.TestCase, _RVVBackendTestMixin):
         args = backend.decode_fwd_impl.call_args.args
         self.assertTrue(torch.equal(args[6], batch.out_cache_loc))
 
-    def test_case_forward_extend_fp_save_kv_cache_false_skips_cache_write(self):
-        """FP extend with save_kv_cache=False should avoid Python-side cache writes."""
+    def test_extend_no_save_skips_cache(self):
+        """save_kv_cache=False must skip set_kv_buffer entirely; no stale writes."""
         from unittest.mock import MagicMock
 
         import torch
@@ -361,8 +354,8 @@ class TestRVVBackendCacheWiring(unittest.TestCase, _RVVBackendTestMixin):
         backend.extend_fwd_impl.assert_called_once()
         self.assertEqual(tuple(out.shape), (4, 8 * 64))
 
-    def test_case_forward_extend_fp_save_kv_cache_true_writes_cache_once(self):
-        """FP extend with save_kv_cache=True must stage K/V into the cache pool."""
+    def test_extend_save_writes_cache(self):
+        """save_kv_cache=True must call set_kv_buffer exactly once per extend step."""
         from unittest.mock import MagicMock
 
         import torch
@@ -388,8 +381,8 @@ class TestRVVBackendCacheWiring(unittest.TestCase, _RVVBackendTestMixin):
 class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
     """INT8 scale resolution and buffer routing tests."""
 
-    def test_case_missing_layer_scales_use_dynamic_quant_sentinel(self):
-        """Floating-point K/V may use the dynamic-quantization sentinel scales."""
+    def test_missing_scales_use_nan_sentinel(self):
+        """FP K/V with no layer scales must yield NaN sentinel, not raise."""
         import torch
 
         from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
@@ -409,8 +402,8 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
         self.assertTrue(isnan(layer._cached_k_scale_float))
         self.assertTrue(isnan(layer._cached_v_scale_float))
 
-    def test_case_missing_layer_scales_raise_for_prequantized_kv(self):
-        """Pre-quantized INT8 K/V must provide explicit scales."""
+    def test_missing_scales_reject_prequant_kv(self):
+        """INT8 K/V without explicit scales must raise, not silently use a wrong dequant value."""
         import torch
 
         from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
@@ -432,7 +425,7 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
                 torch.randint(0, 10, (1, 1, 8), dtype=torch.int8),
             )
 
-    def test_case_partial_layer_scales_raise(self):
+    def test_partial_layer_scales_raise(self):
         """INT8 path must reject partially missing KV scales."""
         from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
 
@@ -446,8 +439,8 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
         with self.assertRaisesRegex(RuntimeError, "Inconsistent INT8 KV-cache scales"):
             RVVAttnBackend._ensure_cached_scales(layer)
 
-    def test_case_layer_scales_use_tensor_or_float_when_present(self):
-        """INT8 path should cache explicit tensor/float scales without fallback."""
+    def test_explicit_scales_cached(self):
+        """Explicit tensor/float scales must be cached and not fallback to sentinel."""
         import torch
 
         from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
@@ -464,8 +457,8 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
         self.assertAlmostEqual(layer._cached_k_scale_float, 0.25, places=6)
         self.assertAlmostEqual(layer._cached_v_scale_float, 0.5, places=6)
 
-    def test_case_resolved_scales_refresh_when_layer_scales_change(self):
-        """Changing layer scales after first use must refresh resolved floats."""
+    def test_scales_refresh_on_change(self):
+        """Updated layer scales must invalidate cached floats; stale values would corrupt dequant."""
         import torch
 
         from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
@@ -485,8 +478,8 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
         self.assertAlmostEqual(layer._cached_k_scale_float, 0.75, places=6)
         self.assertAlmostEqual(layer._cached_v_scale_float, 1.25, places=6)
 
-    def test_case_dynamic_quant_cache_does_not_mask_missing_int8_scales(self):
-        """A float-K/V sentinel must not be reused for later INT8 K/V inputs."""
+    def test_nan_cache_does_not_mask_int8(self):
+        """NaN sentinel cached for FP K/V must not suppress the missing-scale error for INT8 K/V."""
         import torch
 
         from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
@@ -514,8 +507,60 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
                 torch.randint(0, 10, (1, 1, 8), dtype=torch.int8),
             )
 
-    def test_case_int8_scale_buffers_use_hidden_layer_width(self):
-        """INT8 scale buffers should size by model hidden-layer count."""
+    def test_default_scale_1_uses_dynamic_quantization(self):
+        """k_scale=v_scale=1.0 with FP inputs is the BaseKVCacheMethod fallback (no
+        calibration data in checkpoint).  The RVV backend must switch to dynamic
+        per-token quantization (NaN sentinel) instead of using the 1.0 placeholder,
+        which would round all sub-integer activation values to zero.
+        """
+        import torch
+
+        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
+
+        layer = SimpleNamespace(
+            k_scale=torch.tensor(1.0),
+            v_scale=torch.tensor(1.0),
+            k_scale_float=1.0,
+            v_scale_float=1.0,
+        )
+
+        RVVAttnBackend._ensure_cached_scales(
+            layer,
+            torch.randn(1, 1, 8, dtype=torch.bfloat16),
+            torch.randn(1, 1, 8, dtype=torch.bfloat16),
+        )
+        self.assertTrue(
+            isnan(layer._cached_k_scale_float),
+            "k_scale=1.0 with FP inputs must switch to NaN dynamic path",
+        )
+        self.assertTrue(
+            isnan(layer._cached_v_scale_float),
+            "v_scale=1.0 with FP inputs must switch to NaN dynamic path",
+        )
+
+    def test_real_calibrated_scale_not_overridden(self):
+        """A non-1.0 scale from a real calibrated checkpoint must be used as-is."""
+        import torch
+
+        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
+
+        layer = SimpleNamespace(
+            k_scale=torch.tensor(0.08),
+            v_scale=torch.tensor(0.12),
+            k_scale_float=None,
+            v_scale_float=None,
+        )
+
+        RVVAttnBackend._ensure_cached_scales(
+            layer,
+            torch.randn(1, 1, 8, dtype=torch.bfloat16),
+            torch.randn(1, 1, 8, dtype=torch.bfloat16),
+        )
+        self.assertAlmostEqual(layer._cached_k_scale_float, 0.08, places=5)
+        self.assertAlmostEqual(layer._cached_v_scale_float, 0.12, places=5)
+
+    def test_scale_buffers_sized_by_hidden_layers(self):
+        """Scale buffers must be sized by num_hidden_layers so each layer gets its own row."""
         from unittest.mock import MagicMock, patch
 
         import torch
@@ -555,8 +600,8 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
         self.assertEqual(tuple(backend._v_scale_buf.shape), (48, 16, 2))
         self.assertEqual(backend._scale_buf_index(SimpleNamespace(layer_id=3)), 3)
 
-    def test_case_forward_decode_int8_passes_cached_scales_to_kernel(self):
-        """INT8 decode should pass both side buffers and cached scalar scales."""
+    def test_decode_int8_passes_cached_scales(self):
+        """INT8 decode must pass scale buffers and cached scalar scales to the kernel."""
         from unittest.mock import MagicMock
 
         import torch
@@ -587,7 +632,7 @@ class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
 class TestRVVLMHeadPacking(unittest.TestCase):
     """LM-head RVV packing behavior."""
 
-    def test_case_non_cpu_weights_skip_rvv_packing(self):
+    def test_non_cpu_weights_skip_packing(self):
         from unittest.mock import patch
 
         import torch
@@ -615,7 +660,7 @@ class TestRVVLMHeadPacking(unittest.TestCase):
         self.assertEqual(module.weight.device.type, "meta")
         self.assertEqual(module.bias.device.type, "meta")
 
-    def test_case_lm_head_lazy_pack_cache_tracks_inplace_weight_updates(self):
+    def test_lm_head_lazy_pack_tracks_updates(self):
         from unittest.mock import patch
 
         import torch
@@ -672,7 +717,7 @@ class TestRVVLMHeadPacking(unittest.TestCase):
             lm_head._rvv_lm_head_packed_source_sig[-1], lm_head.weight._version
         )
 
-    def test_case_float32_lm_head_disables_rvv_backend(self):
+    def test_float32_lm_head_disables_backend(self):
         from unittest.mock import patch
 
         import torch
@@ -692,7 +737,7 @@ class TestRVVLMHeadPacking(unittest.TestCase):
 
         mock_get_op.assert_not_called()
 
-    def test_case_lora_wrapped_lm_head_disables_rvv_backend(self):
+    def test_lora_lm_head_disables_backend(self):
         from unittest.mock import patch
 
         from sglang.srt.layers import rvv_utils
