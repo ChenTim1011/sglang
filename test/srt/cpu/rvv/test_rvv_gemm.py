@@ -1,10 +1,5 @@
-"""Unit tests for RVV GEMM kernels.
+"""Unit tests for RVV GEMM kernels."""
 
-Usage:
-    python3 -m unittest test.srt.cpu.rvv.test_rvv_gemm -v
-"""
-
-import importlib.util
 import itertools
 import unittest
 
@@ -21,16 +16,12 @@ from .rvv_utils import (
 
 
 def _has_rvv_bf16_gemm_ops() -> bool:
-    if not importlib.util.find_spec("sgl_kernel"):
-        return False
     return has_sgl_kernel_op("weight_packed_linear") and has_sgl_kernel_op(
         "convert_weight_packed"
     )
 
 
 def _has_rvv_int8_gemm_ops() -> bool:
-    if not importlib.util.find_spec("sgl_kernel"):
-        return False
     return (
         has_sgl_kernel_op("convert_weight_packed")
         and has_sgl_kernel_op("per_token_quant_int8_cpu")
@@ -43,8 +34,6 @@ torch.manual_seed(1234)
 
 
 class TestRVVGemm(CustomTestCase):
-    """Test suite for RVV GEMM kernels."""
-
     M = [1, 2, 3, 4, 5, 101]
     N = [16, 32, 48, 64, 80]
     K = [100, 32 * 16]
@@ -58,8 +47,7 @@ class TestRVVGemm(CustomTestCase):
     N_int8 = [16, 32 * 12, 80]  # Covers small-N, large-N, and tail handling.
     K_int8 = [32 * 17]
 
-    def run_case_gemm_bf16(self, M, N, K, has_bias, dtype):
-        """Run one BF16 GEMM case and compare packed and unpacked paths."""
+    def _run_bf16(self, M, N, K, has_bias, dtype):
         mat1 = torch.randn(M, K, dtype=dtype)
         mat2 = torch.randn(N, K, dtype=dtype)
 
@@ -91,8 +79,8 @@ class TestRVVGemm(CustomTestCase):
         torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
 
     @unittest.skipUnless(_has_rvv_bf16_gemm_ops(), "RVV BF16 GEMM ops not available")
-    def test_case_gemm_bf16_matrix(self):
-        """Case: BF16 and FP16 GEMM across shape and bias matrix."""
+    def test_bf16(self):
+        """Shape + bias matrix covers M-tail, N-chunk, and K-stride combinations."""
         for params in itertools.product(
             self.M,
             self.N,
@@ -107,11 +95,11 @@ class TestRVVGemm(CustomTestCase):
                 has_bias=params[3],
                 dtype=params[4],
             ):
-                self.run_case_gemm_bf16(*params)
+                self._run_bf16(*params)
 
     @unittest.skipUnless(_has_rvv_bf16_gemm_ops(), "RVV BF16 GEMM ops not available")
-    def test_case_gemm_bf16_fma_path(self):
-        """Case: GEMM FMA boundary where N exceeds one vector-length chunk."""
+    def test_bf16_fma_path(self):
+        """Large N forces the multi-chunk FMA loop; exercises accumulation across chunks."""
         for params in itertools.product(
             self.M,
             self.N_fma,
@@ -126,10 +114,9 @@ class TestRVVGemm(CustomTestCase):
                 has_bias=params[3],
                 dtype=params[4],
             ):
-                self.run_case_gemm_bf16(*params)
+                self._run_bf16(*params)
 
-    def run_case_gemm_int8(self, M, N, K, has_bias, dtype):
-        """Run one INT8 GEMM case against the native reference implementation."""
+    def _run_int8(self, M, N, K, has_bias, dtype):
         A = torch.randn((M, K), dtype=dtype) / 10
 
         Aq, As = torch.ops.sgl_kernel.per_token_quant_int8_cpu(A)
@@ -198,8 +185,8 @@ class TestRVVGemm(CustomTestCase):
         torch.testing.assert_close(ref_out, fused_out_packed, atol=atol, rtol=rtol)
 
     @unittest.skipUnless(_has_rvv_int8_gemm_ops(), "RVV INT8 GEMM ops not available")
-    def test_case_gemm_int8_matrix(self):
-        """Case: INT8 GEMM across shape, bias, and dtype matrix."""
+    def test_int8(self):
+        """TILE_M=4 short-row path and scale dequantization across the full shape matrix."""
         for params in itertools.product(
             self.M_int8,
             self.N_int8,
@@ -214,10 +201,9 @@ class TestRVVGemm(CustomTestCase):
                 has_bias=params[3],
                 dtype=params[4],
             ):
-                self.run_case_gemm_int8(*params)
+                self._run_int8(*params)
 
-    def run_case_gemm_bf16_small_oc(self, M, N, K, has_bias, dtype):
-        """Run one small-output-channel GEMM case."""
+    def _run_bf16_small_oc(self, M, N, K, has_bias, dtype):
         mat1 = torch.randn(M, K, dtype=dtype)
         mat2 = torch.randn(N, K, dtype=dtype)
 
@@ -237,8 +223,8 @@ class TestRVVGemm(CustomTestCase):
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     @unittest.skipUnless(_has_rvv_bf16_gemm_ops(), "RVV BF16 GEMM ops not available")
-    def test_case_gemm_bf16_small_oc(self):
-        """Case: small output-channel GEMM."""
+    def test_bf16_small_oc(self):
+        """N=1,12 exercises the scalar/sub-chunk output path that bypasses the main VL loop."""
         for params in itertools.product(
             [1, 8, 32, 1024], [12, 1], self.K, self.has_bias, self.dtypes
         ):
@@ -249,11 +235,11 @@ class TestRVVGemm(CustomTestCase):
                 has_bias=params[3],
                 dtype=params[4],
             ):
-                self.run_case_gemm_bf16_small_oc(*params)
+                self._run_bf16_small_oc(*params)
 
     @unittest.skipUnless(_has_rvv_bf16_gemm_ops(), "RVV BF16 GEMM ops not available")
-    def test_case_gemm_bf16_non_contiguous(self):
-        """Case: BF16/FP16 GEMM with non-contiguous activation (stride-2 batch dim)."""
+    def test_bf16_non_contiguous(self):
+        """Non-contiguous activation must be handled without silent stride corruption."""
         M, N, K = 8, 64, 512
         for dtype in self.dtypes:
             with self.subTest(dtype=dtype):
@@ -270,8 +256,8 @@ class TestRVVGemm(CustomTestCase):
                 torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     @unittest.skipUnless(_has_rvv_int8_gemm_ops(), "RVV INT8 GEMM ops not available")
-    def test_case_gemm_int8_non_contiguous(self):
-        """Case: INT8 GEMM with non-contiguous activation (stride-2 batch dim)."""
+    def test_int8_non_contiguous(self):
+        """Non-contiguous INT8 activation must not corrupt quantization or GEMM output."""
         M, N, K = 5, 32, 32 * 17
         for dtype in self.dtypes:
             with self.subTest(dtype=dtype):
@@ -301,8 +287,8 @@ class TestRVVGemm(CustomTestCase):
                 torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     @unittest.skipUnless(_has_rvv_int8_gemm_ops(), "RVV INT8 GEMM ops not available")
-    def test_case_gemm_int8_rejects_unpacked_weight_k_mismatch(self):
-        """Case: unpacked INT8 GEMM rejects weights whose K dimension mismatches mat1."""
+    def test_int8_rejects_k_mismatch(self):
+        """K-dim mismatch must raise rather than silently reading out-of-bounds."""
         dtype = torch.float16
         A = torch.randn(2, 64, dtype=dtype) / 10
         Aq, As = torch.ops.sgl_kernel.per_token_quant_int8_cpu(A)
@@ -331,8 +317,8 @@ class TestRVVGemm(CustomTestCase):
             )
 
     @unittest.skipUnless(_has_rvv_int8_gemm_ops(), "RVV INT8 GEMM ops not available")
-    def test_case_gemm_int8_rejects_packed_weight_block_count_mismatch(self):
-        """Case: packed INT8 GEMM rejects weights whose packed NB disagrees with scales2."""
+    def test_int8_rejects_packed_mismatch(self):
+        """Packed weight NB/scale count mismatch must raise instead of producing garbage."""
         dtype = torch.float16
         K = 64
         A = torch.randn(2, K, dtype=dtype) / 10

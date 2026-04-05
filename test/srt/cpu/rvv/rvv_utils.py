@@ -1,18 +1,7 @@
-"""Shared helpers and numeric tolerances for RVV CPU unit tests."""
-
-# Re-export shared CPU test helpers from test.srt.cpu.utils and keep RVV-only
-# references/tolerances local to this module.
-
 import importlib.util
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
-
-from ..utils import (  # noqa: F401
-    GeluAndMul,
-    SiluAndMul,
-    torch_naive_fused_moe,
-)
 
 
 def has_sgl_kernel_op(op_name: str) -> bool:
@@ -27,7 +16,7 @@ def has_sgl_kernel_op(op_name: str) -> bool:
 
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, bias, output_dtype=torch.bfloat16):
-    """RVV/shared CPU W8A8 reference: activation is uint8, weight is int8."""
+    """RVV CPU W8A8 reference: activation is uint8, weight is int8."""
     A = A.to(torch.int32) - 128
     B = B.to(torch.int32)
 
@@ -51,7 +40,6 @@ def native_w8a8_per_token_matmul(A, B, As, Bs, bias, output_dtype=torch.bfloat16
 
 
 # Numeric tolerances for shared RVV test paths: precision[key][dtype].
-# Keep keys flat and searchable; one-off special cases should override locally.
 precision = {
     "pointwise_default": {
         torch.bfloat16: 3e-2,

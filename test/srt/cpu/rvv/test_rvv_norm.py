@@ -1,11 +1,4 @@
-"""Unit tests for RVV norm kernels.
-
-Tests run against local Python reference implementations and are skipped on
-non-RISC-V builds where the kernels are unavailable.
-
-Usage:
-    python3 -m unittest test.srt.cpu.rvv.test_rvv_norm -v
-"""
+"""Unit tests for RVV norm kernels."""
 
 import itertools
 import unittest
@@ -39,8 +32,7 @@ class TestRVVNormCore(CustomTestCase):
     N = [4096, 4109]
     dtype = [torch.float16, torch.bfloat16]
 
-    def run_case_norm_rms(self, m, n, x=None, dtype=torch.float16):
-        """Run one RMSNorm case."""
+    def _run_rmsnorm(self, m, n, x=None, dtype=torch.float16):
         if x is None:
             x = torch.randn([m, n], dtype=dtype)
         weight = torch.randn(n, dtype=dtype)
@@ -51,8 +43,7 @@ class TestRVVNormCore(CustomTestCase):
         atol = rtol = precision["pointwise_default"][dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
-    def run_case_norm_rms_fused_add(self, m, n, dtype):
-        """Run one fused-add-RMSNorm case."""
+    def _run_fused_add_rmsnorm(self, m, n, dtype):
         x = torch.randn([m, n], dtype=dtype)
         residual = torch.randn([m, n], dtype=dtype)
         weight = torch.randn(n, dtype=dtype)
@@ -68,8 +59,7 @@ class TestRVVNormCore(CustomTestCase):
         torch.testing.assert_close(x, ref_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_res, atol=atol, rtol=rtol)
 
-    def run_case_norm_l2(self, m, n, dtype):
-        """Run one L2Norm case."""
+    def _run_l2norm(self, m, n, dtype):
         x = torch.randn([m, n], dtype=dtype)
         eps = 1e-6
 
@@ -81,8 +71,7 @@ class TestRVVNormCore(CustomTestCase):
         atol = rtol = precision["pointwise_default"][dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
-    def run_case_norm_gemma_rms(self, m, n, dtype):
-        """Run one Gemma RMSNorm case."""
+    def _run_gemma_rmsnorm(self, m, n, dtype):
         x = torch.randn([m, n], dtype=dtype)
         weight = torch.randn(n, dtype=dtype)
         eps = 1e-6
@@ -92,8 +81,7 @@ class TestRVVNormCore(CustomTestCase):
         atol = rtol = precision["pointwise_default"][dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
-    def run_case_norm_gemma_rms_fused_add(self, m, n, dtype):
-        """Run one Gemma fused-add-RMSNorm case."""
+    def _run_gemma_fused_add(self, m, n, dtype):
         x = torch.randn([m, n], dtype=dtype)
         residual = torch.randn([m, n], dtype=dtype)
         weight = torch.randn(n, dtype=dtype)
@@ -109,8 +97,7 @@ class TestRVVNormCore(CustomTestCase):
         torch.testing.assert_close(x, ref_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_res, atol=atol, rtol=rtol)
 
-    def run_case_norm_gemma3_rms(self, m, n, dtype):
-        """Run one Gemma3 RMSNorm case for 2D and 4D tensors."""
+    def _run_gemma3_rmsnorm(self, m, n, dtype):
         x_2d = torch.randn([m, n], dtype=dtype)
         weight = torch.randn(n, dtype=dtype)
         eps = 1e-6
@@ -126,43 +113,41 @@ class TestRVVNormCore(CustomTestCase):
         ref_4d = gemma3_rmsnorm_native(x_4d, weight, eps)
         torch.testing.assert_close(ref_4d, out_4d, atol=atol, rtol=rtol)
 
-    def test_case_rmsnorm(self):
-        """Case: RMSNorm across shape and dtype matrix."""
+    def test_rmsnorm(self):
+        """N+13 odd shape catches tail handling; M range covers VLEN=256 boundary."""
         for m, n, dt in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=m, n=n, dtype=dt):
-                self.run_case_norm_rms(m, n, dtype=dt)
+                self._run_rmsnorm(m, n, dtype=dt)
 
-    def test_case_fused_add_rmsnorm(self):
-        """Case: fused-add-RMSNorm across shape and dtype matrix."""
+    def test_fused_add_rmsnorm(self):
+        """Both output tensors (normed x and updated residual) must match reference."""
         for m, n, dt in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=m, n=n, dtype=dt):
-                self.run_case_norm_rms_fused_add(m, n, dt)
+                self._run_fused_add_rmsnorm(m, n, dt)
 
-    def test_case_l2norm(self):
-        """Case: L2Norm across shape and dtype matrix."""
+    def test_l2norm(self):
+        """L2Norm equals RMSNorm with unit weight; shared shape matrix catches tails."""
         for m, n, dt in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=m, n=n, dtype=dt):
-                self.run_case_norm_l2(m, n, dt)
+                self._run_l2norm(m, n, dt)
 
-    def test_case_gemma_rmsnorm(self):
-        """Case: Gemma RMSNorm across shape and dtype matrix."""
+    def test_gemma_rmsnorm(self):
         for m, n, dt in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=m, n=n, dtype=dt):
-                self.run_case_norm_gemma_rms(m, n, dt)
+                self._run_gemma_rmsnorm(m, n, dt)
 
-    def test_case_gemma_fused_add_rmsnorm(self):
-        """Case: Gemma fused-add-RMSNorm across shape and dtype matrix."""
+    def test_gemma_fused_add_rmsnorm(self):
         for m, n, dt in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=m, n=n, dtype=dt):
-                self.run_case_norm_gemma_rms_fused_add(m, n, dt)
+                self._run_gemma_fused_add(m, n, dt)
 
-    def test_case_gemma3_rmsnorm(self):
-        """Case: Gemma3 RMSNorm for 2D and 4D tensors."""
+    def test_gemma3_rmsnorm(self):
+        """Gemma3 adds (1 + w) scaling; both 2D and 4D layouts must match reference."""
         for m, n, dt in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=m, n=n, dtype=dt):
-                self.run_case_norm_gemma3_rms(m, n, dt)
+                self._run_gemma3_rmsnorm(m, n, dt)
 
-    def test_case_gemma3_rmsnorm_4d_multi_batch(self):
+    def test_gemma3_rmsnorm_4d_multi_batch(self):
         """Case: Gemma3 RMSNorm 4D with batch_size > 1."""
         for dt in self.dtype:
             n = 4096
@@ -175,14 +160,14 @@ class TestRVVNormCore(CustomTestCase):
             with self.subTest(dtype=dt):
                 torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
-    def test_case_rmsnorm_non_contiguous(self):
+    def test_rmsnorm_non_contiguous(self):
         """Case: RMSNorm with non-contiguous input tensors."""
         for dt in self.dtype:
             x = helper_non_contiguous(torch.randn(256, 4096, dtype=dt))
             with self.subTest(dtype=dt, shape=x.shape):
-                self.run_case_norm_rms(x.shape[0], x.shape[1], x=x, dtype=dt)
+                self._run_rmsnorm(x.shape[0], x.shape[1], x=x, dtype=dt)
 
-    def test_case_fused_add_rmsnorm_non_contiguous(self):
+    def test_fused_add_rmsnorm_non_contiguous(self):
         """Case: fused-add-RMSNorm with non-contiguous input tensors."""
         for dt in self.dtype:
             x = helper_non_contiguous(torch.randn(256, 4096, dtype=dt))
@@ -197,13 +182,13 @@ class TestRVVNormCore(CustomTestCase):
                 torch.testing.assert_close(x_copy, ref_x, atol=atol, rtol=rtol)
                 torch.testing.assert_close(res_copy, ref_res, atol=atol, rtol=rtol)
 
-    def test_case_rmsnorm_small_n(self):
+    def test_rmsnorm_small_n(self):
         """Case: RMSNorm with N smaller than one full m4 vector (< 8 for VLEN=256)."""
         for n, dt in itertools.product([1, 4, 7], self.dtype):
             with self.subTest(n=n, dtype=dt):
-                self.run_case_norm_rms(4, n, dtype=dt)
+                self._run_rmsnorm(4, n, dtype=dt)
 
-    def test_case_gemma_rmsnorm_non_contiguous(self):
+    def test_gemma_rmsnorm_non_contiguous(self):
         """Case: Gemma RMSNorm with non-contiguous input tensors."""
         for dt in self.dtype:
             x = helper_non_contiguous(torch.randn(256, 4096, dtype=dt))
@@ -227,8 +212,7 @@ class TestRVVNormLayer(CustomTestCase):
     N = [4096, 4109]
     dtype = [torch.float16, torch.bfloat16]
 
-    def run_case_norm_layer(self, m, n, dtype):
-        """Run one LayerNorm case."""
+    def _run_layernorm(self, m, n, dtype):
         x = torch.randn([m, n], dtype=dtype)
         weight = torch.randn(n, dtype=dtype)
         eps = 1e-6
@@ -239,8 +223,7 @@ class TestRVVNormLayer(CustomTestCase):
         atol = rtol = precision["pointwise_default"][dtype]
         torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
-    def run_case_norm_layer_fused_add(self, m, n, dtype):
-        """Run one fused-add-LayerNorm case."""
+    def _run_fused_add_layernorm(self, m, n, dtype):
         x = torch.randn([m, n], dtype=dtype)
         residual = torch.randn([m, n], dtype=dtype)
         weight = torch.randn(n, dtype=dtype)
@@ -258,13 +241,12 @@ class TestRVVNormLayer(CustomTestCase):
         torch.testing.assert_close(out, ref_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_res, atol=atol, rtol=rtol)
 
-    def test_case_layernorm(self):
-        """Case: LayerNorm across shape and dtype matrix."""
+    def test_layernorm(self):
         for m, n, dt in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=m, n=n, dtype=dt):
-                self.run_case_norm_layer(m, n, dt)
+                self._run_layernorm(m, n, dt)
 
-    def test_case_layernorm_with_bias(self):
+    def test_layernorm_with_bias(self):
         """Case: LayerNorm with non-None bias tensor."""
         for m, n, dt in itertools.product([128, 257], [4096, 4109], self.dtype):
             x = torch.randn([m, n], dtype=dt)
@@ -281,7 +263,7 @@ class TestRVVNormLayer(CustomTestCase):
             with self.subTest(m=m, n=n, dtype=dt):
                 torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
-    def test_case_layernorm_non_contiguous(self):
+    def test_layernorm_non_contiguous(self):
         """Case: LayerNorm with non-contiguous input tensors."""
         for dt in self.dtype:
             x = helper_non_contiguous(torch.randn(256, 4096, dtype=dt))
@@ -293,11 +275,10 @@ class TestRVVNormLayer(CustomTestCase):
             with self.subTest(dtype=dt):
                 torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
-    def test_case_fused_add_layernorm(self):
-        """Case: fused-add-LayerNorm across shape and dtype matrix."""
+    def test_fused_add_layernorm(self):
         for m, n, dt in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=m, n=n, dtype=dt):
-                self.run_case_norm_layer_fused_add(m, n, dt)
+                self._run_fused_add_layernorm(m, n, dt)
 
 
 @unittest.skipUnless(
@@ -311,8 +292,7 @@ class TestRVVNormFusedGated(CustomTestCase):
     N = [4096, 4109]
     dtype = [torch.float16, torch.bfloat16]
 
-    def run_case_norm_rms_gated(self, m, n, dtype):
-        """Run one fused gated RMSNorm case."""
+    def _run_rmsnorm_gated(self, m, n, dtype):
         x = torch.randn([m, n], dtype=dtype)
         weight = torch.randn(n, dtype=dtype)
         gate = torch.randn([m, n], dtype=dtype)
@@ -324,13 +304,12 @@ class TestRVVNormFusedGated(CustomTestCase):
         atol = rtol = precision["pointwise_default"][dtype] * 2
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
-    def test_case_fused_rmsnorm_gated(self):
-        """Case: fused gated RMSNorm across shape and dtype matrix."""
+    def test_fused_rmsnorm_gated(self):
         for m, n, dt in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=m, n=n, dtype=dt):
-                self.run_case_norm_rms_gated(m, n, dt)
+                self._run_rmsnorm_gated(m, n, dt)
 
-    def test_case_fused_rmsnorm_gated_non_contiguous(self):
+    def test_fused_rmsnorm_gated_non_contiguous(self):
         """Case: fused gated RMSNorm with non-contiguous input tensors."""
         for dt in self.dtype:
             x = helper_non_contiguous(torch.randn(256, 4096, dtype=dt))

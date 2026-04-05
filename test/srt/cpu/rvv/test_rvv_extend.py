@@ -1,8 +1,4 @@
-"""Unit tests for RVV extend attention kernel (BF16/FP16).
-
-Usage:
-    python3 -m unittest test.srt.cpu.rvv.test_rvv_extend -v
-"""
+"""Unit tests for RVV extend attention kernel (BF16/FP16)."""
 
 import unittest
 
@@ -27,7 +23,7 @@ class TestRVVExtendBase(CustomTestCase):
         self.device = torch.device("cpu")
         self.dtypes = [torch.float16, torch.bfloat16]
 
-    def run_case_extend_attention(
+    def _run_extend(
         self,
         B,
         N_CTX,
@@ -35,7 +31,6 @@ class TestRVVExtendBase(CustomTestCase):
         H_KV,
         D,
         DV,
-        mla=False,
         logit_cap=0.0,
         force_prefix_zero=False,
         dtype=torch.bfloat16,
@@ -73,9 +68,8 @@ class TestRVVExtendBase(CustomTestCase):
         total_token_num = torch.sum(b_seq_len).item()
         extend_token_num = torch.sum(b_seq_len_extend).item()
 
-        H_BUF = 1 if mla else H_KV
-        k_buffer = torch.randn((total_token_num, H_BUF, D), dtype=dtype, generator=gen)
-        v_buffer = torch.randn((total_token_num, H_BUF, DV), dtype=dtype, generator=gen)
+        k_buffer = torch.randn((total_token_num, H_KV, D), dtype=dtype, generator=gen)
+        v_buffer = torch.randn((total_token_num, H_KV, DV), dtype=dtype, generator=gen)
 
         k_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype)
         v_extend = torch.empty((extend_token_num, H_KV, DV), dtype=dtype)
@@ -159,10 +153,10 @@ class TestRVVExtendBase(CustomTestCase):
 
 
 class TestRVVExtendMHA(TestRVVExtendBase):
-    """Test suite for RVV extend attention MHA path."""
+    """MHA path tests for RVV extend attention."""
 
-    def test_case_mha_cases(self):
-        """Case: MHA extend across representative shapes and dtypes."""
+    def test_mha(self):
+        """Varied shapes cover head-count and prefix/extend length boundaries."""
         configs = [
             (2, 128, 16, 16, 128, 96, 0.0),
             (2, 64, 8, 8, 32, 32, 0.0),
@@ -182,20 +176,19 @@ class TestRVVExtendMHA(TestRVVExtendBase):
                     logit_cap=logit_cap,
                     dtype=dtype,
                 ):
-                    self.run_case_extend_attention(
+                    self._run_extend(
                         B=B,
                         N_CTX=N_CTX,
                         H_Q=H_Q,
                         H_KV=H_KV,
                         D=D,
                         DV=DV,
-                        mla=False,
                         dtype=dtype,
                         logit_cap=logit_cap,
                     )
 
-    def test_case_mha_extend_only(self):
-        """Case: pure extend stage with zero prefix lengths."""
+    def test_mha_zero_prefix(self):
+        """Zero prefix ensures Stage 1 (cached KV) is skipped entirely."""
         configs = [
             (2, 128, 16, 16, 128, 96, 0.0),
             (1, 64, 8, 8, 64, 64, 0.0),
@@ -206,52 +199,49 @@ class TestRVVExtendMHA(TestRVVExtendBase):
                 with self.subTest(
                     B=B, N_CTX=N_CTX, H_Q=H_Q, H_KV=H_KV, D=D, DV=DV, dtype=dtype
                 ):
-                    self.run_case_extend_attention(
+                    self._run_extend(
                         B=B,
                         N_CTX=N_CTX,
                         H_Q=H_Q,
                         H_KV=H_KV,
                         D=D,
                         DV=DV,
-                        mla=False,
                         dtype=dtype,
                         logit_cap=logit_cap,
                         force_prefix_zero=True,
                     )
 
-    def test_case_mha_single_token_extend(self):
-        """Case: N_CTX=1 hits the single-row BLOCK_M boundary in both extend modes."""
+    def test_mha_single_token(self):
+        """N_CTX=1 hits the single-row BLOCK_M boundary; tiling must not OOB."""
         for dtype in self.dtypes:
             with self.subTest(dtype=dtype, force_prefix_zero=False):
-                self.run_case_extend_attention(
+                self._run_extend(
                     B=2,
                     N_CTX=1,
                     H_Q=8,
                     H_KV=8,
                     D=64,
                     DV=64,
-                    mla=False,
                     dtype=dtype,
                 )
             with self.subTest(dtype=dtype, force_prefix_zero=True):
-                self.run_case_extend_attention(
+                self._run_extend(
                     B=2,
                     N_CTX=1,
                     H_Q=8,
                     H_KV=8,
                     D=64,
                     DV=64,
-                    mla=False,
                     dtype=dtype,
                     force_prefix_zero=True,
                 )
 
 
 class TestRVVExtendGQA(TestRVVExtendBase):
-    """Test suite for RVV extend attention GQA path."""
+    """GQA path tests for RVV extend attention."""
 
-    def test_case_gqa_cases(self):
-        """Case: GQA extend across representative shapes and dtypes."""
+    def test_gqa(self):
+        """GQA shapes verify H_Q/H_KV ratio broadcasting is correct in both stages."""
         configs = [
             (2, 128, 32, 8, 128, 96),
             (4, 128, 24, 4, 64, 64),
@@ -263,19 +253,18 @@ class TestRVVExtendGQA(TestRVVExtendBase):
                 with self.subTest(
                     B=B, N_CTX=N_CTX, H_Q=H_Q, H_KV=H_KV, D=D, DV=DV, dtype=dtype
                 ):
-                    self.run_case_extend_attention(
+                    self._run_extend(
                         B=B,
                         N_CTX=N_CTX,
                         H_Q=H_Q,
                         H_KV=H_KV,
                         D=D,
                         DV=DV,
-                        mla=False,
                         dtype=dtype,
                     )
 
-    def test_case_gqa_with_logit_cap(self):
-        """GQA extend with logit_cap > 0 exercises the tanh-softcap path."""
+    def test_gqa_logit_cap(self):
+        """GQA + logit_cap: tanh-softcap must interact correctly with GQA broadcasting."""
         configs = [
             (2, 128, 32, 8, 128, 96),
             (1, 256, 16, 2, 128, 128),
@@ -283,20 +272,19 @@ class TestRVVExtendGQA(TestRVVExtendBase):
         for B, N_CTX, H_Q, H_KV, D, DV in configs:
             for dtype in self.dtypes:
                 with self.subTest(B=B, H_Q=H_Q, H_KV=H_KV, dtype=dtype):
-                    self.run_case_extend_attention(
+                    self._run_extend(
                         B=B,
                         N_CTX=N_CTX,
                         H_Q=H_Q,
                         H_KV=H_KV,
                         D=D,
                         DV=DV,
-                        mla=False,
                         logit_cap=50.0,
                         dtype=dtype,
                     )
 
-    def test_case_gqa_zero_prefix(self):
-        """GQA extend with no prefix tokens (Stage 2 only path)."""
+    def test_gqa_zero_prefix(self):
+        """GQA with no prefix: Stage 1 (cached KV) is skipped, only Stage 2 runs."""
         configs = [
             (2, 128, 32, 8, 128, 96),
             (1, 256, 16, 2, 128, 128),
@@ -304,14 +292,13 @@ class TestRVVExtendGQA(TestRVVExtendBase):
         for B, N_CTX, H_Q, H_KV, D, DV in configs:
             for dtype in self.dtypes:
                 with self.subTest(B=B, H_Q=H_Q, H_KV=H_KV, dtype=dtype):
-                    self.run_case_extend_attention(
+                    self._run_extend(
                         B=B,
                         N_CTX=N_CTX,
                         H_Q=H_Q,
                         H_KV=H_KV,
                         D=D,
                         DV=DV,
-                        mla=False,
                         dtype=dtype,
                         force_prefix_zero=True,
                     )
