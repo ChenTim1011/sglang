@@ -16,10 +16,10 @@ VLEN is auto-detected from `/proc/cpuinfo` at build time (128 / 256 / 512 / 1024
 
 The following models have been verified on the SpacemiT K1 (VLEN=256):
 
-| Model Name | BF16 | W8A8 INT8 | BF16 + INT8 KV | W8A8 + INT8 KV |
-|:---:|:---:|:---:|:---:|:---:|
-| Llama-3.2-1B | [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) | - | ✓ | - |
-| Qwen2.5-1.5B | [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | [RedHatAI/Qwen2.5-1.5B-quantized.w8a8](https://huggingface.co/RedHatAI/Qwen2.5-1.5B-quantized.w8a8) | ✓ | ✓ |
+| Model Name | BF16 | W8A8 INT8 |
+|:---:|:---:|:---:|
+| Llama-3.2-1B | [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) | - |
+| Qwen2.5-1.5B | [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | [RedHatAI/Qwen2.5-1.5B-quantized.w8a8](https://huggingface.co/RedHatAI/Qwen2.5-1.5B-quantized.w8a8) |
 
 ## Installation
 
@@ -218,19 +218,17 @@ Notes:
 4. Once the server is running, open a second terminal and send requests — see
    [Send Inference Requests](#send-inference-requests) below.
 
-### Quantization and KV Cache
+### Quantization
 
-The RVV backend supports two memory-saving modes that can be combined:
+The RVV backend supports W8A8 INT8 weight quantization:
 
-| Mode | Extra flags | Weight memory | KV memory |
-|------|-------------|---------------|-----------|
-| BF16 (default) | *(none)* | baseline | baseline |
-| W8A8 INT8 | `--quantization w8a8_int8` | −50% | baseline |
-| INT8 KV cache | `--kv-cache-dtype int8` | baseline | −50% |
-| W8A8 + INT8 KV | both flags | −50% | −50% |
+| Mode | Extra flags | Weight memory |
+|------|-------------|---------------|
+| BF16 (default) | *(none)* | baseline |
+| W8A8 INT8 | `--quantization w8a8_int8` | −50% |
 
 Add the relevant flags to the `launch_server` command above. For example, to use
-W8A8 quantization with an INT8 KV cache (maximum memory reduction):
+W8A8 quantization:
 
 ```bash
 python3 -m sglang.launch_server \
@@ -240,7 +238,6 @@ python3 -m sglang.launch_server \
     --dtype bfloat16 \
     --trust-remote-code \
     --quantization w8a8_int8 \
-    --kv-cache-dtype int8 \
     --mem-fraction-static 0.6 \
     --max-total-tokens 512 \
     --host 0.0.0.0 \
@@ -249,11 +246,8 @@ python3 -m sglang.launch_server \
 
 Notes:
 
-1. **W8A8 INT8:** Requires a pre-quantized INT8 checkpoint with `weight_scale` tensors
+1. **W8A8 INT8:** Requires a pre-quantized INT8 checkpoint with `weight_scale` tensors.
    Loading a plain BF16 checkpoint with `--quantization w8a8_int8` is **not supported**.
-
-2. **INT8 KV cache:** The ~10% throughput overhead comes from quantize/dequantize on every
-   attention step. Use it when memory pressure requires a larger context window.
 
 ### Server Flags Reference
 
@@ -265,7 +259,6 @@ Notes:
 | `--mem-fraction-static` | Fraction of memory reserved for the KV cache |
 | `--max-total-tokens` | Limit total token budget to fit within available RAM |
 | `--quantization w8a8_int8` | Use pre-quantized INT8 weights (requires INT8 checkpoint with weight_scale) |
-| `--kv-cache-dtype int8` | Store KV cache as INT8 (~50% memory saving) |
 
 ---
 
