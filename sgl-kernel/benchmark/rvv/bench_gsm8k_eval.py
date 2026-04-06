@@ -29,6 +29,7 @@ except ImportError:
     sys.exit(1)
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 W8A8_MODEL = "RedHatAI/Qwen2.5-1.5B-quantized.w8a8"
+LLAMA32_1B_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 BASE_URL = DEFAULT_URL_FOR_TEST
 INVALID = -9999999
 
@@ -38,6 +39,7 @@ GSM8K_EXPERIMENT_CONFIGS = {
         "model": MODEL,
         "quantization": None,
         "kv_int8": False,
+        "num_shots": 4,
     },
     "int8_kv": {
         "model": MODEL,
@@ -50,11 +52,26 @@ GSM8K_EXPERIMENT_CONFIGS = {
         "model": W8A8_MODEL,
         "quantization": "w8a8_int8",
         "kv_int8": False,
+        "num_shots": 4,
     },
     "w8a8_int8_kv": {
         "model": W8A8_MODEL,
         "quantization": "w8a8_int8",
         "kv_int8": True,
+    },
+    "llama32_1b": {
+        "model": LLAMA32_1B_MODEL,
+        "quantization": None,
+        "kv_int8": False,
+        "num_shots": 8,
+        "use_chat_template": True,
+    },
+    "llama32_1b_int8_kv": {
+        "model": LLAMA32_1B_MODEL,
+        "quantization": None,
+        "kv_int8": True,
+        "num_shots": 8,
+        "use_chat_template": True,
     },
 }
 
@@ -90,6 +107,7 @@ class BenchmarkConfig:
     max_new_tokens: int
     description: str
     lines: list = field(default_factory=list)
+    use_chat_template: bool = False
 
 
 @dataclass
@@ -123,6 +141,15 @@ def _get_one_example(lines, i, include_answer):
 
 def _get_few_shot_examples(lines, k):
     return "".join(_get_one_example(lines, i, True) + "\n\n" for i in range(k))
+
+
+def _wrap_llama3_chat_template(text: str) -> str:
+    """Wrap raw few-shot completion text in Llama-3 chat template tokens."""
+    return (
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+        + text
+        + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
 
 
 def _load_dataset(platinum: bool, data_path: str, num_questions: int, num_shots: int):
@@ -245,13 +272,21 @@ def run_benchmark(
         questions = [_get_one_example(lines, i, False) for i in range(n)]
         labels = [_get_answer_value(lines[i]["answer"]) for i in range(n)]
 
+        if config.use_chat_template:
+            stop_tokens = ["<|eot_id|>", "<|start_header_id|>", "Question"]
+        else:
+            stop_tokens = ["Question", "Assistant:", "<|separator|>"]
+
         @sgl.function
         def few_shot_gsm8k(s, question):
-            s += few_shot_prefix + question
+            prompt = few_shot_prefix + question
+            if config.use_chat_template:
+                prompt = _wrap_llama3_chat_template(prompt)
+            s += prompt
             s += sgl.gen(
                 "answer",
                 max_tokens=config.max_new_tokens,
-                stop=["Question", "Assistant:", "<|separator|>"],
+                stop=stop_tokens,
             )
 
         arguments = [{"question": q} for q in questions]
@@ -386,6 +421,11 @@ def main():
         default=None,
         help="Named experiment: default, int8_kv, w8a8, w8a8_int8_kv.",
     )
+    parser.add_argument(
+        "--use-chat-template",
+        action="store_true",
+        help="Wrap prompts with model chat template (auto-set for llama32_1b config).",
+    )
     args = parser.parse_args()
 
     if args.quick:
@@ -398,11 +438,13 @@ def main():
     run_model = MODEL
     run_quantization = args.quantization
     run_kv_int8 = args.kv_int8
+    run_chat_template = args.use_chat_template
     if args.config:
         cfg = GSM8K_EXPERIMENT_CONFIGS[args.config]
         run_model = cfg["model"]
         run_quantization = cfg.get("quantization", run_quantization)
         run_kv_int8 = cfg["kv_int8"]
+        run_chat_template = cfg.get("use_chat_template", run_chat_template)
         if "num_questions" in cfg:
             num_questions = cfg["num_questions"]
         if "num_shots" in cfg:
@@ -415,6 +457,8 @@ def main():
         run_quantization = args.quantization
     if args.kv_int8:
         run_kv_int8 = True
+    if args.use_chat_template:
+        run_chat_template = True
 
     lines, source = _load_dataset(
         args.platinum, args.data_path, num_questions, num_shots
@@ -434,6 +478,7 @@ def main():
         max_new_tokens=max_tokens,
         description=f"{model_short} ({num_questions}q, {num_shots}-shot, {source})",
         lines=lines,
+        use_chat_template=run_chat_template,
     )
 
     print("=" * 60)

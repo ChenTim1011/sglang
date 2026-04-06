@@ -116,12 +116,8 @@ struct tinygemm_kernel_nn {
 
     constexpr int64_t UNROLL = (BLOCK_M <= 3) ? 4 : 2;
     constexpr int64_t PREFETCH_DIST = UNROLL * 2;
-    // K-tiling: k_tile is the *outer* loop so A[m, k_tile] stays in cache
-    // while all j (N) tiles are swept.  Correct loop order:
-    //   for k_tile → for j → for k ∈ k_tile
-    // KB = L1_CACHE_BYTES / (BLOCK_N * sizeof(element)).
-    // Numerically: BLOCK_N*sizeof = (VLEN/4)*sizeof, which equals __riscv_v_fixed_vlen
-    // for float (4B) and __riscv_v_fixed_vlen/2 for fp16/bf16 (2B).
+    // K-tile size: fit A[BLOCK_M, KB] in L1 while all N-tiles are swept (loop order: k_tile → j → k).
+    // KB = L1_CACHE_BYTES / (BLOCK_N * sizeof(scalar_t)); BLOCK_N * sizeof = VLEN_bits/8 for fp32, /16 for fp16/bf16.
     constexpr int64_t KB = std::is_same_v<scalar_t, float> ? (rvv_constants::L1_CACHE_BYTES / __riscv_v_fixed_vlen)
                                                            : (rvv_constants::L1_CACHE_BYTES * 2 / __riscv_v_fixed_vlen);
 
@@ -247,11 +243,10 @@ struct tinygemm_kernel_gemv_m8 {
     }
 
     // UNROLL: FP32 uses m8 B-loads (8 regs each) → cap at 2.
-    // BF16/FP16 use m4 B-loads (4 regs each) → UNROLL=4 fits in 24 regs.
+    // BF16/FP16 use m4 B-loads (4 regs each) → UNROLL=4.
     constexpr int64_t UNROLL = std::is_same_v<scalar_t, float> ? 2 : 4;
     constexpr int64_t PREFETCH_DIST = UNROLL * 2;
-    // k_tile is outer so A[k_tile] (1 row of scalars) stays in registers
-    // while all j tiles are swept.
+
     constexpr int64_t KB = std::is_same_v<scalar_t, float> ? (rvv_constants::L1_CACHE_BYTES / __riscv_v_fixed_vlen)
                                                            : (rvv_constants::L1_CACHE_BYTES * 2 / __riscv_v_fixed_vlen);
 
@@ -498,7 +493,6 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   TORCH_CHECK(weight.ndimension() == 2, "expect weight to be 2d, got ", weight.ndimension(), "d tensor.");
 
   constexpr int64_t BLOCK_N_RVV = rvv_constants::BLOCK_N;
-  // INT8 weights must always be packed. RVV keeps the shared CPU packed layout:
   // data [K, BLOCK_N] followed by one int32 compensation per output channel.
   // The float32-transpose fallback is only valid for FP types.
   const bool is_int8 = (weight.scalar_type() == at::kChar);
@@ -535,14 +529,8 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   return packed_weight;
 }
 
-at::Tensor weight_packed_linear(
-    at::Tensor& mat1,
-    at::Tensor& mat2,
-    const std::optional<at::Tensor>& bias,
-    // is_packed: true = weight already in RVV block-N format, skip repacking.
-    // Declaration uses is_vnni for API consistency with x86 backend;
-    // renamed here because RVV has no VNNI hardware — is_vnni is misleading.
-    bool is_packed) {
+at::Tensor
+weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_packed) {
   RECORD_FUNCTION("sgl-kernel::weight_packed_linear", std::vector<c10::IValue>({mat1, mat2, bias}));
 
   auto packed_w = is_packed ? mat2 : convert_weight_packed(mat2);

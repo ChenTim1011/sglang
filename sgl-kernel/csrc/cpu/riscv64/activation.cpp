@@ -23,8 +23,6 @@ constexpr float kInvSqrt2 = 0.7071067811865476f;
 template <typename scalar_t>
 void act_silu_inner(
     scalar_t* __restrict__ out_ptr, const scalar_t* __restrict__ x_ptr, const scalar_t* __restrict__ y_ptr, int64_t d) {
-  // scratch is only needed for non-Half/BFloat16 types (scalar fallback path).
-  // AT_DISPATCH_REDUCED_FLOATING_TYPES only dispatches to Half/BFloat16, so nullptr is safe.
   const size_t max_vl = __riscv_vsetvlmax_e32m4();
   const int64_t max_vl_i = static_cast<int64_t>(max_vl);
   int64_t j = 0;
@@ -73,12 +71,10 @@ void act_gelu_tanh_inner(
   for (int64_t j = 0; j < d; j += vl) {
     vl = __riscv_vsetvl_e32m4(d - j);
     vfloat32m4_t vx = load_as_float_m4(x_ptr + j, vl, nullptr);
-    // Compute tanh_arg entirely from vx (vx2, vx3, vinner die here)
     vfloat32m4_t vx2 = __riscv_vfmul_vv_f32m4(vx, vx, vl);
     vfloat32m4_t vx3 = __riscv_vfmul_vv_f32m4(vx2, vx, vl);
     vfloat32m4_t vinner = __riscv_vfmacc_vf_f32m4(vx, 0.044715f, vx3, vl);
     vfloat32m4_t vtanh_arg = __riscv_vfmul_vf_f32m4(vinner, kSqrt2DivPi, vl);
-    // Load vy now: vx2/vx3/vinner dead, only vx + vtanh_arg live alongside vy's load
     vfloat32m4_t vy = load_as_float_m4(y_ptr + j, vl, nullptr);
     vfloat32m4_t vtanh = vftanh_f32m4(vtanh_arg, vl);
     // gelu = 0.5 * x * (1 + tanh) * vy
@@ -98,9 +94,7 @@ void act_gelu_inner(
   for (int64_t j = 0; j < d; j += vl) {
     vl = __riscv_vsetvl_e32m4(d - j);
     vfloat32m4_t vx = load_as_float_m4(x_ptr + j, vl, nullptr);
-    // erf(x / sqrt(2)) — compute before loading vy to reduce peak register pressure
     vfloat32m4_t verf = vferf_f32m4(__riscv_vfmul_vf_f32m4(vx, kInvSqrt2, vl), vl);
-    // Load vy after vferf (vx_scaled dead, only vx + verf live alongside vy's load)
     vfloat32m4_t vy = load_as_float_m4(y_ptr + j, vl, nullptr);
     // gelu = 0.5 * x * (1 + erf) * vy
     vfloat32m4_t vgelu =
