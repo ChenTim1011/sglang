@@ -309,8 +309,14 @@ def use_intel_amx_backend(layer):
     return getattr(layer, "use_intel_amx_backend", False)
 
 
+def rvv_kernels_globally_disabled() -> bool:
+    return get_bool_env_var("SGLANG_DISABLE_RVV_KERNELS")
+
+
 @lru_cache(maxsize=1)
 def cpu_has_rvv_support() -> bool:
+    if rvv_kernels_globally_disabled():
+        return False
     try:
         if not is_host_cpu_riscv():
             return False
@@ -325,6 +331,8 @@ def cpu_has_rvv_support() -> bool:
 
 
 def use_riscv_rvv_backend(layer):
+    if rvv_kernels_globally_disabled():
+        return False
     return getattr(layer, "use_riscv_rvv_backend", False)
 
 

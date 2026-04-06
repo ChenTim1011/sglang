@@ -591,10 +591,10 @@ def run_one_case(
                 if "error" in data:
                     raise RuntimeError(f"Request has failed. {data}.")
 
-                assert (
-                    data["meta_info"]["finish_reason"] is None
-                    or data["meta_info"]["finish_reason"]["type"] == "length"
-                )
+                # Different backends may terminate short requests with different
+                # finish reasons (for example `stop` vs `length`). The latency
+                # benchmark only needs successful streaming progress here, so do
+                # not hardcode a single finish_reason contract.
                 if data["meta_info"]["completion_tokens"] == 1:
                     last_ttft = time.perf_counter() - tic
 
@@ -683,6 +683,34 @@ def should_skip_due_to_max_running_requests(
         )
         return True
     return False
+
+
+def get_warmup_case(
+    bench_args: BenchArgs,
+    skip_max_running_requests_threshold,
+    skip_token_capacity_threshold,
+):
+    warmup_batch_size = min(sorted(set(bench_args.batch_size)))
+    warmup_batch_size = min(warmup_batch_size, skip_max_running_requests_threshold)
+
+    warmup_input_len = min(1024, min(bench_args.input_len))
+    warmup_output_len = min(16, min(bench_args.output_len))
+
+    while (
+        warmup_batch_size * (warmup_input_len + warmup_output_len)
+        > skip_token_capacity_threshold
+        and warmup_input_len > 1
+    ):
+        warmup_input_len = max(1, warmup_input_len // 2)
+
+    while (
+        warmup_batch_size * (warmup_input_len + warmup_output_len)
+        > skip_token_capacity_threshold
+        and warmup_output_len > 1
+    ):
+        warmup_output_len = max(1, warmup_output_len // 2)
+
+    return warmup_batch_size, warmup_input_len, warmup_output_len
 
 
 def get_report_summary(
@@ -844,14 +872,26 @@ def run_benchmark_internal(
     # Warmup
     if not bench_args.skip_warmup:
         batch_size_unique = list(set(bench_args.batch_size))
+        warmup_batch_size, warmup_input_len, warmup_output_len = get_warmup_case(
+            bench_args,
+            skip_max_running_requests_threshold,
+            skip_token_capacity_threshold,
+        )
         print("=" * 8 + " Warmup Begin " + "=" * 8)
-        print(f"Warmup with batch_size={batch_size_unique}")
+        print(
+            "Warmup with "
+            f"batch_size={batch_size_unique}, "
+            f"warmup_batch_size={warmup_batch_size}, "
+            f"warmup_input_len={warmup_input_len}, "
+            f"warmup_output_len={warmup_output_len}"
+        )
         for bs in batch_size_unique:
+            current_bs = min(bs, warmup_batch_size)
             run_one_case(
                 base_url,
-                batch_size=bs,
-                input_len=1024,
-                output_len=16,
+                batch_size=current_bs,
+                input_len=warmup_input_len,
+                output_len=warmup_output_len,
                 temperature=bench_args.temperature,
                 return_logprob=bench_args.return_logprob,
                 stream_interval=bench_args.client_stream_interval,

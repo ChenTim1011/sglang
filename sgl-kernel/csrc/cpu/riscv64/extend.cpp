@@ -253,10 +253,7 @@ void extend_attention_kernel_impl(
                 }
               }
             }
-            // k_scale is the global static fallback; k_scales_block (always populated
-            // above) takes per-token precedence inside the gemm. k_scale is never
-            // reached here but the API requires it for the nullptr-k_scales case.
-            gemm_nt_tiled_transposed_int8(
+            gemm_nt_tiled_transposed_fp_q_int8_k(
                 q_ptr,
                 k_trans_buf_int8,
                 s_i,
