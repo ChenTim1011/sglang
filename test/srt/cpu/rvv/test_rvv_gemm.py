@@ -7,12 +7,33 @@ import torch
 
 from sglang.test.test_utils import CustomTestCase
 
-from .rvv_utils import (
-    has_sgl_kernel_op,
-    helper_non_contiguous,
-    native_w8a8_per_token_matmul,
-    precision,
-)
+from .rvv_utils import has_sgl_kernel_op, helper_non_contiguous, precision
+
+torch.manual_seed(1234)
+
+
+def native_w8a8_per_token_matmul(A, B, As, Bs, bias, output_dtype=torch.bfloat16):
+    """RVV CPU W8A8 reference: activation is uint8, weight is int8."""
+    A = A.to(torch.int32) - 128
+    B = B.to(torch.int32)
+
+    assert A.shape[-1] == B.shape[-1], "Dimension mismatch"
+    assert B.ndim == 2 and B.is_contiguous(), "B must be a 2D contiguous tensor"
+
+    M = A.numel() // A.shape[-1]
+    K = A.shape[-1]
+    origin_C_shape = A.shape[:-1] + (B.shape[0],)
+    A = A.reshape(M, K)
+
+    C = torch.matmul(A, B.transpose(0, 1))
+
+    As = As.reshape(M, 1).to(torch.float32)
+    C = As * C.to(torch.float32) * Bs.view(1, -1).to(torch.float32)
+
+    if bias is not None:
+        C.add_(bias.view(1, -1).to(torch.float32))
+
+    return C.reshape(origin_C_shape).to(output_dtype)
 
 
 def _has_rvv_bf16_gemm_ops() -> bool:
@@ -28,9 +49,6 @@ def _has_rvv_int8_gemm_ops() -> bool:
         and has_sgl_kernel_op("int8_scaled_mm_cpu")
         and has_sgl_kernel_op("int8_scaled_mm_with_quant")
     )
-
-
-torch.manual_seed(1234)
 
 
 class TestRVVGemm(CustomTestCase):
