@@ -423,11 +423,27 @@ def throughput_test(
     # Read dataset
     input_requests = get_dataset(bench_args, tokenizer)
 
+    warmup_num_prompts = min(bench_args.num_prompts, 16)
+    warmup_input_len = 256
+    warmup_output_len = 16
+    warmup_range_ratio = 1.0
+
+    if bench_args.dataset_name == "random":
+        # Keep warmup close to the actual benchmark workload so slow CPU
+        # backends (notably torch_native on RISC-V) do not spend minutes on an
+        # oversized synthetic warmup that is harder than the real run.
+        warmup_input_len = min(bench_args.random_input_len, 256)
+        warmup_output_len = min(bench_args.random_output_len, 16)
+        warmup_range_ratio = bench_args.random_range_ratio
+
+    if server_args.attention_backend == "torch_native":
+        warmup_num_prompts = min(warmup_num_prompts, 2)
+
     warmup_requests = sample_random_requests(
-        input_len=256,
-        output_len=16,
-        num_prompts=min(bench_args.num_prompts, 16),
-        range_ratio=1.0,
+        input_len=warmup_input_len,
+        output_len=warmup_output_len,
+        num_prompts=warmup_num_prompts,
+        range_ratio=warmup_range_ratio,
         tokenizer=tokenizer,
         dataset_path=bench_args.dataset_path,
     )

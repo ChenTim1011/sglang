@@ -1,0 +1,96 @@
+name: Release Docker Images (RVV)
+
+# Triggered manually or on version tags.
+# NOTE: The build MUST run on the rvv-bpi-f3 self-hosted RISC-V runner because
+# docker/rvv.Dockerfile installs native riscv64 binaries from the SpacemiT index.
+# Cross-compilation from x86 is not supported.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (without v prefix, e.g., 0.5.7)'
+        required: true
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: rvv-bpi-f3
+    environment: 'prod'
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          podman system prune -f || true
+          df -h
+
+      - name: Login to Docker Hub
+        run: |
+          echo "$DOCKERHUB_TOKEN" \
+            | podman login docker.io \
+                --username "$DOCKERHUB_USERNAME" \
+                --password-stdin
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Get version from tag
+        id: version
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+
+      - name: Build image
+        timeout-minutes: 150
+        run: |
+          podman build \
+            --format docker \
+            --no-cache \
+            --build-arg VER_SGLANG=v${VERSION} \
+            -t docker.io/lmsysorg/sglang:v${VERSION}-rvv \
+            -f docker/rvv.Dockerfile \
+            .
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Smoke test
+        timeout-minutes: 5
+        run: |
+          podman run --rm docker.io/lmsysorg/sglang:v${VERSION}-rvv \
+            python3 -c "import sgl_kernel; print('sgl_kernel import OK')"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Push to Docker Hub
+        timeout-minutes: 20
+        run: |
+          podman push docker.io/lmsysorg/sglang:v${VERSION}-rvv
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Logout
+        if: always()
+        run: podman logout docker.io || true
