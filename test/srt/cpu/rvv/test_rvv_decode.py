@@ -12,7 +12,7 @@ from .rvv_utils import has_sgl_kernel_op, precision
 torch.manual_seed(1234)
 
 
-def _sdpa_decode_reference(
+def _run_sdpa_forward_decode(
     query: torch.Tensor,
     output: torch.Tensor,
     k_cache: torch.Tensor,
@@ -153,7 +153,7 @@ class TestRVVDecodeBase(CustomTestCase):
             logit_cap,
         )
 
-        _sdpa_decode_reference(
+        _run_sdpa_forward_decode(
             q,
             o_ref,
             k_buffer,
