@@ -11,20 +11,6 @@
 
 #include "vector_math.h"
 
-// Type trait to detect INT8-quantized KV types (used by decode and extend kernels).
-template <typename T>
-struct is_quantized : std::false_type {};
-template <>
-struct is_quantized<int8_t> : std::true_type {};
-
-inline bool is_dynamic_quant_scale(float scale) {
-  return std::isnan(scale);
-}
-
-inline bool is_valid_static_quant_scale(float scale) {
-  return std::isfinite(scale) && scale > 0.0f;
-}
-
 namespace rvv_constants {
 // BLOCK_N = VLEN/4: weight packing tile size; each tile spans 2 vector iterations (m4).
 inline constexpr int BLOCK_N = __riscv_v_fixed_vlen / 4;
@@ -38,12 +24,6 @@ inline constexpr size_t MAX_VL_ELEMENTS_M8 = __riscv_v_fixed_vlen / 4;
 #endif
 inline constexpr int64_t L1_CACHE_BYTES = static_cast<int64_t>(RVV_L1_CACHE_KB) * 1024;
 }  // namespace rvv_constants
-
-// Returns VLENB (vector register length in bytes) at runtime via vsetvlmax.
-// e8m1: LMUL=1, element=8-bit → vl == VLEN/8 == vlenb.
-inline int64_t rvv_get_vlenb() {
-  return static_cast<int64_t>(__riscv_vsetvlmax_e8m1());
-}
 
 // Fixed-width vector type: width follows __riscv_v_fixed_vlen (set at compile time via -mrvv-vector-bits=N).
 // Enables stack arrays of vector type (e.g., vf32m1_t arr[N]) in kernels that need them.
@@ -97,7 +77,7 @@ typedef vfloat32m1_t vf32m1_t __attribute__((riscv_rvv_vector_bits(__riscv_v_fix
 
 // Type Conversion Helpers
 
-// --- BF16 to FP32 ---
+// BF16 to FP32
 // Shift-widening: BF16 and FP32 share exponent field, left-shift by 16 bits
 
 inline vfloat32m1_t bf16_to_f32m1(const uint16_t* ptr, size_t vl) {
@@ -121,14 +101,7 @@ inline vfloat32m8_t bf16_to_f32m8(const uint16_t* ptr, size_t vl) {
   return __riscv_vreinterpret_v_u32m8_f32m8(v_u32);
 }
 
-inline vfloat32m4_t int8_to_f32m4(const int8_t* ptr, size_t vl) {
-  vint8m1_t v_i8 = __riscv_vle8_v_i8m1(ptr, vl);
-  vint16m2_t v_i16 = __riscv_vsext_vf2_i16m2(v_i8, vl);
-  vint32m4_t v_i32 = __riscv_vsext_vf2_i32m4(v_i16, vl);
-  return __riscv_vfcvt_f_x_v_f32m4(v_i32, vl);
-}
-
-// --- FP32 to BF16 ---
+// FP32 to BF16
 // Extract upper 16 bits (sign + exp + upper 7 mantissa)
 
 #if defined(__riscv_zvfh)
@@ -186,8 +159,6 @@ inline vfloat32m4_t load_as_float_m4(const scalar_t* ptr, size_t vl, float* scra
 #endif
   } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
     return bf16_to_f32m4(reinterpret_cast<const uint16_t*>(ptr), vl);
-  } else if constexpr (std::is_same_v<scalar_t, int8_t>) {
-    return int8_to_f32m4(reinterpret_cast<const int8_t*>(ptr), vl);
   } else {
     for (size_t i = 0; i < vl; ++i)
       scratch[i] = static_cast<float>(ptr[i]);
@@ -497,94 +468,7 @@ inline void copy_stub(float* __restrict__ out, const scalar_t* __restrict__ inpu
   }
 }
 
-// INT8 specialization for same-type copy
-inline void copy_stub_int8(int8_t* __restrict__ out, const int8_t* __restrict__ src, int64_t size) {
-  size_t vl;
-  for (int64_t d = 0; d < size; d += vl) {
-    vl = __riscv_vsetvl_e8m4(size - d);
-    vint8m4_t v_data = __riscv_vle8_v_i8m4(src + d, vl);
-    __riscv_vse8_v_i8m4(out + d, v_data, vl);
-  }
-}
-
-template <>
-inline void copy_stub<int8_t>(int8_t* __restrict__ out, const int8_t* __restrict__ src, int64_t size) {
-  copy_stub_int8(out, src, size);
-}
-
 // Quantization Operations
-
-// Symmetric quantization with caller-provided scale.
-template <typename scalar_t>
-inline void quantize_row_int8_symmetric_with_scale(
-    int8_t* __restrict__ Aq, const scalar_t* __restrict__ A, int64_t K, float scale) {
-  // Guard against zero or negative scale to prevent NaN/Inf
-  const float safe_scale = (scale > 1e-9f) ? scale : 1e-9f;
-  const float inv_scale = 1.0f / safe_scale;
-  size_t vl;
-  alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
-
-  for (int64_t k = 0; k < K; k += vl) {
-    vl = __riscv_vsetvl_e32m4(K - k);
-
-    vfloat32m4_t v_val = load_as_float_m4(A + k, vl, scratch);
-    vfloat32m4_t v_scaled = __riscv_vfmul_vf_f32m4(v_val, inv_scale, vl);
-
-    // vfcvt uses fcsr.frm (RNE); vnclip uses VXRM_RNU — different rounding modes per spec.
-    vint32m4_t v_i32 = __riscv_vfcvt_x_f_v_i32m4(v_scaled, vl);
-    vint16m2_t v_i16 = __riscv_vnclip_wx_i16m2(v_i32, 0, __RISCV_VXRM_RNU, vl);
-    vint8m1_t v_i8 = __riscv_vnclip_wx_i8m1(v_i16, 0, __RISCV_VXRM_RNU, vl);
-
-    __riscv_vse8_v_i8m1(Aq + k, v_i8, vl);
-  }
-}
-
-template <typename scalar_t>
-inline void quantize_row_int8_symmetric_infer_scale(
-    int8_t* __restrict__ Aq, float& scale_out, const scalar_t* __restrict__ A, int64_t K, float eps = 1e-7) {
-  float max_val = 0.f;
-  size_t vl;
-  alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
-
-  // Pass 1: Find Max Absolute Value
-  vfloat32m4_t v_max_acc = __riscv_vfmv_v_f_f32m4(0.0f, __riscv_vsetvlmax_e32m4());
-
-  for (int64_t k = 0; k < K; k += vl) {
-    vl = __riscv_vsetvl_e32m4(K - k);
-    vfloat32m4_t v_val = load_as_float_m4(A + k, vl, scratch);
-    vfloat32m4_t v_abs = __riscv_vfsgnjx_vv_f32m4(v_val, v_val, vl);  // Abs
-    v_max_acc = __riscv_vfmax_vv_f32m4_tu(v_max_acc, v_max_acc, v_abs, vl);
-  }
-
-  vfloat32m1_t v_max_scalar =
-      __riscv_vfredmax_vs_f32m4_f32m1(v_max_acc, __riscv_vfmv_s_f_f32m1(0.0f, 1), __riscv_vsetvlmax_e32m4());
-  max_val = __riscv_vfmv_f_s_f32m1_f32(v_max_scalar);
-
-  max_val = std::max(max_val, eps);
-  const float scale = max_val / 127.0f;
-
-  // Pass 2: Quantize with the inferred scale.
-  quantize_row_int8_symmetric_with_scale(Aq, A, K, scale);
-
-  scale_out = scale;
-}
-
-template <typename scalar_t>
-inline void quantize_and_copy(
-    int8_t* __restrict__ dst, const scalar_t* __restrict__ src, int64_t size, float scale, float* scale_out = nullptr) {
-  // NaN is the sentinel for dynamic (per-token) quantization:
-  // infer the scale from the data. Any other finite positive value is a
-  // literal static scale passed by the caller, including 1.0f.
-  if (is_valid_static_quant_scale(scale)) {
-    quantize_row_int8_symmetric_with_scale<scalar_t>(dst, src, size, scale);
-    if (scale_out) *scale_out = scale;
-  } else {
-    TORCH_CHECK(is_dynamic_quant_scale(scale), "quantize_and_copy: invalid quantization scale");
-    float computed_scale;
-    quantize_row_int8_symmetric_infer_scale<scalar_t>(dst, computed_scale, src, size);
-    if (scale_out) *scale_out = computed_scale;
-  }
-}
 
 template <typename scalar_t>
 inline void quantize_row_uint8_asymmetric_with_scale(
@@ -712,8 +596,7 @@ struct AlignedArena {
 
 // Softmax helper: in-place exp and sum (no normalization)
 // scores[i] = exp(scores[i] - max), returns sum = Σ scores[i]
-// NOTE: Does NOT normalize scores. Callers use unnormalized exp values
-// for the online softmax algorithm (FlashAttention-style).
+// NOTE: Does NOT normalize scores. Callers use unnormalized exp values for the online softmax.
 inline float exp_and_sum(float* __restrict__ scores, int n_size, float m_i) {
   if (n_size <= 0) return 0.0f;
 

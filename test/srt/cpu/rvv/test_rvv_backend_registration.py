@@ -1,7 +1,6 @@
 """Unit tests for RVV attention backend registration and integration."""
 
 import unittest
-from math import isnan
 from types import SimpleNamespace
 
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
@@ -11,7 +10,7 @@ from sglang.srt.utils import is_host_cpu_riscv
 class _RVVBackendTestMixin:
     """Shared builders for backend tests."""
 
-    def _make_backend_with_rvv_kernels(self, *, is_int8=False):
+    def _make_backend_with_rvv_kernels(self):
         """Build an RVVAttnBackend and force RVV mode on for integration tests."""
         from unittest.mock import MagicMock, patch
 
@@ -30,7 +29,7 @@ class _RVVBackendTestMixin:
             mock_runner.req_to_token_pool.size = 4
             kv_buf = MagicMock()
             kv_buf.shape = [16, 1, 64]
-            kv_buf.dtype = torch.int8 if is_int8 else torch.bfloat16
+            kv_buf.dtype = torch.bfloat16
             mock_runner.token_to_kv_pool.get_key_buffer.return_value = kv_buf
             mock_runner.token_to_kv_pool.get_value_buffer.return_value = MagicMock(
                 shape=[16, 1, 64]
@@ -38,7 +37,6 @@ class _RVVBackendTestMixin:
             backend = RVVAttnBackend(mock_runner)
 
         backend.use_rvv_kernels = True
-        backend.is_int8 = is_int8
         return backend
 
     def _make_forward_batch(self):
@@ -118,58 +116,6 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
         else:
             self.assertIsNotNone(backend.fallback_backend)
 
-    def test_int8_init_falls_back_when_kernels_missing(self):
-        """INT8 KV cache should fall back if RVV INT8 kernels are unavailable."""
-        from unittest.mock import MagicMock, patch
-
-        import torch
-
-        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-
-        mock_runner = MagicMock()
-        mock_runner.device = "cpu"
-        mock_runner.model_config.num_attention_heads = 8
-        mock_runner.tp_size = 1
-        mock_runner.req_to_token_pool.size = 4
-        kv_buf = MagicMock()
-        kv_buf.shape = [16, 1, 64]
-        kv_buf.dtype = torch.int8
-        mock_runner.token_to_kv_pool.get_key_buffer.return_value = kv_buf
-        mock_runner.token_to_kv_pool.get_value_buffer.return_value = MagicMock(
-            shape=[16, 1, 64]
-        )
-
-        with patch(
-            "sglang.srt.layers.attention.rvv_backend.cpu_has_rvv_support",
-            return_value=True,
-        ), patch(
-            "sglang.srt.layers.attention.rvv_backend.torch.ops",
-            new=SimpleNamespace(sgl_kernel=SimpleNamespace()),
-        ):
-            backend = RVVAttnBackend(mock_runner)
-
-        self.assertTrue(backend.is_int8)
-        self.assertFalse(backend.use_rvv_kernels)
-        self.assertIsNotNone(backend.fallback_backend)
-
-    def test_int8_requested_without_rvv_support_falls_back(self):
-        """If int8 KV cache is requested, lack of RVV support should fall back."""
-        from unittest.mock import MagicMock, patch
-
-        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-
-        mock_runner = MagicMock()
-        mock_runner.server_args = MagicMock(kv_cache_dtype="int8")
-
-        with patch(
-            "sglang.srt.layers.attention.rvv_backend.cpu_has_rvv_support",
-            return_value=False,
-        ):
-            backend = RVVAttnBackend(mock_runner)
-
-        self.assertFalse(backend.use_rvv_kernels)
-        self.assertIsNotNone(backend.fallback_backend)
-
 
 class TestRVVForwardMetadataGuards(unittest.TestCase, _RVVBackendTestMixin):
     """Forward-metadata guard behavior."""
@@ -232,30 +178,6 @@ class TestRVVBackendFallbackSemantics(unittest.TestCase, _RVVBackendTestMixin):
         result = backend.forward_decode(q, k, v, layer, batch, save_kv_cache=False)
 
         backend.fallback_backend.forward_decode.assert_called_once_with(
-            q, k, v, layer, batch, False
-        )
-        self.assertIs(result, sentinel)
-
-    def test_int8_extend_no_save_uses_fallback(self):
-        """INT8 extend with save_kv_cache=False must delegate to TorchNative fallback."""
-        from unittest.mock import MagicMock
-
-        import torch
-
-        backend = self._make_backend_with_rvv_kernels(is_int8=True)
-
-        q = torch.randn(2, 8, 64)
-        k = torch.randn(2, 1, 64)
-        v = torch.randn(2, 1, 64)
-        layer = self._make_layer()
-        batch = MagicMock()
-
-        sentinel = object()
-        backend.fallback_backend.forward_extend = MagicMock(return_value=sentinel)
-
-        result = backend.forward_extend(q, k, v, layer, batch, save_kv_cache=False)
-
-        backend.fallback_backend.forward_extend.assert_called_once_with(
             q, k, v, layer, batch, False
         )
         self.assertIs(result, sentinel)
@@ -376,257 +298,6 @@ class TestRVVBackendCacheWiring(unittest.TestCase, _RVVBackendTestMixin):
             layer, batch.out_cache_loc, k, v
         )
         backend.extend_fwd_impl.assert_called_once()
-
-
-class TestRVVBackendInt8ScalePlumbing(unittest.TestCase, _RVVBackendTestMixin):
-    """INT8 scale resolution and buffer routing tests."""
-
-    def test_missing_scales_use_nan_sentinel(self):
-        """FP K/V with no layer scales must yield NaN sentinel, not raise."""
-        import torch
-
-        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-
-        layer = SimpleNamespace(
-            k_scale=None,
-            v_scale=None,
-            k_scale_float=None,
-            v_scale_float=None,
-        )
-
-        RVVAttnBackend._ensure_cached_scales(
-            layer,
-            torch.randn(1, 1, 8, dtype=torch.float16),
-            torch.randn(1, 1, 8, dtype=torch.float16),
-        )
-        self.assertTrue(isnan(layer._cached_k_scale_float))
-        self.assertTrue(isnan(layer._cached_v_scale_float))
-
-    def test_missing_scales_reject_prequant_kv(self):
-        """INT8 K/V without explicit scales must raise, not silently use a wrong dequant value."""
-        import torch
-
-        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-
-        layer = SimpleNamespace(
-            k_scale=None,
-            v_scale=None,
-            k_scale_float=None,
-            v_scale_float=None,
-        )
-
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "pre-quantized INT8 K/V inputs require explicit dequantization scales",
-        ):
-            RVVAttnBackend._ensure_cached_scales(
-                layer,
-                torch.randint(0, 10, (1, 1, 8), dtype=torch.int8),
-                torch.randint(0, 10, (1, 1, 8), dtype=torch.int8),
-            )
-
-    def test_partial_layer_scales_raise(self):
-        """INT8 path must reject partially missing KV scales."""
-        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-
-        layer = SimpleNamespace(
-            k_scale=None,
-            v_scale=None,
-            k_scale_float=0.25,
-            v_scale_float=None,
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "Inconsistent INT8 KV-cache scales"):
-            RVVAttnBackend._ensure_cached_scales(layer)
-
-    def test_explicit_scales_cached(self):
-        """Explicit tensor/float scales must be cached and not fallback to sentinel."""
-        import torch
-
-        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-
-        layer = SimpleNamespace(
-            k_scale=torch.tensor(0.25),
-            v_scale=None,
-            k_scale_float=None,
-            v_scale_float=0.5,
-        )
-
-        RVVAttnBackend._ensure_cached_scales(layer)
-
-        self.assertAlmostEqual(layer._cached_k_scale_float, 0.25, places=6)
-        self.assertAlmostEqual(layer._cached_v_scale_float, 0.5, places=6)
-
-    def test_scales_refresh_on_change(self):
-        """Updated layer scales must invalidate cached floats; stale values would corrupt dequant."""
-        import torch
-
-        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-
-        layer = SimpleNamespace(
-            k_scale=torch.tensor(0.25),
-            v_scale=torch.tensor(0.5),
-            k_scale_float=None,
-            v_scale_float=None,
-        )
-
-        RVVAttnBackend._ensure_cached_scales(layer)
-        layer.k_scale = torch.tensor(0.75)
-        layer.v_scale = torch.tensor(1.25)
-        RVVAttnBackend._ensure_cached_scales(layer)
-
-        self.assertAlmostEqual(layer._cached_k_scale_float, 0.75, places=6)
-        self.assertAlmostEqual(layer._cached_v_scale_float, 1.25, places=6)
-
-    def test_nan_cache_does_not_mask_int8(self):
-        """NaN sentinel cached for FP K/V must not suppress the missing-scale error for INT8 K/V."""
-        import torch
-
-        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-
-        layer = SimpleNamespace(
-            k_scale=None,
-            v_scale=None,
-            k_scale_float=None,
-            v_scale_float=None,
-        )
-
-        RVVAttnBackend._ensure_cached_scales(
-            layer,
-            torch.randn(1, 1, 8, dtype=torch.float16),
-            torch.randn(1, 1, 8, dtype=torch.float16),
-        )
-
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "pre-quantized INT8 K/V inputs require explicit dequantization scales",
-        ):
-            RVVAttnBackend._ensure_cached_scales(
-                layer,
-                torch.randint(0, 10, (1, 1, 8), dtype=torch.int8),
-                torch.randint(0, 10, (1, 1, 8), dtype=torch.int8),
-            )
-
-    def test_default_scale_1_uses_dynamic_quantization(self):
-        """k_scale=v_scale=1.0 with FP inputs is the BaseKVCacheMethod fallback (no
-        calibration data in checkpoint).  The RVV backend must switch to dynamic
-        per-token quantization (NaN sentinel) instead of using the 1.0 placeholder,
-        which would round all sub-integer activation values to zero.
-        """
-        import torch
-
-        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-
-        layer = SimpleNamespace(
-            k_scale=torch.tensor(1.0),
-            v_scale=torch.tensor(1.0),
-            k_scale_float=1.0,
-            v_scale_float=1.0,
-        )
-
-        RVVAttnBackend._ensure_cached_scales(
-            layer,
-            torch.randn(1, 1, 8, dtype=torch.bfloat16),
-            torch.randn(1, 1, 8, dtype=torch.bfloat16),
-        )
-        self.assertTrue(
-            isnan(layer._cached_k_scale_float),
-            "k_scale=1.0 with FP inputs must switch to NaN dynamic path",
-        )
-        self.assertTrue(
-            isnan(layer._cached_v_scale_float),
-            "v_scale=1.0 with FP inputs must switch to NaN dynamic path",
-        )
-
-    def test_real_calibrated_scale_not_overridden(self):
-        """A non-1.0 scale from a real calibrated checkpoint must be used as-is."""
-        import torch
-
-        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-
-        layer = SimpleNamespace(
-            k_scale=torch.tensor(0.08),
-            v_scale=torch.tensor(0.12),
-            k_scale_float=None,
-            v_scale_float=None,
-        )
-
-        RVVAttnBackend._ensure_cached_scales(
-            layer,
-            torch.randn(1, 1, 8, dtype=torch.bfloat16),
-            torch.randn(1, 1, 8, dtype=torch.bfloat16),
-        )
-        self.assertAlmostEqual(layer._cached_k_scale_float, 0.08, places=5)
-        self.assertAlmostEqual(layer._cached_v_scale_float, 0.12, places=5)
-
-    def test_scale_buffers_sized_by_hidden_layers(self):
-        """Scale buffers must be sized by num_hidden_layers so each layer gets its own row."""
-        from unittest.mock import MagicMock, patch
-
-        import torch
-
-        from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-
-        mock_runner = MagicMock()
-        mock_runner.device = "cpu"
-        mock_runner.model_config.num_attention_heads = 8
-        mock_runner.model_config.num_hidden_layers = 48
-        mock_runner.tp_size = 1
-        mock_runner.req_to_token_pool.size = 4
-        kv_buf = MagicMock()
-        kv_buf.shape = [16, 2, 64]
-        kv_buf.dtype = torch.int8
-        mock_runner.token_to_kv_pool.get_key_buffer.return_value = kv_buf
-        mock_runner.token_to_kv_pool.get_value_buffer.return_value = MagicMock(
-            shape=[16, 2, 64]
-        )
-
-        ops = SimpleNamespace(
-            decode_attention_int8_cpu=object(),
-            extend_attention_int8_cpu=object(),
-        )
-
-        with patch(
-            "sglang.srt.layers.attention.rvv_backend.cpu_has_rvv_support",
-            return_value=True,
-        ), patch(
-            "sglang.srt.layers.attention.rvv_backend.torch.ops",
-            new=SimpleNamespace(sgl_kernel=ops),
-        ):
-            backend = RVVAttnBackend(mock_runner)
-
-        self.assertTrue(backend.use_rvv_kernels)
-        self.assertEqual(tuple(backend._k_scale_buf.shape), (48, 16, 2))
-        self.assertEqual(tuple(backend._v_scale_buf.shape), (48, 16, 2))
-        self.assertEqual(backend._scale_buf_index(SimpleNamespace(layer_id=3)), 3)
-
-    def test_decode_int8_passes_cached_scales(self):
-        """INT8 decode must pass scale buffers and cached scalar scales to the kernel."""
-        from unittest.mock import MagicMock
-
-        import torch
-
-        backend = self._make_backend_with_rvv_kernels(is_int8=True)
-        backend.decode_fwd_impl = MagicMock()
-        backend._k_scale_buf = torch.ones(1, 16, 1, dtype=torch.float32)
-        backend._v_scale_buf = torch.full((1, 16, 1), 2.0, dtype=torch.float32)
-        backend.forward_metadata = (torch.empty(2, 8, 2, 65), 0)
-
-        q = torch.randn(2, 8 * 64)
-        k = torch.randint(-8, 8, (2, 1, 64), dtype=torch.int8)
-        v = torch.randint(-8, 8, (2, 1, 64), dtype=torch.int8)
-        layer = self._make_layer()
-        layer.k_scale = torch.tensor(0.25)
-        layer.v_scale = torch.tensor(0.5)
-        batch = self._make_forward_batch()
-
-        backend.forward_decode(q, k, v, layer, batch, save_kv_cache=True)
-
-        args = backend.decode_fwd_impl.call_args.args
-        self.assertTrue(torch.equal(args[13], backend._k_scale_buf[0]))
-        self.assertTrue(torch.equal(args[14], backend._v_scale_buf[0]))
-        self.assertEqual(args[15], 0.25)
-        self.assertEqual(args[16], 0.5)
 
 
 class TestRVVLMHeadPacking(unittest.TestCase):

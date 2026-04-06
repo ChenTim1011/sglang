@@ -58,33 +58,17 @@ class RVVAttnBackend(AttentionBackend):
             )
             self.v_head_dim = pool.get_value_buffer(layer_id).shape[-1]
 
-            # Detect INT8 KV cache mode from the buffer dtype.
-            k_buffer = pool.get_key_buffer(layer_id)
-            self.is_int8 = k_buffer.dtype in (torch.int8, torch.uint8)
-
             kernels_available = False
-            if self.is_int8:
-                try:
-                    self.decode_fwd_impl = ops.decode_attention_int8_cpu
-                    self.extend_fwd_impl = ops.extend_attention_int8_cpu
-                    kernels_available = True
-                except AttributeError:
-                    logger.warning(
-                        "[RVV] INT8 attention kernels (decode_attention_int8_cpu / "
-                        "extend_attention_int8_cpu) not found in sgl_kernel. "
-                        "Falling back to TorchNative. Build with RVV INT8 support to enable."
-                    )
-            else:
-                try:
-                    self.decode_fwd_impl = ops.decode_attention_cpu
-                    self.extend_fwd_impl = ops.extend_attention_cpu
-                    kernels_available = True
-                except AttributeError:
-                    logger.warning(
-                        "[RVV] FP attention kernels (decode_attention_cpu / "
-                        "extend_attention_cpu) not found in sgl_kernel. "
-                        "Falling back to TorchNative."
-                    )
+            try:
+                self.decode_fwd_impl = ops.decode_attention_cpu
+                self.extend_fwd_impl = ops.extend_attention_cpu
+                kernels_available = True
+            except AttributeError:
+                logger.warning(
+                    "[RVV] FP attention kernels (decode_attention_cpu / "
+                    "extend_attention_cpu) not found in sgl_kernel. "
+                    "Falling back to TorchNative."
+                )
 
             if kernels_available:
                 max_bs = model_runner.req_to_token_pool.size
@@ -93,24 +77,8 @@ class RVVAttnBackend(AttentionBackend):
                     dtype=torch.float32,
                     device="cpu",
                 )
-
-                if self.is_int8:
-                    max_tokens, num_kv_heads = k_buffer.shape[0], k_buffer.shape[1]
-                    num_layers = model_runner.model_config.num_hidden_layers
-                    self._k_scale_buf = torch.ones(
-                        (num_layers, max_tokens, num_kv_heads),
-                        dtype=torch.float32,
-                        device="cpu",
-                    )
-                    self._v_scale_buf = torch.ones(
-                        (num_layers, max_tokens, num_kv_heads),
-                        dtype=torch.float32,
-                        device="cpu",
-                    )
                 self.use_rvv_kernels = True
-                logger.info(
-                    f"[RVV] Initialized. Mode={'INT8' if self.is_int8 else 'FLOAT'}"
-                )
+                logger.info("[RVV] Initialized. Mode=FLOAT")
 
         except (AttributeError, RuntimeError, MemoryError) as e:
             logger.warning(
@@ -125,80 +93,6 @@ class RVVAttnBackend(AttentionBackend):
                 exc_info=True,
             )
             raise
-
-    def _scale_buf_index(self, layer: RadixAttention) -> int:
-        return layer.layer_id
-
-    @staticmethod
-    def _ensure_cached_scales(
-        layer: RadixAttention,
-        key: torch.Tensor | None = None,
-        value: torch.Tensor | None = None,
-    ):
-        """Resolve per-layer KV scales for RVV INT8 attention."""
-
-        def _resolve(src_attr: str, fallback_attr: str):
-            src = getattr(layer, src_attr, None)
-            if isinstance(src, torch.Tensor):
-                return src.item(), True
-            if isinstance(src, (int, float)):
-                return float(src), True
-
-            fallback = getattr(layer, fallback_attr, None)
-            if fallback is not None:
-                return float(fallback), True
-            return None, False
-
-        key_is_quantized = key is not None and key.dtype in (torch.int8, torch.uint8)
-        value_is_quantized = value is not None and value.dtype in (
-            torch.int8,
-            torch.uint8,
-        )
-
-        k_scale, has_k_scale = _resolve("k_scale", "k_scale_float")
-        v_scale, has_v_scale = _resolve("v_scale", "v_scale_float")
-
-        if has_k_scale != has_v_scale:
-            raise RuntimeError(
-                "[RVV] Inconsistent INT8 KV-cache scales on "
-                f"{type(layer).__name__}: k_scale present={has_k_scale}, "
-                f"v_scale present={has_v_scale}. Both scales must be provided "
-                "together for RVV INT8 attention."
-            )
-
-        use_default_fallback_scale = (
-            has_k_scale
-            and k_scale == 1.0
-            and v_scale == 1.0
-            and not key_is_quantized
-            and not value_is_quantized
-        )
-        if use_default_fallback_scale:
-            logger.warning_once(
-                f"[RVV] k_scale=v_scale=1.0 on {type(layer).__name__} with FP inputs "
-                "— this is the BaseKVCacheMethod default (no calibration data in "
-                "checkpoint). Switching to dynamic per-token quantization (NaN) for "
-                "better accuracy."
-            )
-            has_k_scale = False
-
-        if not has_k_scale:
-            if key_is_quantized or value_is_quantized:
-                raise RuntimeError(
-                    "[RVV] Missing k_scale/v_scale on "
-                    f"{type(layer).__name__}; pre-quantized INT8 K/V inputs require "
-                    "explicit dequantization scales."
-                )
-
-            if not use_default_fallback_scale:
-                logger.warning_once(
-                    f"[RVV] Missing k_scale/v_scale on {type(layer).__name__}; using "
-                    "dynamic per-token quantization sentinel scales (NaN, NaN)."
-                )
-            k_scale = float("nan")
-            v_scale = float("nan")
-
-        layer._cached_k_scale_float, layer._cached_v_scale_float = k_scale, v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if not self.use_rvv_kernels:
@@ -293,7 +187,7 @@ class RVVAttnBackend(AttentionBackend):
 
             attn_logits, _ = self.forward_metadata
 
-            args = (
+            self.decode_fwd_impl(
                 q_view,
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
@@ -308,16 +202,6 @@ class RVVAttnBackend(AttentionBackend):
                 layer.scaling,
                 layer.logit_cap,
             )
-            if self.is_int8:
-                self._ensure_cached_scales(layer, k, v)
-                scale_buf_idx = self._scale_buf_index(layer)
-                args += (
-                    self._k_scale_buf[scale_buf_idx],
-                    self._v_scale_buf[scale_buf_idx],
-                )
-                args += (layer._cached_k_scale_float, layer._cached_v_scale_float)
-
-            self.decode_fwd_impl(*args)
             return o
 
         logger.warning_once(
@@ -351,18 +235,7 @@ class RVVAttnBackend(AttentionBackend):
 
             pool = forward_batch.token_to_kv_pool
 
-            if self.is_int8 and not save_kv_cache:
-                # The INT8 extend kernel writes quantized K/V to the cache internally
-                # with no way to suppress it.  When save_kv_cache=False (speculative
-                # decoding verification pass), fall back to TorchNative.
-                return self.fallback_backend.forward_extend(
-                    q, k, v, layer, forward_batch, save_kv_cache
-                )
-
-            if save_kv_cache and not self.is_int8:
-                # FP path: Python writes K/V to the cache pool before the kernel reads it.
-                # INT8 path: skipped — extend_attention_int8_cpu writes quantized K/V
-                # to the cache internally via extend_set_kv_buffer_int8_quantize.
+            if save_kv_cache:
                 pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
 
             current_bs = q.shape[0]
@@ -372,7 +245,7 @@ class RVVAttnBackend(AttentionBackend):
 
             _, max_extend_len = self.forward_metadata
 
-            args = (
+            self.extend_fwd_impl(
                 q_view,
                 k,
                 v,
@@ -388,17 +261,6 @@ class RVVAttnBackend(AttentionBackend):
                 layer.scaling,
                 layer.logit_cap,
             )
-            if self.is_int8:
-                self._ensure_cached_scales(layer, k, v)
-                scale_buf_idx = self._scale_buf_index(layer)
-                # Order matches schema: k_scale_buf, v_scale_buf, k_scale, v_scale
-                args += (
-                    self._k_scale_buf[scale_buf_idx],
-                    self._v_scale_buf[scale_buf_idx],
-                )
-                args += (layer._cached_k_scale_float, layer._cached_v_scale_float)
-
-            self.extend_fwd_impl(*args)
             return o
 
         logger.warning_once(

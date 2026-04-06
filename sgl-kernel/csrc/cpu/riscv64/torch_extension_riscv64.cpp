@@ -62,25 +62,6 @@ void decode_attention_cpu(
     double sm_scale,
     double logit_cap);
 
-void decode_attention_int8_cpu(
-    at::Tensor& query,
-    at::Tensor& k_cache,
-    at::Tensor& v_cache,
-    at::Tensor& output,
-    at::Tensor& key,
-    at::Tensor& value,
-    at::Tensor& loc,
-    at::Tensor& attn_logits,
-    at::Tensor& req_to_token,
-    at::Tensor& req_pool_indices,
-    at::Tensor& seq_lens,
-    double sm_scale,
-    double logit_cap,
-    at::Tensor k_scale_buf,
-    at::Tensor v_scale_buf,
-    double k_scale,
-    double v_scale);
-
 // extend attention
 void extend_attention_cpu(
     at::Tensor& q_extend,
@@ -97,26 +78,6 @@ void extend_attention_cpu(
     int64_t max_len_extend,
     double sm_scale,
     double logit_cap);
-
-void extend_attention_int8_cpu(
-    at::Tensor& q_extend,
-    at::Tensor& k_extend,
-    at::Tensor& v_extend,
-    at::Tensor& o_extend,
-    at::Tensor& k_buffer,
-    at::Tensor& v_buffer,
-    at::Tensor& req_to_token,
-    at::Tensor& req_pool_indices,
-    at::Tensor& seq_lens,
-    at::Tensor& extend_seq_lens,
-    at::Tensor& extend_start_loc,
-    int64_t max_len_extend,
-    double sm_scale,
-    double logit_cap,
-    at::Tensor k_scale_buf,
-    at::Tensor v_scale_buf,
-    double k_scale,
-    double v_scale);
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
@@ -196,12 +157,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
       "float logit_cap) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
-  m.def(
-      "decode_attention_int8_cpu(Tensor query, Tensor k_cache, Tensor v_cache, Tensor(a!) output, Tensor key, "
-      "Tensor value, Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, "
-      "float sm_scale, float logit_cap, "
-      "Tensor k_scale_buf, Tensor v_scale_buf, float k_scale, float v_scale) -> ()");
-  m.impl("decode_attention_int8_cpu", torch::kCPU, &decode_attention_int8_cpu);
 
   // extend
   m.def(
@@ -209,13 +164,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
-  m.def(
-      "extend_attention_int8_cpu(Tensor q_extend, Tensor k_extend, Tensor v_extend, Tensor(a!) o_extend, Tensor "
-      "k_buffer, Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor "
-      "extend_seq_lens, "
-      "Tensor extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, "
-      "Tensor k_scale_buf, Tensor v_scale_buf, float k_scale, float v_scale) -> ()");
-  m.impl("extend_attention_int8_cpu", torch::kCPU, &extend_attention_int8_cpu);
 
   // weight prepack
   m.def("convert_weight_packed(Tensor weight) -> Tensor");
@@ -226,19 +174,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
 
   // gemm
-  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");
+  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_packed) -> Tensor");
   m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
 
   // igemm
   m.def(
       "int8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales1, Tensor scales2, Tensor? bias, ScalarType "
-      "out_dtype, bool is_vnni) -> Tensor");
+      "out_dtype, bool is_packed) -> Tensor");
   m.impl("int8_scaled_mm_cpu", torch::kCPU, &int8_scaled_mm_cpu);
 
   // quant + igemm
   m.def(
       "int8_scaled_mm_with_quant(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, ScalarType out_dtype, bool "
-      "is_vnni) -> Tensor");
+      "is_packed) -> Tensor");
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
 
   // rope
