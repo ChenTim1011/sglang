@@ -166,6 +166,22 @@ class RVVAttnBackend(AttentionBackend):
                 "together for RVV INT8 attention."
             )
 
+        use_default_fallback_scale = (
+            has_k_scale
+            and k_scale == 1.0
+            and v_scale == 1.0
+            and not key_is_quantized
+            and not value_is_quantized
+        )
+        if use_default_fallback_scale:
+            logger.warning_once(
+                f"[RVV] k_scale=v_scale=1.0 on {type(layer).__name__} with FP inputs "
+                "— this is the BaseKVCacheMethod default (no calibration data in "
+                "checkpoint). Switching to dynamic per-token quantization (NaN) for "
+                "better accuracy."
+            )
+            has_k_scale = False
+
         if not has_k_scale:
             if key_is_quantized or value_is_quantized:
                 raise RuntimeError(
@@ -174,10 +190,11 @@ class RVVAttnBackend(AttentionBackend):
                     "explicit dequantization scales."
                 )
 
-            logger.warning_once(
-                f"[RVV] Missing k_scale/v_scale on {type(layer).__name__}; using "
-                "dynamic per-token quantization sentinel scales (NaN, NaN)."
-            )
+            if not use_default_fallback_scale:
+                logger.warning_once(
+                    f"[RVV] Missing k_scale/v_scale on {type(layer).__name__}; using "
+                    "dynamic per-token quantization sentinel scales (NaN, NaN)."
+                )
             k_scale = float("nan")
             v_scale = float("nan")
 

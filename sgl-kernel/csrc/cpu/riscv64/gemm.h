@@ -371,6 +371,82 @@ inline void gemm_nt_tiled_transposed_int8(
     }
   }
 }
+// Layout: K_trans[d * block_n + j] = key j, dimension d  (pre-transposed)
+// Per-token dequant: C[m][n] = sum_k(Q[m][k] * float(K_trans[k*block_n+n])) * scale * k_scale[n]
+template <typename scalar_t>
+inline void gemm_nt_tiled_transposed_fp_q_int8_k(
+    const scalar_t* __restrict__ Q,
+    const int8_t* __restrict__ K_trans,
+    float* __restrict__ C,
+    int M,
+    int N,
+    int head_size,
+    int q_strideM,
+    int block_n,
+    int ldc,
+    float scale,
+    float k_scale,
+    const float* k_scales_per_token = nullptr) {
+  size_t vl_max = __riscv_vsetvlmax_e32m4();
+
+  for (int m_base = 0; m_base < M; m_base += GEMM_TILE_M) {
+    int m_count = std::min(GEMM_TILE_M, M - m_base);
+
+    for (int n_base = 0; n_base < N; n_base += vl_max) {
+      size_t vl = __riscv_vsetvl_e32m4(N - n_base);
+
+      vfloat32m4_t acc0 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+      vfloat32m4_t acc1 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+      vfloat32m4_t acc2 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+      vfloat32m4_t acc3 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+
+      for (int k = 0; k < head_size; ++k) {
+        // Load INT8 keys for this K-dimension slice, widen to FP32
+        const int8_t* k_ptr = K_trans + k * block_n + n_base;
+        vint8m1_t v_k8 = __riscv_vle8_v_i8m1(k_ptr, vl);
+        vint32m4_t v_k32 = __riscv_vsext_vf4_i32m4(v_k8, vl);
+        vfloat32m4_t v_kf = __riscv_vfcvt_f_x_v_f32m4(v_k32, vl);
+
+        // Q stays FP — load scalar from BF16/FP16 row, MACC with FP32 K vector
+        if (m_count > 0) {
+          float q0 = static_cast<float>(Q[(m_base + 0) * q_strideM + k]);
+          acc0 = __riscv_vfmacc_vf_f32m4(acc0, q0, v_kf, vl);
+        }
+        if (m_count > 1) {
+          float q1 = static_cast<float>(Q[(m_base + 1) * q_strideM + k]);
+          acc1 = __riscv_vfmacc_vf_f32m4(acc1, q1, v_kf, vl);
+        }
+        if (m_count > 2) {
+          float q2 = static_cast<float>(Q[(m_base + 2) * q_strideM + k]);
+          acc2 = __riscv_vfmacc_vf_f32m4(acc2, q2, v_kf, vl);
+        }
+        if (m_count > 3) {
+          float q3 = static_cast<float>(Q[(m_base + 3) * q_strideM + k]);
+          acc3 = __riscv_vfmacc_vf_f32m4(acc3, q3, v_kf, vl);
+        }
+      }
+
+      // Store: apply attention scale and per-token K dequant scale
+      auto store = [&](int idx, vfloat32m4_t acc_f) {
+        if (idx < m_count) {
+          if (k_scales_per_token) {
+            vfloat32m4_t tok_k_scales = __riscv_vle32_v_f32m4(k_scales_per_token + n_base, vl);
+            acc_f = __riscv_vfmul_vf_f32m4(acc_f, scale, vl);
+            acc_f = __riscv_vfmul_vv_f32m4(acc_f, tok_k_scales, vl);
+          } else {
+            acc_f = __riscv_vfmul_vf_f32m4(acc_f, scale * k_scale, vl);
+          }
+          __riscv_vse32_v_f32m4(C + (m_base + idx) * ldc + n_base, acc_f, vl);
+        }
+      };
+
+      store(0, acc0);
+      store(1, acc1);
+      store(2, acc2);
+      store(3, acc3);
+    }
+  }
+}
 
 inline void gemm_nn_tiled_int8(
     const float* __restrict__ P,
