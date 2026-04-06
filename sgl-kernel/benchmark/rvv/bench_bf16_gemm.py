@@ -79,11 +79,11 @@ def run_single_backend(backend_name, config, num_iterations=20, warmup=5):
         weight_packed = torch.ops.sgl_kernel.convert_weight_packed(weight)
 
         for _ in range(warmup):
-            sgl_kernel.weight_packed_linear(x, weight_packed, bias_fp32, True)
+            torch.ops.sgl_kernel.weight_packed_linear(x, weight_packed, bias_fp32, True)
 
         start = time.time()
         for _ in range(num_iterations):
-            sgl_kernel.weight_packed_linear(x, weight_packed, bias_fp32, True)
+            torch.ops.sgl_kernel.weight_packed_linear(x, weight_packed, bias_fp32, True)
         end = time.time()
     else:
         for _ in range(warmup):

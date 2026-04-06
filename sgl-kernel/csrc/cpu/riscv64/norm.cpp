@@ -150,8 +150,6 @@ void gemma3_rmsnorm_kernel_4d_impl(
 //           residual[d] = scalar_t(vs);   buffer[d] = float(vs);
 //           sum_sq += vs^2
 //   Pass 2: input[d] = buffer[d] * rsqrt_var * w[d] (or (1+w))
-//
-// Per-thread float buffer isolates each thread's work; allocated by caller.
 template <typename scalar_t, bool is_gemma>
 void fused_add_rmsnorm_kernel_impl(
     scalar_t* __restrict__ input,
@@ -220,8 +218,6 @@ void fused_rmsnorm_gated_kernel_impl(
     alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
     for (int64_t i = begin; i < end; ++i) {
       const scalar_t* in_ptr = input + i * input_strideN;
-      // gate uses hidden_size stride (not a strideN param) — caller guarantees full
-      // contiguity via CHECK_INPUT(gate) in the public API.
       const scalar_t* gate_ptr = gate + i * hidden_size;
       scalar_t* out_ptr = output + i * hidden_size;
 
@@ -244,7 +240,6 @@ void fused_rmsnorm_gated_kernel_impl(
         vfloat32m4_t vw = load_as_float_m4(weight + j, vl, scratch);
         vfloat32m4_t vg = load_as_float_m4(gate_ptr + j, vl, scratch);
         // silu(g) = g / (1 + exp(-g)) = g * approx_rec(1 + exp(-g))
-        // vrec_f32m4 is a Newton-Raphson ~23-bit reciprocal approximation, not exact division.
         vfloat32m4_t vdenom = __riscv_vfadd_vf_f32m4(vfexp_f32m4(__riscv_vfneg_v_f32m4(vg, vl), vl), 1.0f, vl);
         vfloat32m4_t vsilu = __riscv_vfmul_vv_f32m4(vg, vrec_f32m4(vdenom, vl), vl);
         vfloat32m4_t vout = __riscv_vfmul_vv_f32m4(

@@ -84,9 +84,6 @@ struct tinygemm_kernel_nn_gemv {
       for (; k + UNROLL - 1 < k_end; k += UNROLL) {
         if (k + PREFETCH_DIST < K) __builtin_prefetch(b_ptr_base + (k + PREFETCH_DIST) * BLOCK_N, 0, 1);
 
-        // Load B as int8 m2 (64 elements = full BLOCK_N), sign-extend to int16 m4,
-        // then widen-multiply-accumulate into int32 m8. Reuse registers sequentially
-        // to stay at 14 regs total throughout the unroll body.
         vint8m2_t v_b0 = __riscv_vle8_v_i8m2(b_ptr_base + (k + 0) * BLOCK_N, vl);
         v_acc = __riscv_vwmacc_vx_i32m8(
             v_acc, static_cast<int16_t>(a_signed_tile[k + 0 - k_tile]), __riscv_vsext_vf2_i16m4(v_b0, vl), vl);

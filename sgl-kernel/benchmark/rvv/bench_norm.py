@@ -168,7 +168,9 @@ def run_op(backend: str, op_name: str, config: BenchmarkConfig) -> float:
         elif op_name == "l2norm":
             fn = lambda: torch.ops.sgl_kernel.l2norm_cpu(x, eps)
         elif op_name == "layernorm":
-            fn = lambda: torch.ops.sgl_kernel.layernorm_cpu(x.clone(), weight, eps)
+            fn = lambda: torch.ops.sgl_kernel.layernorm_cpu(
+                x.clone(), weight, None, eps
+            )
         elif op_name == "gemma_rmsnorm":
             fn = lambda: torch.ops.sgl_kernel.gemma_rmsnorm_cpu(x, weight, eps)
         elif op_name == "gemma3_rmsnorm":
@@ -183,7 +185,7 @@ def run_op(backend: str, op_name: str, config: BenchmarkConfig) -> float:
             )
         elif op_name == "fused_add_layernorm":
             fn = lambda: torch.ops.sgl_kernel.fused_add_layernorm_cpu(
-                x.clone(), residual.clone(), weight, eps
+                x.clone(), residual.clone(), weight, None, eps
             )
     else:  # torch_native
         if op_name == "rmsnorm":
