@@ -28,7 +28,6 @@ class RVVAttnBackend(AttentionBackend):
       - No INT4 quantization (int4_scaled_mm_cpu excluded)
       - No shared memory transport (SGLANG_RISCV_NO_SHM)
       - No NUMA binding (SGLANG_RISCV_NO_NUMA)
-      - No torch.compile (disabled for RISC-V)
     """
 
     def __init__(self, model_runner: ModelRunner):
@@ -115,17 +114,12 @@ class RVVAttnBackend(AttentionBackend):
         self.forward_metadata = (attn_logits, max_extend_len)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
-        del max_bs, max_num_tokens
-        logger.warning_once(
-            "[RVV] CPU graph / torch.compile is not supported for the RVV attention "
-            "backend yet. Use eager CPU execution or switch to another backend."
-        )
+        # _attn_logits_pool is pre-allocated in _try_init_rvv_kernels with capacity
+        # model_runner.req_to_token_pool.size, which is always >= max_bs.
+        # Nothing extra to allocate here.
+        pass
 
     def get_cpu_graph_seq_len_fill_value(self):
-        logger.warning_once(
-            "[RVV] get_cpu_graph_seq_len_fill_value called on unsupported RVV CPU "
-            "graph path; using fill value 1 before the capture path raises."
-        )
         return 1
 
     def init_forward_metadata_capture_cpu_graph(
@@ -138,20 +132,16 @@ class RVVAttnBackend(AttentionBackend):
         forward_mode,
         spec_info,
     ):
-        del (
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-        )
-        raise RuntimeError(
-            "[RVV] CPU graph / torch.compile is not supported for the RVV attention "
-            "backend yet. Disable --enable-torch-compile or use a different "
-            "attention backend."
-        )
+        if not self.use_rvv_kernels:
+            raise RuntimeError(
+                "[RVV] CPU graph / torch.compile requires RVV kernels to be "
+                "available. Check startup logs for kernel init failure details."
+            )
+        # Slice a view from the pre-allocated pool for this batch size.
+        # Using a view (fixed data pointer) is required by torch.compile to avoid
+        # recompilation across replay steps.
+        # Graph capture is decode-only, so max_extend_len is unused (set to 0).
+        self.forward_metadata = (self._attn_logits_pool[:bs], 0)
 
     def forward_decode(
         self,
@@ -244,7 +234,6 @@ class RVVAttnBackend(AttentionBackend):
             o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
             _, max_extend_len = self.forward_metadata
-
             self.extend_fwd_impl(
                 q_view,
                 k,
