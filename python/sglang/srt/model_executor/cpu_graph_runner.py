@@ -37,6 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.utils import (
+    is_host_cpu_riscv,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -112,6 +113,7 @@ def register_fake_ops():
     Registers fake/meta implementations for all custom sgl_kernel CPU operators
     using torch.library.register_fake to support torch.compile
     """
+    is_riscv = is_host_cpu_riscv()
 
     none_return_ops = [
         "shm_allreduce",
@@ -123,6 +125,15 @@ def register_fake_ops():
         "layernorm_cpu",
         "fused_add_layernorm_cpu",
     ]
+    if is_riscv:
+        none_return_ops = [
+            "fused_add_rmsnorm_cpu",
+            "decode_attention_cpu",
+            "extend_attention_cpu",
+            "gemma_fused_add_rmsnorm_cpu",
+            "layernorm_cpu",
+            "fused_add_layernorm_cpu",
+        ]
     for op in none_return_ops:
 
         @torch.library.register_fake(f"sgl_kernel::{op}")
@@ -141,51 +152,61 @@ def register_fake_ops():
         "gemma3_rmsnorm_cpu",
         "gemma4_rmsnorm_cpu",
     ]:
+        if is_riscv and op not in {
+            "rmsnorm_cpu",
+            "l2norm_cpu",
+            "fused_rmsnorm_gated_cpu",
+            "gemma_rmsnorm_cpu",
+            "gemma3_rmsnorm_cpu",
+        }:
+            continue
 
         @torch.library.register_fake(f"sgl_kernel::{op}")
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
 
-    @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope")
-    def _(
-        hidden_states,
-        q_a_proj_weight,
-        q_b_proj_weight,
-        kv_a_proj_weight,
-        w_kc,
-        q_a_layernorm_weight,
-        kv_a_layernorm_weight,
-        positions,
-        cos_sin_cache,
-        eps,
-        use_int8_w8a8,
-        use_fp8_w8a16,
-        q_a_proj_scale,
-        q_b_proj_scale,
-        kv_a_proj_scale,
-        is_vnni,
-        block_size,
-    ):
-        num_seqs = hidden_states.shape[0]
-        num_heads = w_kc.shape[0]
-        kv_lora_rank = w_kc.shape[1]
-        qk_rope_head_dim = kv_a_proj_weight.shape[0] - kv_lora_rank
-        q_input = torch.empty(
-            num_seqs,
-            num_heads,
-            kv_lora_rank + qk_rope_head_dim,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        k_input = torch.empty(
-            num_seqs,
-            1,
-            kv_lora_rank + qk_rope_head_dim,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        v_input = k_input.narrow(-1, 0, kv_lora_rank)
-        return q_input, k_input, v_input
+    if not is_riscv:
+
+        @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope")
+        def _(
+            hidden_states,
+            q_a_proj_weight,
+            q_b_proj_weight,
+            kv_a_proj_weight,
+            w_kc,
+            q_a_layernorm_weight,
+            kv_a_layernorm_weight,
+            positions,
+            cos_sin_cache,
+            eps,
+            use_int8_w8a8,
+            use_fp8_w8a16,
+            q_a_proj_scale,
+            q_b_proj_scale,
+            kv_a_proj_scale,
+            is_vnni,
+            block_size,
+        ):
+            num_seqs = hidden_states.shape[0]
+            num_heads = w_kc.shape[0]
+            kv_lora_rank = w_kc.shape[1]
+            qk_rope_head_dim = kv_a_proj_weight.shape[0] - kv_lora_rank
+            q_input = torch.empty(
+                num_seqs,
+                num_heads,
+                kv_lora_rank + qk_rope_head_dim,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            k_input = torch.empty(
+                num_seqs,
+                1,
+                kv_lora_rank + qk_rope_head_dim,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            v_input = k_input.narrow(-1, 0, kv_lora_rank)
+            return q_input, k_input, v_input
 
     @torch.library.register_fake("sgl_kernel::rotary_embedding_cpu")
     def _(positions, query, key, head_size, cos_sin_cache, is_neox):
@@ -194,64 +215,66 @@ def register_fake_ops():
         else:
             return torch.empty_like(query), torch.empty_like(key)
 
-    @torch.library.register_fake("sgl_kernel::multimodal_rotary_embedding_cpu")
-    def _(
-        positions,
-        query,
-        key,
-        head_size,
-        cos_sin_cache,
-        mrope_section,
-        mrope_interleaved,
-        is_neox,
-    ):
-        return query, key
+    if not is_riscv:
 
-    @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope_fused_weight")
-    def _(
-        hidden_states,
-        q_a_proj_weight,
-        q_b_proj_weight,
-        w_kc,
-        q_a_layernorm_weight,
-        kv_a_layernorm_weight,
-        positions,
-        cos_sin_cache,
-        eps,
-        use_int8_w8a8,
-        use_fp8_w8a16,
-        qkv_a_proj_scale,
-        q_b_proj_scale,
-        w_scale,
-        is_vnni,
-        block_size,
-        q_lora_rank,
-        kv_lora_rank,
-        qk_rope_head_dim,
-    ):
-        num_seqs = hidden_states.shape[0]
-        num_heads = w_kc.shape[0]
-        kv_lora_rank = w_kc.shape[1]
-        weight_chunks = torch.split(
-            q_a_proj_weight, [q_lora_rank, kv_lora_rank + qk_rope_head_dim], dim=0
-        )
-        qk_rope_head_dim = weight_chunks[1].shape[0] - kv_lora_rank
-        q_input = torch.empty(
-            num_seqs,
-            num_heads,
-            kv_lora_rank + qk_rope_head_dim,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        k_input = torch.empty(
-            num_seqs,
-            1,
-            kv_lora_rank + qk_rope_head_dim,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        v_input = k_input.narrow(-1, 0, kv_lora_rank)
-        return q_input, k_input, v_input
+        @torch.library.register_fake("sgl_kernel::multimodal_rotary_embedding_cpu")
+        def _(
+            positions,
+            query,
+            key,
+            head_size,
+            cos_sin_cache,
+            mrope_section,
+            mrope_interleaved,
+            is_neox,
+        ):
+            return query, key
+
+        @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope_fused_weight")
+        def _(
+            hidden_states,
+            q_a_proj_weight,
+            q_b_proj_weight,
+            w_kc,
+            q_a_layernorm_weight,
+            kv_a_layernorm_weight,
+            positions,
+            cos_sin_cache,
+            eps,
+            use_int8_w8a8,
+            use_fp8_w8a16,
+            qkv_a_proj_scale,
+            q_b_proj_scale,
+            w_scale,
+            is_vnni,
+            block_size,
+            q_lora_rank,
+            kv_lora_rank,
+            qk_rope_head_dim,
+        ):
+            num_seqs = hidden_states.shape[0]
+            num_heads = w_kc.shape[0]
+            kv_lora_rank = w_kc.shape[1]
+            weight_chunks = torch.split(
+                q_a_proj_weight, [q_lora_rank, kv_lora_rank + qk_rope_head_dim], dim=0
+            )
+            qk_rope_head_dim = weight_chunks[1].shape[0] - kv_lora_rank
+            q_input = torch.empty(
+                num_seqs,
+                num_heads,
+                kv_lora_rank + qk_rope_head_dim,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            k_input = torch.empty(
+                num_seqs,
+                1,
+                kv_lora_rank + qk_rope_head_dim,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            v_input = k_input.narrow(-1, 0, kv_lora_rank)
+            return q_input, k_input, v_input
 
     def get_n_size(mat2, is_vnni):
         tile_n = 16
@@ -264,7 +287,17 @@ def register_fake_ops():
     @torch.library.register_fake("sgl_kernel::weight_packed_linear")
     def _(mat1, mat2, bias, is_vnni):
         M = mat1.shape[0]
-        N = get_n_size(mat2, is_vnni)
+        if (
+            is_vnni
+            and is_host_cpu_riscv()
+            and mat2.dim() == 2
+            and mat2.dtype in (torch.bfloat16, torch.float16)
+            and mat2.shape[1] % mat1.shape[1] == 0
+        ):
+            block_n = mat2.shape[1] // mat1.shape[1]
+            N = mat2.shape[0] * block_n
+        else:
+            N = get_n_size(mat2, is_vnni)
         return mat1.new_empty(M, N)
 
     @torch.library.register_fake("sgl_kernel::per_token_quant_int8_cpu")
@@ -278,71 +311,73 @@ def register_fake_ops():
     @torch.library.register_fake("sgl_kernel::int8_scaled_mm_cpu")
     def _(mat1, mat2, scales1, scales2, bias, out_dtype, is_vnni):
         M = mat1.shape[0]
-        N = mat2.shape[0]
+        N = scales2.numel() if is_vnni else mat2.shape[0]
         out = mat1.new_empty(M, N, dtype=out_dtype)
         return out
 
-    @torch.library.register_fake("sgl_kernel::grouped_topk_cpu")
-    def _(
-        hidden_states,
-        gating_output,
-        topk,
-        renormalize,
-        num_expert_group,
-        topk_group,
-        num_fused_shared_experts,
-        routed_scaling_factor,
-        num_token_non_padded,
-    ):
-        num_tokens = hidden_states.shape[0]
-        shape = (num_tokens, topk)
-        device = hidden_states.device
-        topk_weights = torch.empty(shape, device=device, dtype=torch.float32)
-        topk_ids = torch.empty(shape, device=device, dtype=torch.int)
-        return topk_weights, topk_ids
+    if not is_riscv:
 
-    @torch.library.register_fake("sgl_kernel::biased_grouped_topk_cpu")
-    def _(
-        hidden_states,
-        gating_output,
-        correction_bias,
-        topk,
-        renormalize,
-        num_expert_group,
-        topk_group,
-        num_fused_shared_experts,
-        routed_scaling_factor,
-        num_token_non_padded,
-    ):
-        num_tokens = hidden_states.shape[0]
-        shape = (num_tokens, topk)
-        device = hidden_states.device
-        topk_weights = torch.empty(shape, device=device, dtype=torch.float32)
-        topk_ids = torch.empty(shape, device=device, dtype=torch.int)
-        return topk_weights, topk_ids
+        @torch.library.register_fake("sgl_kernel::grouped_topk_cpu")
+        def _(
+            hidden_states,
+            gating_output,
+            topk,
+            renormalize,
+            num_expert_group,
+            topk_group,
+            num_fused_shared_experts,
+            routed_scaling_factor,
+            num_token_non_padded,
+        ):
+            num_tokens = hidden_states.shape[0]
+            shape = (num_tokens, topk)
+            device = hidden_states.device
+            topk_weights = torch.empty(shape, device=device, dtype=torch.float32)
+            topk_ids = torch.empty(shape, device=device, dtype=torch.int)
+            return topk_weights, topk_ids
 
-    @torch.library.register_fake("sgl_kernel::topk_sigmoid_cpu")
-    def _(hidden_states, gating_output, topk, renormalize):
-        num_tokens = hidden_states.shape[0]
-        shape = (num_tokens, topk)
-        return (
-            torch.empty(shape, device=hidden_states.device, dtype=torch.float),
-            torch.empty(shape, device=hidden_states.device, dtype=torch.int),
-        )
+        @torch.library.register_fake("sgl_kernel::biased_grouped_topk_cpu")
+        def _(
+            hidden_states,
+            gating_output,
+            correction_bias,
+            topk,
+            renormalize,
+            num_expert_group,
+            topk_group,
+            num_fused_shared_experts,
+            routed_scaling_factor,
+            num_token_non_padded,
+        ):
+            num_tokens = hidden_states.shape[0]
+            shape = (num_tokens, topk)
+            device = hidden_states.device
+            topk_weights = torch.empty(shape, device=device, dtype=torch.float32)
+            topk_ids = torch.empty(shape, device=device, dtype=torch.int)
+            return topk_weights, topk_ids
 
-    @torch.library.register_fake("sgl_kernel::topk_softmax_cpu")
-    def _(
-        hidden_states,
-        gating_output,
-        topk,
-        renormalize,
-    ):
-        num_tokens = hidden_states.shape[0]
-        shape = (num_tokens, topk)
-        return (
-            torch.empty(shape, device=hidden_states.device, dtype=torch.float),
-            torch.empty(shape, device=hidden_states.device, dtype=torch.int),
-        )
+        @torch.library.register_fake("sgl_kernel::topk_sigmoid_cpu")
+        def _(hidden_states, gating_output, topk, renormalize):
+            num_tokens = hidden_states.shape[0]
+            shape = (num_tokens, topk)
+            return (
+                torch.empty(shape, device=hidden_states.device, dtype=torch.float),
+                torch.empty(shape, device=hidden_states.device, dtype=torch.int),
+            )
+
+        @torch.library.register_fake("sgl_kernel::topk_softmax_cpu")
+        def _(
+            hidden_states,
+            gating_output,
+            topk,
+            renormalize,
+        ):
+            num_tokens = hidden_states.shape[0]
+            shape = (num_tokens, topk)
+            return (
+                torch.empty(shape, device=hidden_states.device, dtype=torch.float),
+                torch.empty(shape, device=hidden_states.device, dtype=torch.int),
+            )
 
     for act_op in [
         "silu_and_mul_cpu",
@@ -368,110 +403,112 @@ def register_fake_ops():
         is_vnni,
     ):
         M = mat1.shape[0]
-        N = mat2.shape[0]
+        N = scales2.numel() if is_vnni else mat2.shape[0]
         return mat1.new_empty(M, N, dtype=out_dtype)
 
-    @torch.library.register_fake("sgl_kernel::fp8_scaled_mm_cpu")
-    def _(
-        mat1,
-        mat2,
-        scales2,
-        block_size,
-        bias,
-        out_dtype,
-        is_vnni,
-    ):
-        M = mat1.shape[0]
-        N = mat2.shape[0]
-        return mat1.new_empty(M, N, dtype=out_dtype)
+    if not is_riscv:
 
-    @torch.library.register_fake("sgl_kernel::fused_linear_sigmoid_mul")
-    def _(
-        mat1,
-        mat2,
-        bias,
-        is_vnni,
-        post_mul_mat,
-    ):
-        M = mat1.shape[0]
-        N = post_mul_mat.shape[1]
-        return mat1.new_empty(M, N)
+        @torch.library.register_fake("sgl_kernel::fp8_scaled_mm_cpu")
+        def _(
+            mat1,
+            mat2,
+            scales2,
+            block_size,
+            bias,
+            out_dtype,
+            is_vnni,
+        ):
+            M = mat1.shape[0]
+            N = mat2.shape[0]
+            return mat1.new_empty(M, N, dtype=out_dtype)
 
-    @torch.library.register_fake("sgl_kernel::fused_qkvzba_split_reshape_cat_cpu")
-    def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
-        batch = mixed_qkvz.shape[0]
-        qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
-        mixed_qkv = mixed_qkvz.new_empty(batch, qkv_dim)
-        z = mixed_qkvz.new_empty(batch, num_heads_v, head_v)
-        b = mixed_ba.new_empty(batch, num_heads_v)
-        a = mixed_ba.new_empty(batch, num_heads_v)
-        return mixed_qkv, z, b, a
+        @torch.library.register_fake("sgl_kernel::fused_linear_sigmoid_mul")
+        def _(
+            mat1,
+            mat2,
+            bias,
+            is_vnni,
+            post_mul_mat,
+        ):
+            M = mat1.shape[0]
+            N = post_mul_mat.shape[1]
+            return mat1.new_empty(M, N)
 
-    @torch.library.register_fake(
-        "sgl_kernel::fused_qkvzba_split_reshape_cat_contiguous_cpu"
-    )
-    def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
-        batch = mixed_qkvz.shape[0]
-        qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
-        mixed_qkv = mixed_qkvz.new_empty(batch, qkv_dim)
-        z = mixed_qkvz.new_empty(batch, num_heads_v, head_v)
-        b = mixed_ba.new_empty(batch, num_heads_v)
-        a = mixed_ba.new_empty(batch, num_heads_v)
-        return mixed_qkv, z, b, a
+        @torch.library.register_fake("sgl_kernel::fused_qkvzba_split_reshape_cat_cpu")
+        def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
+            batch = mixed_qkvz.shape[0]
+            qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+            mixed_qkv = mixed_qkvz.new_empty(batch, qkv_dim)
+            z = mixed_qkvz.new_empty(batch, num_heads_v, head_v)
+            b = mixed_ba.new_empty(batch, num_heads_v)
+            a = mixed_ba.new_empty(batch, num_heads_v)
+            return mixed_qkv, z, b, a
 
-    @torch.library.register_fake(
-        "sgl_kernel::fused_sigmoid_gating_delta_rule_update_cpu"
-    )
-    def _(
-        A_log,
-        dt_bias,
-        q,
-        k,
-        v,
-        a,
-        b,
-        initial_state_source,
-        initial_state_indices,
-        cu_seqlens,
-        use_qk_l2norm_in_kernel,
-        softplus_beta=1.0,
-        softplus_threshold=20.0,
-    ):
-        assert q.dim() == 4
-        assert v.dim() == 4
-        batch_size = q.shape[1]
-        seq_len = q.shape[0]
-        v_num_heads = v.shape[2]
-        v_head_dim = v.shape[3]
-        return q.new_empty(batch_size, seq_len, v_num_heads, v_head_dim)
+        @torch.library.register_fake(
+            "sgl_kernel::fused_qkvzba_split_reshape_cat_contiguous_cpu"
+        )
+        def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
+            batch = mixed_qkvz.shape[0]
+            qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+            mixed_qkv = mixed_qkvz.new_empty(batch, qkv_dim)
+            z = mixed_qkvz.new_empty(batch, num_heads_v, head_v)
+            b = mixed_ba.new_empty(batch, num_heads_v)
+            a = mixed_ba.new_empty(batch, num_heads_v)
+            return mixed_qkv, z, b, a
 
-    @torch.library.register_fake("sgl_kernel::fused_gdn_gating_cpu")
-    def _(A_log, a, b, dt_bias):
-        batch = a.shape[0]
-        num_heads = a.shape[1]
-        out = a.new_empty(1, batch, num_heads, dtype=torch.float)
-        beta = b.new_empty(1, batch, num_heads)
-        return out, beta
+        @torch.library.register_fake(
+            "sgl_kernel::fused_sigmoid_gating_delta_rule_update_cpu"
+        )
+        def _(
+            A_log,
+            dt_bias,
+            q,
+            k,
+            v,
+            a,
+            b,
+            initial_state_source,
+            initial_state_indices,
+            cu_seqlens,
+            use_qk_l2norm_in_kernel,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+        ):
+            assert q.dim() == 4
+            assert v.dim() == 4
+            batch_size = q.shape[1]
+            seq_len = q.shape[0]
+            v_num_heads = v.shape[2]
+            v_head_dim = v.shape[3]
+            return q.new_empty(batch_size, seq_len, v_num_heads, v_head_dim)
 
-    @torch.library.register_fake("sgl_kernel::chunk_gated_delta_rule_cpu")
-    def _(
-        query,
-        key,
-        value,
-        g,
-        beta,
-        initial_state,
-        output_final_state,
-        cu_seqlens,
-        head_first,
-        use_qk_l2norm_in_kernel,
-        eps,
-    ):
-        output = torch.empty_like(value)
-        assert initial_state is not None
-        final_state = initial_state.to(torch.float32)
+        @torch.library.register_fake("sgl_kernel::fused_gdn_gating_cpu")
+        def _(A_log, a, b, dt_bias):
+            batch = a.shape[0]
+            num_heads = a.shape[1]
+            out = a.new_empty(1, batch, num_heads, dtype=torch.float)
+            beta = b.new_empty(1, batch, num_heads)
+            return out, beta
 
-        return output, final_state
+        @torch.library.register_fake("sgl_kernel::chunk_gated_delta_rule_cpu")
+        def _(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_state,
+            output_final_state,
+            cu_seqlens,
+            head_first,
+            use_qk_l2norm_in_kernel,
+            eps,
+        ):
+            output = torch.empty_like(value)
+            assert initial_state is not None
+            final_state = initial_state.to(torch.float32)
+
+            return output, final_state
 
 
 # TODO Remove unnecessary settings for CPUGraphRunner.
