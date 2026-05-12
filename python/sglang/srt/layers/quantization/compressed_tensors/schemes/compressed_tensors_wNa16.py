@@ -22,6 +22,10 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_rvv import (
+    apply_weights_rvv_wna16,
+    process_weights_after_loading_rvv_wna16,
+)
 from sglang.srt.layers.quantization.marlin_utils import (
     MarlinLinearLayerConfig,
     apply_gptq_marlin_linear,
@@ -39,7 +43,10 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import (
+    is_cuda,
+    is_host_cpu_riscv,
+)
 
 _is_cuda = is_cuda()
 
@@ -71,6 +78,7 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                  actorder: Optional[ActivationOrdering] = None):
 
         self.pack_factor = 32 // num_bits
+        self.num_bits = num_bits
         self.strategy = strategy
         self.symmetric = symmetric
         self.group_size = -1 if group_size is None else group_size
@@ -218,6 +226,9 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         device = getattr(layer, self.w_q_name).device
         c = self.kernel_config
 
+        if is_host_cpu_riscv():
+            process_weights_after_loading_rvv_wna16(self, layer)
+            return
         check_marlin_supports_shape(
             c.partition_weight_shape[1],  # out_features
             c.partition_weight_shape[0],  # in_features
@@ -304,6 +315,9 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
         c = self.kernel_config
+
+        if getattr(layer, "use_riscv_rvv_int4_w4a8_dynamic_linear_backend", False):
+            return apply_weights_rvv_wna16(self, layer, x, bias)
 
         def _get_weight_params(
             layer: torch.nn.Module,
