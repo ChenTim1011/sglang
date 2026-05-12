@@ -89,6 +89,18 @@ std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
 at::Tensor
 weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_packed);
 
+std::tuple<at::Tensor, at::Tensor>
+convert_weight_w4a8_dynamic_packed(at::Tensor& weight_q, at::Tensor& scales, int64_t group_size);
+
+at::Tensor weight_w4a8_dynamic_linear(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& scales,
+    const std::optional<at::Tensor>& bias,
+    const std::optional<at::Tensor>& input_permutation,
+    int64_t group_size,
+    bool is_packed);
+
 // igemm
 at::Tensor int8_scaled_mm_cpu(
     at::Tensor& mat1,
@@ -117,9 +129,9 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& cos_sin_cache,
     bool is_neox);
 
-// [NOTE] When registering kernels, we should accurately describe the in-place information.
-// Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
-// will be modified in-place to avoid incorrect fusing and execution order on graph mode.
+// [NOTE] When registering kernels, accurately describe in-place writes.
+// Use distinct alias sets for distinct mutable tensors; reusing `a!` for
+// multiple arguments makes PyTorch alias analysis unnecessarily conservative.
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // activation
   m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
@@ -142,9 +154,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("l2norm_cpu", torch::kCPU, &l2norm_cpu);
   m.def("fused_rmsnorm_gated_cpu(Tensor input, Tensor weight, Tensor gate, float eps) -> Tensor");
   m.impl("fused_rmsnorm_gated_cpu", torch::kCPU, &fused_rmsnorm_gated_cpu);
-  m.def("fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
+  m.def("fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(b!) residual, Tensor weight, float eps) -> ()");
   m.impl("fused_add_rmsnorm_cpu", torch::kCPU, &fused_add_rmsnorm_cpu);
-  m.def("gemma_fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
+  m.def("gemma_fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(b!) residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm_cpu", torch::kCPU, &gemma_fused_add_rmsnorm_cpu);
   m.def(
       "fused_add_layernorm_cpu(Tensor input, Tensor(a!) residual, Tensor weight, Tensor? bias, float eps) -> "
@@ -153,9 +165,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor(a!) k_cache, Tensor(a!) v_cache, Tensor(a!) output, Tensor key, "
+      "decode_attention_cpu(Tensor query, Tensor(a!) k_cache, Tensor(b!) v_cache, Tensor(c!) output, Tensor key, "
       "Tensor value, "
-      "Tensor loc, Tensor(a!) attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float "
+      "Tensor loc, Tensor(d!) attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float "
       "sm_scale, "
       "float logit_cap) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
@@ -178,7 +190,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // gemm
   m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_packed) -> Tensor");
   m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
-
+  // int4 dynamic-activation gemm
+  m.def("convert_weight_w4a8_dynamic_packed(Tensor weight_q, Tensor scales, int group_size) -> (Tensor, Tensor)");
+  m.impl("convert_weight_w4a8_dynamic_packed", torch::kCPU, &convert_weight_w4a8_dynamic_packed);
+  m.def(
+      "weight_w4a8_dynamic_linear(Tensor mat1, Tensor mat2, Tensor scales, Tensor? bias, Tensor? input_permutation, "
+      "int group_size, bool is_packed) -> Tensor");
+  m.impl("weight_w4a8_dynamic_linear", torch::kCPU, &weight_w4a8_dynamic_linear);
   // igemm
   m.def(
       "int8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales1, Tensor scales2, Tensor? bias, ScalarType "

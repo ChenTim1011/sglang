@@ -388,6 +388,40 @@ class TestRVVLMHeadPacking(unittest.TestCase):
             lm_head._rvv_lm_head_packed_source_sig[-1], lm_head.weight._version
         )
 
+    def test_lm_head_lazy_pack_reuses_cache_while_compiling(self):
+        from unittest.mock import patch
+
+        import torch
+
+        from sglang.srt.layers import rvv_utils
+
+        pack_calls = []
+
+        def fake_convert(weight):
+            pack_calls.append(weight.clone())
+            return weight + 10
+
+        lm_head = SimpleNamespace(
+            weight=torch.nn.Parameter(
+                torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float16)
+            )
+        )
+
+        with patch.object(
+            rvv_utils, "cpu_has_rvv_support", return_value=True
+        ), patch.object(rvv_utils, "_convert_weight_packed", side_effect=fake_convert):
+            packed_1 = rvv_utils.resolve_rvv_lm_head_weight(lm_head)
+            with torch.no_grad():
+                lm_head.weight.copy_(
+                    torch.tensor([[5.0, 6.0], [7.0, 8.0]], dtype=torch.float16)
+                )
+
+            with patch.object(torch.compiler, "is_compiling", return_value=True):
+                packed_2 = rvv_utils.resolve_rvv_lm_head_weight(lm_head)
+
+        self.assertEqual(len(pack_calls), 1)
+        self.assertTrue(torch.equal(packed_1, packed_2))
+
     def test_float32_lm_head_disables_backend(self):
         from unittest.mock import patch
 
