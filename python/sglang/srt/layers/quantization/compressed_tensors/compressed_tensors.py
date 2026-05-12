@@ -71,12 +71,13 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_host_cpu_riscv, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_host_cpu_riscv = is_host_cpu_riscv()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -993,7 +994,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                     f"{scheme.__class__.__name__} is not supported on XPU "
                     "(no XPU kernel implementation)."
                 )
-        elif not _is_npu:
+        elif not _is_npu and not (
+            _is_host_cpu_riscv and isinstance(scheme, CompressedTensorsWNA16)
+        ):
             self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
