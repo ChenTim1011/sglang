@@ -8,6 +8,7 @@ from sglang.srt.utils.common import use_riscv_rvv_backend
 logger = logging.getLogger(__name__)
 
 _convert_weight_packed = None
+_convert_weight_w4a8_dynamic_packed = None
 
 
 def _get_convert_weight_packed_op():
@@ -26,6 +27,28 @@ def _get_convert_weight_packed_op():
                 "[RVV] sgl_kernel.convert_weight_packed not found. "
                 "Weight packing will be disabled; performance will be degraded. "
                 "Ensure sgl-kernel was built with RVV support."
+            )
+        return None
+
+
+def _get_convert_weight_w4a8_dynamic_packed_op():
+    global _convert_weight_w4a8_dynamic_packed
+    if _convert_weight_w4a8_dynamic_packed is not None:
+        return _convert_weight_w4a8_dynamic_packed
+
+    try:
+        import sgl_kernel  # noqa: F401
+
+        _convert_weight_w4a8_dynamic_packed = (
+            torch.ops.sgl_kernel.convert_weight_w4a8_dynamic_packed
+        )
+        return _convert_weight_w4a8_dynamic_packed
+    except (ImportError, AttributeError, RuntimeError):
+        if is_host_cpu_riscv():
+            logger.warning_once(
+                "[RVV] sgl_kernel.convert_weight_w4a8_dynamic_packed not found. "
+                "W4A8 dynamic packing is unavailable. "
+                "Ensure sgl-kernel was built with RVV W4A8 dynamic support."
             )
         return None
 
@@ -59,6 +82,42 @@ def _rvv_process_weight_after_loading(module, weight_names) -> None:
         setattr(module, name, packed)
 
     module.use_riscv_rvv_backend = True
+
+    if getattr(module, "bias", None) is not None and module.bias.dtype != torch.float32:
+        module.bias = torch.nn.Parameter(module.bias.float(), requires_grad=False)
+
+
+def _rvv_process_int4_weight_after_loading(
+    module, weight_name, scale_name, group_size
+) -> None:
+    """Pack compressed-tensors INT4 weights for RVV kernels."""
+    weight = getattr(module, weight_name)
+    scales = getattr(module, scale_name)
+    devices = {weight.device, scales.device}
+    assert len(devices) == 1, "Expects INT4 weight and scales to be on the same device"
+    if devices.pop() != torch.device("cpu"):
+        return
+
+    if not cpu_has_rvv_support():
+        return
+
+    weight_data = weight.data
+    scales_data = scales.data.float()
+
+    convert_weight_w4a8_dynamic_packed = _get_convert_weight_w4a8_dynamic_packed_op()
+    if convert_weight_w4a8_dynamic_packed is None:
+        raise RuntimeError(
+            "[RVV] sgl_kernel.convert_weight_w4a8_dynamic_packed unavailable; "
+            "cannot pack INT4 weights for the RVV W4A8 dynamic backend. "
+            "Rebuild sgl-kernel with RVV W4A8 dynamic support."
+        )
+
+    w4a8_dynamic_weight, w4a8_dynamic_scales = convert_weight_w4a8_dynamic_packed(
+        weight_data, scales_data, group_size
+    )
+    module._rvv_int4_w4a8_dynamic_w_q = w4a8_dynamic_weight
+    module._rvv_int4_w4a8_dynamic_w_s = w4a8_dynamic_scales
+    module.use_riscv_rvv_int4_w4a8_dynamic_linear_backend = True
 
     if getattr(module, "bias", None) is not None and module.bias.dtype != torch.float32:
         module.bias = torch.nn.Parameter(module.bias.float(), requires_grad=False)
@@ -106,14 +165,22 @@ def resolve_rvv_lm_head_weight(lm_head) -> torch.Tensor:
     #    packed RVV path entirely.
     # 3. tests and real workloads may update lm_head.weight in place after load,
     #    so the packed cache must be refreshed lazily when the source changes.
+    cached_sig = getattr(lm_head, "_rvv_lm_head_packed_source_sig", None)
+    cached_weight = getattr(lm_head, "_rvv_lm_head_packed_weight", None)
+
+    if (
+        cached_weight is not None
+        and hasattr(torch, "compiler")
+        and torch.compiler.is_compiling()
+    ):
+        return cached_weight
+
     source_sig = (
         weight.data_ptr(),
         tuple(weight.shape),
         weight.dtype,
         weight._version,
     )
-    cached_sig = getattr(lm_head, "_rvv_lm_head_packed_source_sig", None)
-    cached_weight = getattr(lm_head, "_rvv_lm_head_packed_weight", None)
 
     if cached_weight is not None and cached_sig == source_sig:
         return cached_weight
