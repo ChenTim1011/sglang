@@ -343,6 +343,17 @@ def register_fake_ops(tp_size: int):
         out = mat1.new_empty(M, N, dtype=out_dtype)
         return out
 
+    @register_cpu_compile_fake("weight_w4a8_dynamic_linear")
+    def _(mat1, mat2, scales, bias, input_permutation, group_size, is_packed):
+        M = mat1.shape[0]
+        if bias is not None:
+            N = bias.shape[0]
+        elif is_packed:
+            N = scales.shape[0] * scales.shape[2]
+        else:
+            N = mat2.shape[0]
+        return mat1.new_empty(M, N)
+
     @register_cpu_compile_fake("grouped_topk_cpu")
     def _(
         hidden_states,
