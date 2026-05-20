@@ -18,8 +18,19 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import cpu_has_rvv_support
 
 logger = logging.getLogger(__name__)
+
+
+def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
+    """Restrict INT8 KV cache storage to the RVV CPU attention path."""
+    if resolving_view(server_args).kv_cache_dtype != "int8":
+        return
+    if not cpu_has_rvv_support():
+        raise ValueError(
+            "--kv-cache-dtype=int8 requires RISC-V hardware with RVV support."
+        )
 
 
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
