@@ -39,6 +39,16 @@ precision = {
         torch.float16: 3e-3,
         torch.float32: 1e-5,
     },
+    "attention_decode_int8": {
+        torch.bfloat16: 1e-1,
+        torch.float16: 1e-1,
+        torch.float32: 1e-5,
+    },
+    "attention_extend_int8": {
+        torch.bfloat16: 1e-1,
+        torch.float16: 7e-2,
+        torch.float32: 1e-5,
+    },
 }
 
 

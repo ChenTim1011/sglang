@@ -45,7 +45,6 @@ from sglang.srt.utils.common import (
     SUPPORTED_LORA_TARGET_MODULES,
     cpu_has_amx_support,
     cpu_has_rvv_support,
-    get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     get_device_name,
@@ -4462,8 +4461,9 @@ class ServerArgs:
                 "bf16",
                 "bfloat16",
                 "fp4_e2m1",
+                "int8",
             ],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+.',
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+. "int8" is supported by the RVV CPU attention backend.',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
@@ -7092,6 +7092,11 @@ class ServerArgs:
         from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
 
         validate_hisparse(self)
+
+        if self.kv_cache_dtype == "int8" and not cpu_has_rvv_support():
+            raise ValueError(
+                "--kv-cache-dtype=int8 requires RISC-V hardware with RVV support."
+            )
 
         assert (
             self.schedule_conservativeness >= 0
