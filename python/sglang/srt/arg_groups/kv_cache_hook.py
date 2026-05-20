@@ -18,6 +18,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.utils.device import cpu_has_rvv_support
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,16 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
         requested_dtype,
         requested_dtype,
     )
+
+
+def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
+    """Restrict INT8 KV cache storage to the RVV CPU attention path."""
+    if resolving_view(server_args).kv_cache_dtype != "int8":
+        return
+    if not cpu_has_rvv_support():
+        raise ValueError(
+            "--kv-cache-dtype=int8 requires RISC-V hardware with RVV support."
+        )
 
 
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
