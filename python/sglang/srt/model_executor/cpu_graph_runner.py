@@ -197,6 +197,10 @@ def register_fake_ops(tp_size: int):
         "apply_multidimensional_rope_cpu",
         "fused_sigmoid_mul_cpu",
     ]
+    if is_host_cpu_riscv():
+        none_return_ops.extend(
+            ["decode_attention_int8_cpu", "extend_attention_int8_cpu"]
+        )
     for op in none_return_ops:
 
         @register_cpu_compile_fake(op)
