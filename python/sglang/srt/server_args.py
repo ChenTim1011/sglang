@@ -679,7 +679,8 @@ class ServerArgs:
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "
+                '"int8" is supported by the RVV CPU attention backend.'
             ),
             choices=[
                 "auto",
@@ -691,6 +692,7 @@ class ServerArgs:
                 "nvfp4",
                 "fp4_mx_block16",
                 "fp4_e2m1",
+                "int8",
             ],
             resolvable=True,
         ),
@@ -8931,6 +8933,11 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _hisparse_validation)
+
+        if self.kv_cache_dtype == "int8" and not cpu_has_rvv_support():
+            raise ValueError(
+                "--kv-cache-dtype=int8 requires RISC-V hardware with RVV support."
+            )
 
         assert (
             self.schedule_conservativeness >= 0
