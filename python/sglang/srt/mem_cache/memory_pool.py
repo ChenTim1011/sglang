@@ -1139,6 +1139,7 @@ class MHATokenToKVPool(KVCache):
                 assert self.v_head_dim % self._kv_vector_x == 0
 
         self._create_buffers()
+        self._create_int8_kv_scale_buffers()
 
         self.device_module = torch.get_device_module(self.device)
 
@@ -1296,9 +1297,52 @@ class MHATokenToKVPool(KVCache):
             device=self.device,
         )
 
+    def _create_int8_kv_scale_buffers(self):
+        self.has_int8_kv_scale_buffer = self.dtype in (torch.int8, torch.uint8)
+        if not self.has_int8_kv_scale_buffer:
+            return
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.k_scale_buffer = [
+                torch.full(
+                    (self.size + self.page_size, self.head_num),
+                    float("nan"),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_scale_buffer = [
+                torch.full(
+                    (self.size + self.page_size, self.head_num),
+                    float("nan"),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+
+        scale_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_scale_buffer + self.v_scale_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        scale_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_scale_buffer + self.v_scale_buffer
+            ],
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.data_ptrs, scale_ptrs], dim=0)
+        self.data_strides = torch.cat([self.data_strides, scale_strides], dim=0)
+
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+        if getattr(self, "has_int8_kv_scale_buffer", False):
+            del self.k_scale_buffer
+            del self.v_scale_buffer
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -1309,6 +1353,11 @@ class MHATokenToKVPool(KVCache):
         v_size_bytes = 0
         for v_cache in self.v_buffer:
             v_size_bytes += get_tensor_size_bytes(v_cache)
+        if getattr(self, "has_int8_kv_scale_buffer", False):
+            for k_scale_cache in self.k_scale_buffer:
+                k_size_bytes += get_tensor_size_bytes(k_scale_cache)
+            for v_scale_cache in self.v_scale_buffer:
+                v_size_bytes += get_tensor_size_bytes(v_scale_cache)
         return k_size_bytes, v_size_bytes
 
     # for disagg
@@ -1352,7 +1401,16 @@ class MHATokenToKVPool(KVCache):
                 v_cpu = self.v_buffer[layer_id][chunk_indices].to(
                     "cpu", non_blocking=True
                 )
-                kv_cache_cpu[-1].append([k_cpu, v_cpu])
+                if getattr(self, "has_int8_kv_scale_buffer", False):
+                    k_scale_cpu = self.k_scale_buffer[layer_id][chunk_indices].to(
+                        "cpu", non_blocking=True
+                    )
+                    v_scale_cpu = self.v_scale_buffer[layer_id][chunk_indices].to(
+                        "cpu", non_blocking=True
+                    )
+                    kv_cache_cpu[-1].append([k_cpu, v_cpu, k_scale_cpu, v_scale_cpu])
+                else:
+                    kv_cache_cpu[-1].append([k_cpu, v_cpu])
         current_platform.synchronize()
         return kv_cache_cpu
 
@@ -1362,15 +1420,21 @@ class MHATokenToKVPool(KVCache):
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                k_cpu, v_cpu = (
-                    kv_cache_cpu[layer_id][i // chunk_size][0],
-                    kv_cache_cpu[layer_id][i // chunk_size][1],
-                )
+                cache_entry = kv_cache_cpu[layer_id][i // chunk_size]
+                k_cpu, v_cpu = cache_entry[0], cache_entry[1]
                 assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
                 k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
                 v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
                 self.k_buffer[layer_id][chunk_indices] = k_chunk
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
+                if getattr(self, "has_int8_kv_scale_buffer", False):
+                    k_scale_cpu, v_scale_cpu = cache_entry[2], cache_entry[3]
+                    self.k_scale_buffer[layer_id][chunk_indices] = k_scale_cpu.to(
+                        self.k_scale_buffer[0].device, non_blocking=True
+                    )
+                    self.v_scale_buffer[layer_id][chunk_indices] = v_scale_cpu.to(
+                        self.v_scale_buffer[0].device, non_blocking=True
+                    )
         current_platform.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
@@ -1400,6 +1464,16 @@ class MHATokenToKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_key_scale_buffer(self, layer_id: int):
+        if not getattr(self, "has_int8_kv_scale_buffer", False):
+            raise RuntimeError("INT8 KV scale buffer is not allocated")
+        return self.k_scale_buffer[layer_id - self.start_layer]
+
+    def get_value_scale_buffer(self, layer_id: int):
+        if not getattr(self, "has_int8_kv_scale_buffer", False):
+            raise RuntimeError("INT8 KV scale buffer is not allocated")
+        return self.v_scale_buffer[layer_id - self.start_layer]
 
     def set_kv_buffer(
         self,
@@ -1585,8 +1659,12 @@ class MHATokenToKVPool(KVCache):
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
-        if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
+        if str(self.device) == "cpu" or envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
+            if getattr(self, "has_int8_kv_scale_buffer", False):
+                move_kv_cache_native(
+                    self.k_scale_buffer, self.v_scale_buffer, tgt_loc, src_loc
+                )
             return
 
         N = tgt_loc.numel()

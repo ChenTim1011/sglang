@@ -182,7 +182,9 @@ def register_fake_ops(tp_size: int):
         none_return_ops = [
             "fused_add_rmsnorm_cpu",
             "decode_attention_cpu",
+            "decode_attention_int8_cpu",
             "extend_attention_cpu",
+            "extend_attention_int8_cpu",
             "gemma_fused_add_rmsnorm_cpu",
             "layernorm_cpu",
             "fused_add_layernorm_cpu",

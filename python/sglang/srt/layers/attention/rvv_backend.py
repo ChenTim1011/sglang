@@ -34,6 +34,7 @@ class RVVAttnBackend(AttentionBackend):
         super().__init__()
         self.device = "cpu"
         self.use_rvv_kernels = False
+        self.is_int8 = False
         self.num_head = 0
         self.v_head_dim = 0
 
@@ -58,16 +59,32 @@ class RVVAttnBackend(AttentionBackend):
             self.v_head_dim = pool.get_value_buffer(layer_id).shape[-1]
 
             kernels_available = False
-            try:
-                self.decode_fwd_impl = ops.decode_attention_cpu
-                self.extend_fwd_impl = ops.extend_attention_cpu
-                kernels_available = True
-            except AttributeError:
-                logger.warning(
-                    "[RVV] FP attention kernels (decode_attention_cpu / "
-                    "extend_attention_cpu) not found in sgl_kernel. "
-                    "Falling back to TorchNative."
-                )
+            k_buffer = pool.get_key_buffer(layer_id)
+            self.is_int8 = k_buffer.dtype in (torch.int8, torch.uint8)
+            if self.is_int8:
+                try:
+                    self.decode_fwd_impl = ops.decode_attention_int8_cpu
+                    self.extend_fwd_impl = ops.extend_attention_int8_cpu
+                    if not getattr(pool, "has_int8_kv_scale_buffer", False):
+                        raise RuntimeError("INT8 KV scale buffers are not allocated")
+                    kernels_available = True
+                except AttributeError:
+                    logger.warning(
+                        "[RVV] INT8 attention kernels (decode_attention_int8_cpu / "
+                        "extend_attention_int8_cpu) not found in sgl_kernel. "
+                        "Falling back to TorchNative."
+                    )
+            else:
+                try:
+                    self.decode_fwd_impl = ops.decode_attention_cpu
+                    self.extend_fwd_impl = ops.extend_attention_cpu
+                    kernels_available = True
+                except AttributeError:
+                    logger.warning(
+                        "[RVV] FP attention kernels (decode_attention_cpu / "
+                        "extend_attention_cpu) not found in sgl_kernel. "
+                        "Falling back to TorchNative."
+                    )
 
             if kernels_available:
                 max_bs = model_runner.req_to_token_pool.size
@@ -77,7 +94,9 @@ class RVVAttnBackend(AttentionBackend):
                     device="cpu",
                 )
                 self.use_rvv_kernels = True
-                logger.info("[RVV] Initialized. Mode=FLOAT")
+                logger.info(
+                    f"[RVV] Initialized. Mode={'INT8' if self.is_int8 else 'FLOAT'}"
+                )
 
         except (AttributeError, RuntimeError, MemoryError) as e:
             logger.warning(
@@ -92,6 +111,77 @@ class RVVAttnBackend(AttentionBackend):
                 exc_info=True,
             )
             raise
+
+    @staticmethod
+    def _ensure_cached_scales(
+        layer: RadixAttention,
+        key: torch.Tensor | None = None,
+        value: torch.Tensor | None = None,
+    ):
+        """Resolve INT8 KV-cache quantization scales for this layer."""
+        if getattr(layer, "_rvv_int8_scales_cached", False):
+            return
+
+        def _resolve(src_attr: str, fallback_attr: str):
+            src = getattr(layer, src_attr, None)
+            if isinstance(src, torch.Tensor):
+                return src.item(), True
+            if isinstance(src, (int, float)):
+                return float(src), True
+
+            fallback = getattr(layer, fallback_attr, None)
+            if fallback is not None:
+                return float(fallback), True
+            return None, False
+
+        key_is_quantized = key is not None and key.dtype in (torch.int8, torch.uint8)
+        value_is_quantized = value is not None and value.dtype in (
+            torch.int8,
+            torch.uint8,
+        )
+
+        k_scale, has_k_scale = _resolve("k_scale", "k_scale_float")
+        v_scale, has_v_scale = _resolve("v_scale", "v_scale_float")
+
+        if has_k_scale != has_v_scale:
+            raise RuntimeError(
+                "[RVV] Inconsistent INT8 KV-cache scales on "
+                f"{type(layer).__name__}: k_scale present={has_k_scale}, "
+                f"v_scale present={has_v_scale}."
+            )
+
+        default_unit_scale = (
+            has_k_scale
+            and k_scale == 1.0
+            and v_scale == 1.0
+            and not key_is_quantized
+            and not value_is_quantized
+        )
+        if default_unit_scale:
+            logger.warning_once(
+                f"[RVV] k_scale=v_scale=1.0 on {type(layer).__name__} with FP "
+                "inputs; treating it as the default missing-scale fallback and "
+                "using dynamic per-token INT8 quantization."
+            )
+            has_k_scale = False
+
+        if not has_k_scale:
+            if key_is_quantized or value_is_quantized:
+                raise RuntimeError(
+                    "[RVV] Pre-quantized INT8 K/V inputs require explicit "
+                    "k_scale/v_scale."
+                )
+            if not default_unit_scale:
+                logger.warning_once(
+                    f"[RVV] Missing k_scale/v_scale on {type(layer).__name__}; "
+                    "using dynamic per-token INT8 quantization."
+                )
+            k_scale = float("nan")
+            v_scale = float("nan")
+
+        layer._cached_k_scale_float = k_scale
+        layer._cached_v_scale_float = v_scale
+        layer._rvv_int8_scales_cached = True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if not self.use_rvv_kernels:
@@ -177,7 +267,7 @@ class RVVAttnBackend(AttentionBackend):
 
             attn_logits, _ = self.forward_metadata
 
-            self.decode_fwd_impl(
+            args = (
                 q_view,
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
@@ -192,6 +282,18 @@ class RVVAttnBackend(AttentionBackend):
                 layer.scaling,
                 layer.logit_cap,
             )
+            if self.is_int8:
+                self._ensure_cached_scales(layer, k, v)
+                args += (
+                    forward_batch.token_to_kv_pool.get_key_scale_buffer(layer.layer_id),
+                    forward_batch.token_to_kv_pool.get_value_scale_buffer(
+                        layer.layer_id
+                    ),
+                    layer._cached_k_scale_float,
+                    layer._cached_v_scale_float,
+                )
+
+            self.decode_fwd_impl(*args)
             return o
 
         logger.warning_once(
@@ -225,7 +327,12 @@ class RVVAttnBackend(AttentionBackend):
 
             pool = forward_batch.token_to_kv_pool
 
-            if save_kv_cache:
+            if self.is_int8 and not save_kv_cache:
+                return self.fallback_backend.forward_extend(
+                    q, k, v, layer, forward_batch, save_kv_cache
+                )
+
+            if save_kv_cache and not self.is_int8:
                 pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
 
             current_bs = q.shape[0]
@@ -234,7 +341,8 @@ class RVVAttnBackend(AttentionBackend):
             o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
             _, max_extend_len = self.forward_metadata
-            self.extend_fwd_impl(
+
+            args = (
                 q_view,
                 k,
                 v,
@@ -250,6 +358,16 @@ class RVVAttnBackend(AttentionBackend):
                 layer.scaling,
                 layer.logit_cap,
             )
+            if self.is_int8:
+                self._ensure_cached_scales(layer, k, v)
+                args += (
+                    pool.get_key_scale_buffer(layer.layer_id),
+                    pool.get_value_scale_buffer(layer.layer_id),
+                    layer._cached_k_scale_float,
+                    layer._cached_v_scale_float,
+                )
+
+            self.extend_fwd_impl(*args)
             return o
 
         logger.warning_once(

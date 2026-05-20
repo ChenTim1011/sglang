@@ -116,6 +116,34 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
         else:
             self.assertIsNotNone(backend.fallback_backend)
 
+    def test_cpu_graph_registers_int8_attention_fake_ops(self):
+        """INT8 RVV attention ops need fake registrations for torch.compile."""
+        from unittest.mock import patch
+
+        registered = []
+
+        def fake_register_fake(op_name):
+            registered.append(op_name)
+
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+        with (
+            patch(
+                "sglang.srt.model_executor.cpu_graph_runner.is_host_cpu_riscv",
+                return_value=True,
+            ),
+            patch("torch.library.register_fake", side_effect=fake_register_fake),
+        ):
+            from sglang.srt.model_executor.cpu_graph_runner import register_fake_ops
+
+            register_fake_ops()
+
+        self.assertIn("sgl_kernel::decode_attention_int8_cpu", registered)
+        self.assertIn("sgl_kernel::extend_attention_int8_cpu", registered)
+
 
 class TestRVVForwardMetadataGuards(unittest.TestCase, _RVVBackendTestMixin):
     """Forward-metadata guard behavior."""
@@ -298,6 +326,64 @@ class TestRVVBackendCacheWiring(unittest.TestCase, _RVVBackendTestMixin):
             layer, batch.out_cache_loc, k, v
         )
         backend.extend_fwd_impl.assert_called_once()
+
+
+class TestRVVInt8KVScaleLifecycle(unittest.TestCase):
+    """INT8 KV scale buffers must follow KV slot lifecycle."""
+
+    def test_move_kv_cache_moves_int8_scales(self):
+        import torch
+
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        pool = MHATokenToKVPool(
+            size=8,
+            page_size=1,
+            dtype=torch.int8,
+            head_num=2,
+            head_dim=4,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+
+        pool.k_buffer[0][2].fill_(11)
+        pool.v_buffer[0][2].fill_(22)
+        pool.k_scale_buffer[0][2] = torch.tensor([0.25, 0.5])
+        pool.v_scale_buffer[0][2] = torch.tensor([0.75, 1.0])
+
+        pool.move_kv_cache(
+            torch.tensor([5], dtype=torch.int64),
+            torch.tensor([2], dtype=torch.int64),
+        )
+
+        self.assertTrue(torch.equal(pool.k_buffer[0][5], pool.k_buffer[0][2]))
+        self.assertTrue(torch.equal(pool.v_buffer[0][5], pool.v_buffer[0][2]))
+        self.assertTrue(
+            torch.equal(pool.k_scale_buffer[0][5], pool.k_scale_buffer[0][2])
+        )
+        self.assertTrue(
+            torch.equal(pool.v_scale_buffer[0][5], pool.v_scale_buffer[0][2])
+        )
+
+    def test_int8_scale_buffers_start_as_nan(self):
+        import torch
+
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        pool = MHATokenToKVPool(
+            size=4,
+            page_size=1,
+            dtype=torch.int8,
+            head_num=2,
+            head_dim=4,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+
+        self.assertTrue(torch.isnan(pool.k_scale_buffer[0]).all())
+        self.assertTrue(torch.isnan(pool.v_scale_buffer[0]).all())
 
 
 class TestRVVLMHeadPacking(unittest.TestCase):
