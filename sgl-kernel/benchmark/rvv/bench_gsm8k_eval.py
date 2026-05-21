@@ -29,6 +29,7 @@ except ImportError:
     sys.exit(1)
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 W8A8_MODEL = "RedHatAI/Qwen2.5-1.5B-quantized.w8a8"
+W4A16_MODEL = "RedHatAI/Qwen2.5-1.5B-quantized.w4a16"
 LLAMA32_1B_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 BASE_URL = DEFAULT_URL_FOR_TEST
 INVALID = -9999999
@@ -58,6 +59,18 @@ GSM8K_EXPERIMENT_CONFIGS = {
         "model": W8A8_MODEL,
         "quantization": "w8a8_int8",
         "kv_int8": True,
+    },
+    "w4a16": {
+        "model": W4A16_MODEL,
+        "quantization": "compressed-tensors",
+        "kv_int8": False,
+        "num_shots": 4,
+    },
+    "w4a16_int8_kv": {
+        "model": W4A16_MODEL,
+        "quantization": "compressed-tensors",
+        "kv_int8": True,
+        "num_shots": 4,
     },
     "llama32_1b": {
         "model": LLAMA32_1B_MODEL,
@@ -404,9 +417,9 @@ def main():
     parser.add_argument(
         "--quantization",
         type=str,
-        choices=["w8a8_int8"],
+        choices=["w8a8_int8", "compressed-tensors"],
         default=None,
-        help="Weight quantization mode. Use w8a8_int8 for RedHatAI W8A8 checkpoints.",
+        help="Weight quantization mode. Use w8a8_int8 or compressed-tensors.",
     )
     parser.add_argument(
         "--model-path",
@@ -419,7 +432,7 @@ def main():
         type=str,
         choices=list(GSM8K_EXPERIMENT_CONFIGS),
         default=None,
-        help="Named experiment: default, int8_kv, w8a8, w8a8_int8_kv.",
+        help="Named experiment: default, int8_kv, w8a8, w8a8_int8_kv, w4a16, w4a16_int8_kv.",
     )
     parser.add_argument(
         "--use-chat-template",

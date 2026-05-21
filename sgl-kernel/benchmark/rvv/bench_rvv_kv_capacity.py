@@ -137,6 +137,11 @@ def main() -> None:
         help="Model name to launch.",
     )
     parser.add_argument(
+        "--quantization",
+        default="",
+        help="Optional quantization argument forwarded to sglang serve.",
+    )
+    parser.add_argument(
         "--kv-memory-mb",
         type=int,
         default=256,
@@ -194,6 +199,7 @@ def main() -> None:
         process = _launch(
             model=args.model,
             kv_cache_dtype=kv_cache_dtype,
+            quant_arg=args.quantization,
             max_total_tokens=max_total_tokens,
             extra_args=[
                 "--attention-backend",

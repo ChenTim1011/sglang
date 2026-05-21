@@ -7,6 +7,7 @@ set -euo pipefail
 #   3) BF16 + INT8 KV cache
 #   4) W8A8
 #   5) W8A8 + INT8 KV cache
+#   6) INT4 W4A16 compressed-tensors (optional)
 #
 # Tools mapping:
 # - bench_serving             : online serving (async, realistic)
@@ -22,6 +23,8 @@ set -euo pipefail
 #   bash sgl-kernel/benchmark/rvv/run_sglang_rvv_benchmarks.sh --tool all --server-timeout 600
 #   bash sgl-kernel/benchmark/rvv/run_sglang_rvv_benchmarks.sh --tool all --native-only
 #   bash sgl-kernel/benchmark/rvv/run_sglang_rvv_benchmarks.sh --tool all --skip-native
+#   bash sgl-kernel/benchmark/rvv/run_sglang_rvv_benchmarks.sh --tool one-batch --int4-only --quick
+#   bash sgl-kernel/benchmark/rvv/run_sglang_rvv_benchmarks.sh --tool one-batch --core-modes-only --include-int4 --quick
 #
 # Optional env:
 #   PYTHON_BIN=python
@@ -31,6 +34,8 @@ set -euo pipefail
 #   SERVER_MAX_RUNNING_REQUESTS=1
 #   SERVER_MAX_TOTAL_TOKENS=3072
 #   SERVING_REQUEST_RATE=0.15
+#   W8A8_MODEL=RedHatAI/Qwen2.5-1.5B-quantized.w8a8
+#   INT4_MODEL=RedHatAI/Qwen2.5-1.5B-quantized.w4a16
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:30000}"
@@ -38,11 +43,16 @@ TOOL="serving"   # serving | one-batch-server | offline | one-batch | all
 QUICK=0
 NATIVE_ONLY=0
 SKIP_NATIVE=0
+INCLUDE_INT4=0
+INT4_ONLY=0
+CORE_MODES_ONLY=0
 SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-900}"
 SERVER_MEM_FRACTION_STATIC="${SERVER_MEM_FRACTION_STATIC:-0.28}"
 SERVER_MAX_RUNNING_REQUESTS="${SERVER_MAX_RUNNING_REQUESTS:-1}"
 SERVER_MAX_TOTAL_TOKENS="${SERVER_MAX_TOTAL_TOKENS:-2048}"
 SERVING_REQUEST_RATE="${SERVING_REQUEST_RATE:-0.10}"
+W8A8_MODEL="${W8A8_MODEL:-RedHatAI/Qwen2.5-1.5B-quantized.w8a8}"
+INT4_MODEL="${INT4_MODEL:-RedHatAI/Qwen2.5-1.5B-quantized.w4a16}"
 
 # RISC-V low-memory stable defaults.
 NUM_PROMPTS=16
@@ -70,6 +80,23 @@ while [[ $# -gt 0 ]]; do
     --skip-native)
       SKIP_NATIVE=1
       shift
+      ;;
+    --include-int4)
+      INCLUDE_INT4=1
+      shift
+      ;;
+    --core-modes-only)
+      CORE_MODES_ONLY=1
+      shift
+      ;;
+    --int4-only)
+      INCLUDE_INT4=1
+      INT4_ONLY=1
+      shift
+      ;;
+    --int4-model)
+      INT4_MODEL="$2"
+      shift 2
       ;;
     --base-url)
       BASE_URL="$2"
@@ -117,6 +144,16 @@ if [[ "$NATIVE_ONLY" -eq 1 && "$SKIP_NATIVE" -eq 1 ]]; then
   exit 1
 fi
 
+if [[ "$NATIVE_ONLY" -eq 1 && "$INT4_ONLY" -eq 1 ]]; then
+  echo "--native-only and --int4-only are mutually exclusive"
+  exit 1
+fi
+
+if [[ "$NATIVE_ONLY" -eq 1 && "$CORE_MODES_ONLY" -eq 1 ]]; then
+  echo "--native-only and --core-modes-only are mutually exclusive"
+  exit 1
+fi
+
 if [[ "$BASE_URL" =~ ^https?://[^:]+:([0-9]+)$ ]]; then
   PORT="${BASH_REMATCH[1]}"
 else
@@ -124,48 +161,84 @@ else
   exit 1
 fi
 
-MODE_NAMES=(
-  "PYTORCH_NATIVE"
-  "BF16"
-  "BF16+INT8KV"
-  "W8A8"
-  "W8A8+INT8KV"
-)
-MODE_MODELS=(
-  "Qwen/Qwen2.5-1.5B-Instruct"
-  "Qwen/Qwen2.5-1.5B-Instruct"
-  "Qwen/Qwen2.5-1.5B-Instruct"
-  "Qwen/Qwen2.5-1.5B-Instruct"
-  "Qwen/Qwen2.5-1.5B-Instruct"
-)
-MODE_QUANTS=(
-  ""
-  ""
-  ""
-  "w8a8_int8"
-  "w8a8_int8"
-)
-MODE_KVS=(
-  ""
-  ""
-  "int8"
-  ""
-  "int8"
-)
-MODE_ATTN_BACKENDS=(
-  "torch_native"
-  "rvv"
-  "rvv"
-  "rvv"
-  "rvv"
-)
-MODE_DISABLE_RVV_KERNELS=(
-  "1"
-  ""
-  ""
-  ""
-  ""
-)
+if [[ "$CORE_MODES_ONLY" -eq 1 ]]; then
+  MODE_NAMES=(
+    "BF16"
+    "W8A8"
+  )
+  MODE_MODELS=(
+    "Qwen/Qwen2.5-1.5B-Instruct"
+    "${W8A8_MODEL}"
+  )
+  MODE_QUANTS=(
+    ""
+    "w8a8_int8"
+  )
+  MODE_KVS=(
+    ""
+    ""
+  )
+  MODE_ATTN_BACKENDS=(
+    "rvv"
+    "rvv"
+  )
+  MODE_DISABLE_RVV_KERNELS=(
+    ""
+    ""
+  )
+else
+  MODE_NAMES=(
+    "PYTORCH_NATIVE"
+    "BF16"
+    "BF16+INT8KV"
+    "W8A8"
+    "W8A8+INT8KV"
+  )
+  MODE_MODELS=(
+    "Qwen/Qwen2.5-1.5B-Instruct"
+    "Qwen/Qwen2.5-1.5B-Instruct"
+    "Qwen/Qwen2.5-1.5B-Instruct"
+    "${W8A8_MODEL}"
+    "${W8A8_MODEL}"
+  )
+  MODE_QUANTS=(
+    ""
+    ""
+    ""
+    "w8a8_int8"
+    "w8a8_int8"
+  )
+  MODE_KVS=(
+    ""
+    ""
+    "int8"
+    ""
+    "int8"
+  )
+  MODE_ATTN_BACKENDS=(
+    "torch_native"
+    "rvv"
+    "rvv"
+    "rvv"
+    "rvv"
+  )
+  MODE_DISABLE_RVV_KERNELS=(
+    "1"
+    ""
+    ""
+    ""
+    ""
+  )
+fi
+
+if [[ "$INCLUDE_INT4" -eq 1 ]]; then
+  MODE_NAMES+=("INT4_W4A16")
+  MODE_MODELS+=("${INT4_MODEL}")
+  MODE_QUANTS+=("compressed-tensors")
+  MODE_KVS+=("")
+  MODE_ATTN_BACKENDS+=("rvv")
+  MODE_DISABLE_RVV_KERNELS+=("")
+fi
 
 SERVER_PID=""
 
@@ -376,6 +449,9 @@ trap cleanup_server EXIT
 for i in "${!MODE_NAMES[@]}"; do
   name="${MODE_NAMES[$i]}"
 
+  if [[ "$INT4_ONLY" -eq 1 && "${name}" != "INT4_W4A16" ]]; then
+    continue
+  fi
   if [[ "$NATIVE_ONLY" -eq 1 && "${name}" != "PYTORCH_NATIVE" ]]; then
     continue
   fi
