@@ -126,7 +126,7 @@ class TestRVVGemm(CustomTestCase):
     # Cover the FMA path once N exceeds a single vector-length chunk.
     N_fma = [100, 300]
 
-    M_int8 = [1, 2, 3, 5, 128]  # Exercises the TILE_M=4 short-row path.
+    M_int8 = [1, 2, 3, 4, 5, 8, 128]  # Exercises the TILE_M=4 short-row path.
     N_int8 = [16, 32 * 12, 80]  # Covers small-N, large-N, and tail handling.
     K_int8 = [32 * 17]
     N_w4a8_dynamic = [64, 81, 896]
@@ -505,7 +505,7 @@ class TestRVVGemm(CustomTestCase):
     def test_w4a8_dynamic_linear(self):
         """W4A8 dynamic path should match quantized reference."""
         for params in itertools.product(
-            [1, 4],
+            [1, 4, 8],
             self.N_w4a8_dynamic,
             self.K_w4a8_dynamic,
             self.has_bias,
