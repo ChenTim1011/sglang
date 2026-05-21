@@ -35,6 +35,19 @@ inline vint16m4_t decode_high_signed_nibble_to_i16m4(vuint8m2_t packed, size_t v
   return __riscv_vsext_vf2_i16m4(signed_i8, vl);
 }
 
+inline vint16m2_t decode_low_signed_nibble_to_i16m2(vuint8m1_t packed, size_t vl) {
+  vuint8m1_t shifted = __riscv_vsll_vx_u8m1(packed, 4, vl);
+  vint8m1_t signed_i8 = __riscv_vreinterpret_v_u8m1_i8m1(shifted);
+  signed_i8 = __riscv_vsra_vx_i8m1(signed_i8, 4, vl);
+  return __riscv_vsext_vf2_i16m2(signed_i8, vl);
+}
+
+inline vint16m2_t decode_high_signed_nibble_to_i16m2(vuint8m1_t packed, size_t vl) {
+  vint8m1_t signed_i8 = __riscv_vreinterpret_v_u8m1_i8m1(packed);
+  signed_i8 = __riscv_vsra_vx_i8m1(signed_i8, 4, vl);
+  return __riscv_vsext_vf2_i16m2(signed_i8, vl);
+}
+
 template <typename scalar_t>
 inline void quantize_activation_w4a8_dynamic_groups(
     const scalar_t* __restrict__ A,
@@ -452,6 +465,135 @@ void w4a8_dynamic_gemm_kernel_impl_m2_batched(
   at::parallel_for(0, num_m_blocks, parallel_mb_grain_size, compute_mb_range);
 }
 
+template <typename scalar_t, bool has_bias>
+void w4a8_dynamic_gemm_kernel_impl_m4(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ mat1,
+    const uint8_t* __restrict__ packed_w,
+    const float* __restrict__ scales,
+    const float* __restrict__ bias,
+    const int64_t* __restrict__ input_permutation,
+    int64_t N,
+    int64_t K,
+    int64_t mat1_stride0,
+    int64_t out_stride0,
+    int64_t group_size) {
+  constexpr int64_t BLOCK_M = 4;
+  constexpr int64_t BLOCK_N = rvv_constants::BLOCK_N;
+  const int64_t NB = div_up(N, BLOCK_N);
+  const int64_t num_groups = K / group_size;
+  const int64_t w4a8_dynamic_group_bytes = 1 + (group_size / 2) * BLOCK_N;
+  constexpr int64_t parallel_nb_min = 1;
+  constexpr int64_t parallel_grain_size = 0;
+
+  TORCH_CHECK(K <= W4A8_DYNAMIC_MAX_K, "weight_w4a8_dynamic_linear: stack scratch supports K <= ", W4A8_DYNAMIC_MAX_K);
+  TORCH_CHECK(
+      num_groups <= W4A8_DYNAMIC_MAX_GROUPS,
+      "weight_w4a8_dynamic_linear: stack scratch supports at most ",
+      W4A8_DYNAMIC_MAX_GROUPS,
+      " activation groups.");
+
+  alignas(64) int8_t mat1_q8[BLOCK_M][W4A8_DYNAMIC_MAX_K];
+  alignas(64) float mat1_scales[BLOCK_M][W4A8_DYNAMIC_MAX_GROUPS];
+  if (input_permutation == nullptr) {
+    quantize_activation_w4a8_dynamic_groups_block<scalar_t, BLOCK_M, false>(
+        mat1, mat1_stride0, &mat1_q8[0][0], &mat1_scales[0][0], nullptr, K, group_size);
+  } else {
+    quantize_activation_w4a8_dynamic_groups_block<scalar_t, BLOCK_M, true>(
+        mat1, mat1_stride0, &mat1_q8[0][0], &mat1_scales[0][0], input_permutation, K, group_size);
+  }
+
+  auto compute_nb_range = [&](int64_t begin, int64_t end) {
+    for (int64_t nb = begin; nb < end; ++nb) {
+      const int64_t n_start = nb * BLOCK_N;
+      const int64_t n_size = std::min(BLOCK_N, N - n_start);
+      const size_t vl_max = __riscv_vsetvlmax_e32m4();
+
+      for (int64_t j = 0; j < n_size; j += static_cast<int64_t>(vl_max)) {
+        const size_t vl = (j + static_cast<int64_t>(vl_max) <= n_size) ? vl_max : __riscv_vsetvl_e32m4(n_size - j);
+
+        vfloat32m4_t v_acc_f0 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+        vfloat32m4_t v_acc_f1 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+        vfloat32m4_t v_acc_f2 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+        vfloat32m4_t v_acc_f3 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+
+        for (int64_t g = 0; g < num_groups; ++g) {
+          vint32m4_t v_acc_i0 = __riscv_vmv_v_x_i32m4(0, vl);
+          vint32m4_t v_acc_i1 = __riscv_vmv_v_x_i32m4(0, vl);
+          vint32m4_t v_acc_i2 = __riscv_vmv_v_x_i32m4(0, vl);
+          vint32m4_t v_acc_i3 = __riscv_vmv_v_x_i32m4(0, vl);
+
+          const uint8_t* group_block = packed_w + (nb * num_groups + g) * w4a8_dynamic_group_bytes;
+          const uint8_t* q4_bytes = group_block + 1 + j;
+          constexpr int64_t PREFETCH_DIST = 4;
+          const int64_t packed_group_elems = group_size / 2;
+
+          for (int64_t kp = 0; kp < packed_group_elems; ++kp) {
+            if (kp + PREFETCH_DIST < packed_group_elems) {
+              __builtin_prefetch(q4_bytes + (kp + PREFETCH_DIST) * BLOCK_N, 0, 1);
+            }
+            const int64_t k0 = g * group_size + kp * 2;
+            const int64_t k1 = k0 + 1;
+            const vuint8m1_t v_packed = __riscv_vle8_v_u8m1(q4_bytes + kp * BLOCK_N, vl);
+            const vint16m2_t v_low_i16 = decode_low_signed_nibble_to_i16m2(v_packed, vl);
+            const vint16m2_t v_high_i16 = decode_high_signed_nibble_to_i16m2(v_packed, vl);
+            v_acc_i0 = __riscv_vwmacc_vx_i32m4(v_acc_i0, static_cast<int16_t>(mat1_q8[0][k0]), v_low_i16, vl);
+            v_acc_i0 = __riscv_vwmacc_vx_i32m4(v_acc_i0, static_cast<int16_t>(mat1_q8[0][k1]), v_high_i16, vl);
+            v_acc_i1 = __riscv_vwmacc_vx_i32m4(v_acc_i1, static_cast<int16_t>(mat1_q8[1][k0]), v_low_i16, vl);
+            v_acc_i1 = __riscv_vwmacc_vx_i32m4(v_acc_i1, static_cast<int16_t>(mat1_q8[1][k1]), v_high_i16, vl);
+            v_acc_i2 = __riscv_vwmacc_vx_i32m4(v_acc_i2, static_cast<int16_t>(mat1_q8[2][k0]), v_low_i16, vl);
+            v_acc_i2 = __riscv_vwmacc_vx_i32m4(v_acc_i2, static_cast<int16_t>(mat1_q8[2][k1]), v_high_i16, vl);
+            v_acc_i3 = __riscv_vwmacc_vx_i32m4(v_acc_i3, static_cast<int16_t>(mat1_q8[3][k0]), v_low_i16, vl);
+            v_acc_i3 = __riscv_vwmacc_vx_i32m4(v_acc_i3, static_cast<int16_t>(mat1_q8[3][k1]), v_high_i16, vl);
+          }
+
+          vfloat32m4_t v_w_scale = __riscv_vle32_v_f32m4(scales + (nb * num_groups + g) * BLOCK_N + j, vl);
+          v_acc_f0 = __riscv_vfmacc_vv_f32m4(
+              v_acc_f0,
+              __riscv_vfcvt_f_x_v_f32m4(v_acc_i0, vl),
+              __riscv_vfmul_vf_f32m4(v_w_scale, mat1_scales[0][g], vl),
+              vl);
+          v_acc_f1 = __riscv_vfmacc_vv_f32m4(
+              v_acc_f1,
+              __riscv_vfcvt_f_x_v_f32m4(v_acc_i1, vl),
+              __riscv_vfmul_vf_f32m4(v_w_scale, mat1_scales[1][g], vl),
+              vl);
+          v_acc_f2 = __riscv_vfmacc_vv_f32m4(
+              v_acc_f2,
+              __riscv_vfcvt_f_x_v_f32m4(v_acc_i2, vl),
+              __riscv_vfmul_vf_f32m4(v_w_scale, mat1_scales[2][g], vl),
+              vl);
+          v_acc_f3 = __riscv_vfmacc_vv_f32m4(
+              v_acc_f3,
+              __riscv_vfcvt_f_x_v_f32m4(v_acc_i3, vl),
+              __riscv_vfmul_vf_f32m4(v_w_scale, mat1_scales[3][g], vl),
+              vl);
+        }
+
+        if constexpr (has_bias) {
+          vfloat32m4_t v_bias = __riscv_vle32_v_f32m4(bias + n_start + j, vl);
+          v_acc_f0 = __riscv_vfadd_vv_f32m4(v_acc_f0, v_bias, vl);
+          v_acc_f1 = __riscv_vfadd_vv_f32m4(v_acc_f1, v_bias, vl);
+          v_acc_f2 = __riscv_vfadd_vv_f32m4(v_acc_f2, v_bias, vl);
+          v_acc_f3 = __riscv_vfadd_vv_f32m4(v_acc_f3, v_bias, vl);
+        }
+
+        alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
+        store_from_float_m4(out + n_start + j, v_acc_f0, vl, scratch);
+        store_from_float_m4(out + out_stride0 + n_start + j, v_acc_f1, vl, scratch);
+        store_from_float_m4(out + 2 * out_stride0 + n_start + j, v_acc_f2, vl, scratch);
+        store_from_float_m4(out + 3 * out_stride0 + n_start + j, v_acc_f3, vl, scratch);
+      }
+    }
+  };
+
+  if (parallel_nb_min > 0 && NB >= parallel_nb_min) {
+    at::parallel_for(0, NB, parallel_grain_size, compute_nb_range);
+  } else {
+    compute_nb_range(0, NB);
+  }
+}
+
 }  // namespace
 
 std::tuple<at::Tensor, at::Tensor>
@@ -606,7 +748,21 @@ at::Tensor weight_w4a8_dynamic_linear(
       scalar_t* out_data = out.data_ptr<scalar_t>();
       int64_t m = 0;
       constexpr int64_t batched_m2_min_blocks = 8;
-      const int64_t even_m = (M / 2) * 2;
+      for (; m + 4 <= M && M < 2 * batched_m2_min_blocks; m += 4) {
+        w4a8_dynamic_gemm_kernel_impl_m4<scalar_t, has_bias>(
+            out_data + m * out.stride(0),
+            mat1_data + m * mat1.stride(0),
+            packed_w.data_ptr<uint8_t>(),
+            packed_scales.data_ptr<float>(),
+            bias_data,
+            input_permutation_data,
+            N,
+            K,
+            mat1.stride(0),
+            out.stride(0),
+            group_size);
+      }
+      const int64_t even_m = m + ((M - m) / 2) * 2;
       if (even_m / 2 >= batched_m2_min_blocks) {
         w4a8_dynamic_gemm_kernel_impl_m2_batched<scalar_t, has_bias>(
             out_data,
@@ -615,7 +771,7 @@ at::Tensor weight_w4a8_dynamic_linear(
             packed_scales.data_ptr<float>(),
             bias_data,
             input_permutation_data,
-            even_m,
+            even_m - m,
             N,
             K,
             mat1.stride(0),
