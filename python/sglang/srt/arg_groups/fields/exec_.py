@@ -570,6 +570,39 @@ class ExecGraph(msgspec.Struct):
         bool,
         "Enable debug mode for torch compile",
     ] = False
+    enable_cpu_rvv_inductor: A[
+        bool,
+        (
+            "Enable the TorchInductor RVV CPU regional Linear path with explicit "
+            "packed BF16 weights, without capturing the full CPU graph."
+        ),
+    ] = False
+    cpu_rvv_memory_budget_mib: A[
+        Optional[float],
+        "Maximum MiB for TorchInductor RVV packed-weight side buffers.",
+    ] = None
+    cpu_compile_mode: A[
+        str,
+        Arg(
+            help="Compile selected CPU regions without capturing the full CPU graph.",
+            choices=["off", "regional"],
+        ),
+    ] = "off"
+    cpu_rvv_regional_small_batch: A[
+        bool,
+        "Route M=2-15 Linear projections through bounded Inductor buckets.",
+    ] = False
+    cpu_rvv_packed_weight_mode: A[
+        str,
+        Arg(
+            help="Select explicit packed-weight side buffers for RVV BF16 Linear.",
+            choices=["off", "explicit"],
+        ),
+    ] = "off"
+    cpu_rvv_packed_weight_max_mib: A[
+        Optional[float],
+        "Deprecated alias for --cpu-rvv-memory-budget-mib.",
+    ] = None
     torch_compile_max_bs: A[
         int,
         "Set the maximum batch size when using torch compile.",
