@@ -733,6 +733,14 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
                 )
+            elif (
+                cpu_linear_policy := getattr(lm_head, "_sglang_cpu_linear_policy", None)
+            ) is not None:
+                logits = cpu_linear_policy.apply(
+                    lm_head,
+                    hidden_states.to(lm_head.weight.dtype),
+                    embedding_bias,
+                )
             elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),

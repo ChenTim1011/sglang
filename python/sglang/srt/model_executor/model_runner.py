@@ -967,6 +967,18 @@ class ModelRunner:
         )
 
         self.dtype = self.model_config.dtype
+        if self.device == "cpu" and (
+            self.server_args.enable_cpu_rvv_inductor
+            or self.server_args.cpu_compile_mode == "regional"
+        ):
+            from sglang.srt.compilation.cpu_rvv_inductor_policy import (
+                install_rvv_inductor_regional_policy,
+            )
+
+            install_rvv_inductor_regional_policy(
+                self.model,
+                self.server_args,
+            )
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory

@@ -1667,6 +1667,52 @@ class ServerArgs:
         bool,
         "Optimize the model with torch.compile. Experimental feature.",
     ] = False
+    enable_cpu_rvv_inductor: A[
+        bool,
+        (
+            "Enable the recommended TorchInductor RVV CPU path. This selects "
+            "regional compilation and explicit packed BF16 weights without "
+            "capturing the full CPU graph, including M=2-15 regional buckets."
+        ),
+    ] = False
+    cpu_rvv_memory_budget_mib: A[
+        Optional[float],
+        (
+            "Maximum MiB for RVV packed-weight side buffers. When unset, "
+            "SGLang derives a safe budget from currently available host memory."
+        ),
+    ] = None
+    cpu_compile_mode: A[
+        str,
+        Arg(
+            help=(
+                "Advanced RVV option: compile selected CPU regions without "
+                "capturing the full CPU graph."
+            ),
+            choices=["off", "regional"],
+        ),
+    ] = "off"
+    cpu_rvv_regional_small_batch: A[
+        bool,
+        (
+            "Advanced RVV option: route 2-15 row projections through regional "
+            "Inductor buckets. The default preserves the M=1 and M=16-128 policy."
+        ),
+    ] = False
+    cpu_rvv_packed_weight_mode: A[
+        str,
+        Arg(
+            help=(
+                "Advanced RVV option: select explicit packed-weight side buffers "
+                "for supported regional BF16 projections."
+            ),
+            choices=["off", "explicit"],
+        ),
+    ] = "off"
+    cpu_rvv_packed_weight_max_mib: A[
+        Optional[float],
+        ("Deprecated alias for --cpu-rvv-memory-budget-mib."),
+    ] = None
     enable_torch_compile_debug_mode: A[bool, "Enable debug mode for torch compile"] = (
         False
     )

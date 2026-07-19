@@ -184,6 +184,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        cpu_linear_policy = getattr(layer, "_sglang_cpu_linear_policy", None)
+        if cpu_linear_policy is not None:
+            return cpu_linear_policy.apply(layer, x, bias)
+
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:

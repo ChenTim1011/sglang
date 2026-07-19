@@ -50,6 +50,7 @@ from torch import nn
 from torch.nn.parameter import Parameter
 from transformers import LlamaConfig
 
+from sglang.srt.compilation.cpu_linear_policy import apply_cpu_linear_policy
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
@@ -132,9 +133,9 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
+        gate_up = apply_cpu_linear_policy(self.gate_up_proj, x)
         x = self.act_fn(gate_up)
-        x = self.down_proj(x)
+        x = apply_cpu_linear_policy(self.down_proj, x)
         return x
 
 
@@ -255,11 +256,11 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        qkv = apply_cpu_linear_policy(self.qkv_proj, hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        output = self.o_proj(attn_output)
+        output = apply_cpu_linear_policy(self.o_proj, attn_output)
         return output
 
 
