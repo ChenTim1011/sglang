@@ -133,7 +133,7 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
         ):
             from sglang.srt.model_executor.cpu_graph_runner import register_fake_ops
 
-            register_fake_ops()
+            register_fake_ops(tp_size=1)
 
         self.assertIn("sgl_kernel::decode_attention_int8_cpu", registered)
         self.assertIn("sgl_kernel::extend_attention_int8_cpu", registered)
