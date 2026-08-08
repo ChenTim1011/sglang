@@ -1680,11 +1680,6 @@ void decode_attention_cpu(
     double logit_cap) {
   constexpr double k_scale = 1.0;
   constexpr double v_scale = 1.0;
-  RECORD_FUNCTION(
-      "sgl-kernel::decode_attention_cpu",
-      std::vector<c10::IValue>(
-          {query, output, k_buffer, v_buffer, attn_logits, req_to_token, req_pool_indices, seq_lens}));
-
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
@@ -1867,11 +1862,6 @@ void decode_attention_int8_cpu(
     at::Tensor v_scale_buf,  // float32 [max_tokens, num_kv_heads]; per-token V scales
     double k_scale,
     double v_scale) {
-  RECORD_FUNCTION(
-      "sgl-kernel::decode_attention_int8_cpu",
-      std::vector<c10::IValue>(
-          {query, output, k_buffer, v_buffer, attn_logits, req_to_token, req_pool_indices, seq_lens}));
-
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
