@@ -1107,10 +1107,17 @@ class LayeredModelLoader(DefaultModelLoader):
             weights = self._get_all_weights(model_config, model)
 
             # Helper function to recursively fill the weights of a module
+            materialized_modules: set[int] = set()
+
             def fill_module(module, fqn: List[str], weights):
                 """
                 fqn: list of strings representing the fully qualified name of `module`.
                 """
+                module_id = id(module)
+                if module_id in materialized_modules:
+                    return
+                materialized_modules.add(module_id)
+
                 # Layer by layer
                 for name, submod in module.named_children():
                     fill_module(submod, fqn + [name], weights)
