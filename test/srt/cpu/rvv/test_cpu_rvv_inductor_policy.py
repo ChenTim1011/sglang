@@ -3,6 +3,7 @@ import gc
 import os
 import unittest
 import weakref
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -11,6 +12,7 @@ import torch
 from sglang.srt.compilation.cpu_linear_policy import apply_cpu_linear_policy
 from sglang.srt.compilation.cpu_rvv_inductor_policy import (
     _RVV_REGIONAL_COMPILED_BY_SHAPE,
+    _PackedWeightSource,
     _regional_bucket_rows,
     _should_use_rvv_inductor_regional_shape,
     install_rvv_inductor_regional_policy,
@@ -288,6 +290,7 @@ class TestCpuRvvInductorPolicy(unittest.TestCase):
 
     def test_explicit_packing_respects_the_memory_budget(self):
         model = TorchNativeLlamaForCausalLM().to(dtype=torch.bfloat16)
+        packed_linear_calls = []
 
         def eager_pack(weight):
             block_n = 32
@@ -300,6 +303,12 @@ class TestCpuRvvInductorPolicy(unittest.TestCase):
                 .contiguous()
             )
 
+        def eager_packed_linear(input, packed_weight, out_features):
+            packed_linear_calls.append(packed_weight)
+            n_blocks, k, block_n = packed_weight.shape
+            weight = packed_weight.permute(0, 2, 1).reshape(n_blocks * block_n, k)
+            return torch.nn.functional.linear(input, weight[:out_features])
+
         with (
             mock.patch(
                 "sglang.srt.compilation.cpu_rvv_inductor_policy."
@@ -309,7 +318,11 @@ class TestCpuRvvInductorPolicy(unittest.TestCase):
             mock.patch(
                 "sglang.srt.compilation.cpu_rvv_inductor_policy."
                 "_RVV_PACKED_BF16_LINEAR_OP",
-                side_effect=torch.nn.functional.linear,
+                side_effect=eager_packed_linear,
+            ),
+            mock.patch(
+                "sglang.srt.compilation.cpu_rvv_inductor_policy.torch.compile",
+                side_effect=lambda fn, *args, **kwargs: fn,
             ),
         ):
             install_rvv_inductor_regional_policy(
@@ -320,6 +333,20 @@ class TestCpuRvvInductorPolicy(unittest.TestCase):
                 ),
                 force=True,
             )
+            linear_modules = (
+                model.model.layers[0].self_attn.qkv_proj,
+                model.model.layers[0].self_attn.o_proj,
+                model.model.layers[0].mlp.gate_up_proj,
+                model.model.layers[0].mlp.down_proj,
+            )
+            skipped = next(
+                module
+                for module in linear_modules
+                if not hasattr(module, "_sglang_rvv_packed_weight")
+            )
+            input = torch.randn(1, skipped.in_features, dtype=torch.bfloat16)
+            expected = torch.nn.functional.linear(input, skipped.weight)
+            actual = skipped(input)
 
         stats = model._sglang_rvv_explicit_pack_stats
         self.assertLessEqual(stats["bytes"], stats["max_bytes"])
@@ -329,6 +356,26 @@ class TestCpuRvvInductorPolicy(unittest.TestCase):
         self.assertEqual(
             stats["eligible_bytes"], stats["bytes"] + stats["skipped_bytes"]
         )
+        self.assertEqual(packed_linear_calls, [])
+        torch.testing.assert_close(actual, expected)
+
+    def test_packed_weight_source_rejects_each_contract_mismatch(self):
+        weight = torch.randn(8, 8, dtype=torch.bfloat16)
+        source = _PackedWeightSource.capture(weight)
+        other_weight = weight.detach().clone()
+
+        self.assertTrue(source.matches(weight))
+        mismatches = {
+            "tensor_ref": weakref.ref(other_weight),
+            "data_ptr": source.data_ptr + 1,
+            "shape": (4, 16),
+            "stride": (1, 8),
+            "dtype": torch.float32,
+            "device": torch.device("meta"),
+        }
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                self.assertFalse(replace(source, **{field: value}).matches(weight))
 
     def test_explicit_packing_uses_available_memory_for_the_default_budget(self):
         model = TorchNativeLlamaForCausalLM().to(dtype=torch.bfloat16)
