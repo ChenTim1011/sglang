@@ -64,7 +64,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import empty_context, get_free_cpu_memory, log_info_on_rank0
+from sglang.srt.utils import empty_context, is_host_cpu_riscv, get_free_cpu_memory, log_info_on_rank0
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 
 logger = logging.getLogger(__name__)
@@ -770,7 +770,18 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("weight_packed_linear")
     def _(mat1, mat2, bias, is_vnni):
-        N = get_n_size(mat2, is_vnni)
+        M = mat1.shape[0]
+        if (
+            is_vnni
+            and is_host_cpu_riscv()
+            and mat2.dim() == 2
+            and mat2.dtype in (torch.bfloat16, torch.float16)
+            and mat2.shape[1] % mat1.shape[1] == 0
+        ):
+            block_n = mat2.shape[1] // mat1.shape[1]
+            N = mat2.shape[0] * block_n
+        else:
+            N = get_n_size(mat2, is_vnni)
         # The non-FMA kernel flattens leading dimensions for GEMM and restores
         # them before returning. The FP32/FMA path only accepts a 2D mat1.
         output_shape = (
@@ -790,7 +801,7 @@ def register_fake_ops(tp_size: int):
     @register_cpu_compile_fake("int8_scaled_mm_cpu")
     def _(mat1, mat2, scales1, scales2, bias, out_dtype, is_vnni):
         M = mat1.shape[0]
-        N = mat2.shape[0]
+        N = scales2.numel() if is_vnni else mat2.shape[0]
         out = mat1.new_empty(M, N, dtype=out_dtype)
         return out
 
@@ -907,7 +918,7 @@ def register_fake_ops(tp_size: int):
         is_vnni,
     ):
         M = mat1.shape[0]
-        N = mat2.shape[0]
+        N = scales2.numel() if is_vnni else mat2.shape[0]
         return mat1.new_empty(M, N, dtype=out_dtype)
 
     @register_cpu_compile_fake("fp8_scaled_mm_cpu")
