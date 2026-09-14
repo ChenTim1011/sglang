@@ -1802,8 +1802,8 @@ void decode_attention_cpu(
             max_num_reqs,
             max_context_len,
             max_total_num_tokens,
-            k_scale,
-            v_scale,
+            /* k_scale */ 1.0f,
+            /* v_scale */ 1.0f,
             o_strideM,
             o_strideH);
       } else {
@@ -1833,8 +1833,8 @@ void decode_attention_cpu(
             max_num_reqs,
             max_context_len,
             max_total_num_tokens,
-            k_scale,
-            v_scale,
+            /* k_scale */ 1.0f,
+            /* v_scale */ 1.0f,
             o_strideM,
             o_strideH);
       }
