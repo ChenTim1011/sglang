@@ -16,6 +16,10 @@ from sglang.srt.compilation.cpu_rvv_inductor_policy import (
     install_rvv_inductor_regional_policy,
     invalidate_rvv_inductor_packed_weights,
 )
+from sglang.srt.layers.rvv_utils import (
+    _rvv_process_weight_after_loading,
+    rvv_inductor_owns_linear,
+)
 
 
 class _TorchNativeLinear(torch.nn.Linear):
@@ -941,6 +945,41 @@ class TestCpuRvvInductorPolicy(unittest.TestCase):
                 install_rvv_inductor_regional_policy(model, self._server_args()),
                 4,
             )
+
+    def test_installer_allows_rvv_attention_hybrid(self):
+        model = TorchNativeLlamaForCausalLM()
+        with mock.patch(
+            "sglang.srt.compilation.cpu_rvv_inductor_policy._rvv_cpu_capability",
+            return_value="RVV",
+        ):
+            self.assertEqual(
+                install_rvv_inductor_regional_policy(
+                    model,
+                    self._server_args(attention_backend="rvv"),
+                ),
+                4,
+            )
+
+    def test_hybrid_ownership_keeps_linear_weight_row_major(self):
+        server_args = self._server_args(attention_backend="rvv")
+        self.assertTrue(rvv_inductor_owns_linear(server_args))
+
+        layer = torch.nn.Linear(8, 8, bias=False).to(dtype=torch.bfloat16)
+        weight_before = layer.weight.detach().clone()
+        with (
+            mock.patch(
+                "sglang.srt.layers.rvv_utils.rvv_inductor_owns_linear",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.srt.layers.rvv_utils.cpu_has_rvv_support"
+            ) as capability_probe,
+        ):
+            _rvv_process_weight_after_loading(layer, ["weight"])
+
+        capability_probe.assert_not_called()
+        torch.testing.assert_close(layer.weight, weight_before)
+        self.assertFalse(layer.use_riscv_rvv_backend)
 
     def test_regional_mode_is_independent_from_cpu_graph(self):
         regional_model = TorchNativeLlamaForCausalLM()

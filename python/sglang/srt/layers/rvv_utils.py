@@ -11,6 +11,24 @@ _convert_weight_packed = None
 _convert_weight_w4a8_dynamic_packed = None
 
 
+def rvv_inductor_owns_linear(server_args=None) -> bool:
+    """Whether TorchInductor, rather than sgl-kernel, owns BF16 Linear."""
+    if server_args is None:
+        try:
+            from sglang.srt.runtime_context import get_server_args
+
+            server_args = get_server_args()
+        except (AttributeError, RuntimeError, ValueError):
+            return False
+    return bool(
+        server_args is not None
+        and (
+            getattr(server_args, "enable_cpu_rvv_inductor", False)
+            or getattr(server_args, "cpu_compile_mode", "off") == "regional"
+        )
+    )
+
+
 def _get_convert_weight_packed_op():
     global _convert_weight_packed
     if _convert_weight_packed is not None:
@@ -62,6 +80,13 @@ def _rvv_process_weight_after_loading(module, weight_names) -> None:
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
     assert len(devices) == 1, "Expects all weights to be on the same device"
     if devices.pop() != torch.device("cpu"):
+        return
+
+    # The Inductor path keeps the model parameter row-major and creates its own
+    # non-persistent packed side tensor after loading. Replacing the parameter
+    # here would violate that layout contract and duplicate packed weights.
+    if rvv_inductor_owns_linear():
+        module.use_riscv_rvv_backend = False
         return
 
     if not cpu_has_rvv_support():
@@ -193,6 +218,8 @@ def resolve_rvv_lm_head_weight(lm_head) -> torch.Tensor:
 
 def use_rvv_lm_head_backend(lm_head) -> bool:
     """Whether lm_head is eligible for the RVV packed-linear path."""
+    if rvv_inductor_owns_linear():
+        return False
     if not hasattr(lm_head, "weight"):
         return False
     if _is_lora_wrapped(lm_head):

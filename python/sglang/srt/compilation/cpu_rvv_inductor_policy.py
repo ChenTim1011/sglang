@@ -38,6 +38,7 @@ _RVV_REGIONAL_TARGETS = (*_RVV_REGIONAL_LINEAR_TARGETS, "lm_head")
 _RVV_REGIONAL_COMPILED_BY_SHAPE = {}
 _RVV_PACKED_WEIGHT_BUFFER = "_sglang_rvv_packed_weight"
 _RVV_PACKED_MEMORY_RESERVE_BYTES = 1024 * 1024 * 1024
+_RVV_REGIONAL_ATTENTION_BACKENDS = ("torch_native", "rvv")
 
 
 class _RegionalShapeKey(NamedTuple):
@@ -564,7 +565,8 @@ def _should_install_rvv_inductor_regional_policy(
     return (
         _is_cpu_device(getattr(server_args, "device", None))
         and _is_bfloat16_dtype(getattr(server_args, "dtype", None))
-        and getattr(server_args, "attention_backend", None) == "torch_native"
+        and getattr(server_args, "attention_backend", None)
+        in _RVV_REGIONAL_ATTENTION_BACKENDS
         and _regional_policy_requested(server_args)
         and not bool(getattr(server_args, "enable_lora", False))
         and _rvv_cpu_capability() == "RVV"
@@ -580,8 +582,11 @@ def _simple_rvv_inductor_unavailable_reason(model: nn.Module, server_args):
         return "--device must be cpu"
     if not _is_bfloat16_dtype(getattr(server_args, "dtype", None)):
         return "--dtype must be bfloat16"
-    if getattr(server_args, "attention_backend", None) != "torch_native":
-        return "--attention-backend must be torch_native"
+    if (
+        getattr(server_args, "attention_backend", None)
+        not in _RVV_REGIONAL_ATTENTION_BACKENDS
+    ):
+        return "--attention-backend must be torch_native or rvv"
     if bool(getattr(server_args, "enable_lora", False)):
         return "LoRA is not supported by the RVV regional policy"
     capability = _rvv_cpu_capability()
