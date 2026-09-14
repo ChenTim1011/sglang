@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 project(sgl_kernel)
 
-set(CMAKE_CXX_STANDARD 17)
+# Current PyTorch ATen headers require C++20. Keep the RVV extension aligned
+# with the compiler ABI contract used by the installed PyTorch wheel.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
