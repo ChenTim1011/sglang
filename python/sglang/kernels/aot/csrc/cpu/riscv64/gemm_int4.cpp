@@ -4,7 +4,6 @@
 
 #include <ATen/Parallel.h>
 #include <ATen/core/Tensor.h>
-#include <ATen/record_function.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -598,9 +597,6 @@ void w4a8_dynamic_gemm_kernel_impl_m4(
 
 std::tuple<at::Tensor, at::Tensor>
 convert_weight_w4a8_dynamic_packed(at::Tensor& weight_q, at::Tensor& scales, int64_t group_size) {
-  RECORD_FUNCTION(
-      "sgl-kernel::convert_weight_w4a8_dynamic_packed", std::vector<c10::IValue>({weight_q, scales, group_size}));
-
   CHECK_INPUT(weight_q);
   CHECK_INPUT(scales);
   CHECK_DIM(2, weight_q);
@@ -669,10 +665,6 @@ at::Tensor weight_w4a8_dynamic_linear(
     const std::optional<at::Tensor>& input_permutation,
     int64_t group_size,
     bool is_packed) {
-  RECORD_FUNCTION(
-      "sgl-kernel::weight_w4a8_dynamic_linear",
-      std::vector<c10::IValue>({mat1, mat2, scales, bias, input_permutation, group_size, is_packed}));
-
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scales);
