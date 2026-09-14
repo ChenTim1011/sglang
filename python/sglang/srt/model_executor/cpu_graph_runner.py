@@ -48,6 +48,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     empty_context,
+    is_host_cpu_riscv,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -150,6 +151,16 @@ _CPU_COMPILE_FAKE_OPS: set[str] = set()
 
 
 def register_cpu_compile_fake(op_name: str):
+    if is_host_cpu_riscv():
+        try:
+            getattr(getattr(torch.ops.sgl_kernel, op_name), "default")
+        except (AttributeError, RuntimeError):
+
+            def keep_function_unregistered(func):
+                return func
+
+            return keep_function_unregistered
+
     _CPU_COMPILE_FAKE_OPS.add(op_name)
     return torch.library.register_fake(f"sgl_kernel::{op_name}")
 
@@ -346,7 +357,17 @@ def register_fake_ops(tp_size: int):
     @register_cpu_compile_fake("weight_packed_linear")
     def _(mat1, mat2, bias, is_vnni):
         M = mat1.shape[0]
-        N = get_n_size(mat2, is_vnni)
+        if (
+            is_vnni
+            and is_host_cpu_riscv()
+            and mat2.dim() == 2
+            and mat2.dtype in (torch.bfloat16, torch.float16)
+            and mat2.shape[1] % mat1.shape[1] == 0
+        ):
+            block_n = mat2.shape[1] // mat1.shape[1]
+            N = mat2.shape[0] * block_n
+        else:
+            N = get_n_size(mat2, is_vnni)
         return mat1.new_empty(M, N)
 
     @register_cpu_compile_fake("per_token_quant_int8_cpu")
@@ -360,7 +381,7 @@ def register_fake_ops(tp_size: int):
     @register_cpu_compile_fake("int8_scaled_mm_cpu")
     def _(mat1, mat2, scales1, scales2, bias, out_dtype, is_vnni):
         M = mat1.shape[0]
-        N = mat2.shape[0]
+        N = scales2.numel() if is_vnni else mat2.shape[0]
         out = mat1.new_empty(M, N, dtype=out_dtype)
         return out
 
@@ -462,7 +483,7 @@ def register_fake_ops(tp_size: int):
         is_vnni,
     ):
         M = mat1.shape[0]
-        N = mat2.shape[0]
+        N = scales2.numel() if is_vnni else mat2.shape[0]
         return mat1.new_empty(M, N, dtype=out_dtype)
 
     @register_cpu_compile_fake("fp8_scaled_mm_cpu")
