@@ -104,7 +104,7 @@ set(RISCV64_SKIP_TOPLEVEL
     gemm_fp8 gemm_int4
     bmm
     qkv_proj preprocessor conv3d
-    shm interface flash_attn
+    shm interface flash_attn numa_utils
     torch_extension_cpu
 )
 
