@@ -458,7 +458,7 @@ class TorchNativeLlamaForCausalLM(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
         module = self.get_submodule(fqn)
-        params_dict = dict(module.named_parameters(prefix=fqn, recurse=False))
+        params_dict = dict(module.named_parameters(prefix=fqn, recurse=(fqn == "")))
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
