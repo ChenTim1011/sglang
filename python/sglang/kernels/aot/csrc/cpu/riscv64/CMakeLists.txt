@@ -50,12 +50,26 @@ else()
     endif()
 endif()
 
-# Compiler check
-if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    message(FATAL_ERROR "RISC-V build requires Clang for RVV intrinsics. Current: ${CMAKE_CXX_COMPILER_ID}")
-elseif(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19.0)
-    message(FATAL_ERROR "Clang >= 19.0 required for RVV. Found: ${CMAKE_CXX_COMPILER_VERSION}")
+# Keep the compiler's OpenMP code-generation ABI and linked runtime together.
+# LLVM OpenMP uses __kmpc_* symbols; GNU OpenMP uses GOMP_* symbols. Mixing a
+# Clang-generated object with libgomp can link while leaving __kmpc_* symbols
+# unresolved, which then tempts callers to preload libomp and load two OpenMP
+# runtimes into one process.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19.0)
+        message(FATAL_ERROR "Clang >= 19.0 required for RVV. Found: ${CMAKE_CXX_COMPILER_VERSION}")
+    endif()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 15.0)
+        message(FATAL_ERROR "GCC >= 15.0 required for RVV. Found: ${CMAKE_CXX_COMPILER_VERSION}")
+    endif()
+else()
+    message(FATAL_ERROR "RISC-V build requires Clang >= 19 or GCC >= 15. Current: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 endif()
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+message(STATUS "RISC-V OpenMP compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "RISC-V OpenMP flags: ${OpenMP_CXX_FLAGS}")
+message(STATUS "RISC-V OpenMP libraries: ${OpenMP_CXX_LIBRARIES}")
 
 # Auto-detect VLEN and ISA extensions from /proc/cpuinfo
 set(RVV_HAS_ZVFH OFF)
@@ -128,15 +142,21 @@ if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
     add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
 endif()
 
-add_compile_options(-O3 -Wno-unknown-pragmas -fopenmp)
+add_compile_options(-O3 -Wno-unknown-pragmas)
 if(RVV_HAS_ZVFH)
     set(RVV_MARCH "rv64gcv_zvfh")
     set(RVV_ZVFH_ENABLED "ON")
-    add_compile_options(-march=${RVV_MARCH} -mabi=lp64d -mrvv-vector-bits=${RVV_VECTOR_BITS})
     add_compile_definitions(RVV_HAS_ZVFH=1)
 else()
     set(RVV_MARCH "rv64gcv")
     set(RVV_ZVFH_ENABLED "OFF")
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC exposes __riscv_v_fixed_vlen only when the ISA declares the minimum
+    # vector length and -mrvv-vector-bits=zvl requests that fixed-size model.
+    set(RVV_MARCH "${RVV_MARCH}_zvl${RVV_VECTOR_BITS}b")
+    add_compile_options(-march=${RVV_MARCH} -mabi=lp64d -mrvv-vector-bits=zvl)
+else()
     add_compile_options(-march=${RVV_MARCH} -mabi=lp64d -mrvv-vector-bits=${RVV_VECTOR_BITS})
 endif()
 add_compile_definitions(CPU_CAPABILITY_RVV)
@@ -150,20 +170,8 @@ message(STATUS "  zvfh enabled: ${RVV_ZVFH_ENABLED}")
 
 message(STATUS "Build Architecture: riscv64 (RVV enabled)")
 
-# Link libraries: PyTorch + OpenMP (no NUMA)
-set(LINK_LIBS ${TORCH_LIBRARIES})
-set(OMP_LIB_PATH "$ENV{RISCV_OMP_LIB_PATH}")
-if(EXISTS "${OMP_LIB_PATH}")
-    list(APPEND LINK_LIBS "${OMP_LIB_PATH}")
-else()
-    find_library(OMP_LIB omp)
-    if(OMP_LIB)
-        list(APPEND LINK_LIBS ${OMP_LIB})
-    endif()
-endif()
-
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-target_link_libraries(common_ops PRIVATE ${LINK_LIBS})
+target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} OpenMP::OpenMP_CXX)
 target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 
 install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
