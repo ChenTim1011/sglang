@@ -1,0 +1,41 @@
+name: RISE RISC-V Runner Smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, ci/rise-riscv-smoke]
+    paths:
+      - .github/workflows/rise-riscv-smoke.yml
+      - scripts/ci/riscv/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rise-riscv-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    if: github.repository == 'ChenTim1011/sglang'
+    runs-on: ubuntu-24.04-riscv
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Record runner environment
+        run: |
+          uname -a
+          lscpu
+          python3 --version
+          g++ --version
+          objdump --version
+      - name: Native scalar execution and RVV compile-only checks
+        run: python3 scripts/ci/riscv/smoke.py --output rise-riscv-results
+      - name: Save evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rise-riscv-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: rise-riscv-results/
+          if-no-files-found: warn
+          retention-days: 14
